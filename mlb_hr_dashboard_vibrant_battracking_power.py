@@ -605,6 +605,122 @@ def hr_pitch_shape_match(
     return pd.DataFrame(output)
 
 
+
+def build_batter_pitch_type_table(
+    df: pd.DataFrame,
+    rankings: pd.DataFrame,
+    profile: pd.DataFrame,
+    pitcher_hand: str,
+) -> pd.DataFrame:
+    """Show each displayed hitter's results against the starter's pitch types.
+
+    The split is against the same pitch type from pitchers with the selected
+    starter's handedness. Small samples are shrunk toward the pitch-type league
+    baseline. This surfaces the data already summarized by Pitch Match without
+    double-counting it in the model.
+    """
+    if rankings.empty or profile.empty or not pitcher_hand:
+        return pd.DataFrame()
+
+    hand_rows = df[df["p_throws"].eq(pitcher_hand)].copy()
+    if hand_rows.empty:
+        return pd.DataFrame()
+
+    player_names = rankings.set_index("player_id")["Player"].to_dict()
+    player_ids = [int(value) for value in rankings["player_id"].dropna().unique()]
+    output: list[dict] = []
+
+    def shrunk_rate(numerator: float, denominator: float, baseline: float, prior: float) -> float:
+        baseline = float(baseline) if pd.notna(baseline) else 0.0
+        return float((float(numerator) + baseline * prior) / (float(denominator) + prior))
+
+    def safe_ratio(value: float, baseline: float) -> float:
+        if pd.isna(value) or pd.isna(baseline) or float(baseline) <= 0:
+            return 1.0
+        return float(np.clip(float(value) / float(baseline), 0.35, 2.75))
+
+    for _, pitch_row in profile.sort_values("Usage", ascending=False).iterrows():
+        pitch_name = str(pitch_row["pitch_name"])
+        league = hand_rows[hand_rows["pitch_name"].eq(pitch_name)].copy()
+        if league.empty:
+            continue
+
+        lg_swings = float(league["is_swing"].sum())
+        lg_bbe = float(league["is_bbe"].sum())
+        lg_pa = float(league["is_pa_end"].sum())
+        lg_contact = float(league["is_contact"].sum()) / max(lg_swings, 1.0)
+        lg_whiff = float(league["is_whiff"].sum()) / max(lg_swings, 1.0)
+        lg_xslg = float(league.loc[league["is_bbe"], "xslg_value"].sum()) / max(lg_bbe, 1.0)
+        lg_xba = float(league.loc[league["is_bbe"], "xba_value"].sum()) / max(lg_bbe, 1.0)
+        lg_barrel = float(league["is_barrel"].sum()) / max(lg_bbe, 1.0)
+        lg_hard_hit = float(league["is_hard_hit"].sum()) / max(lg_bbe, 1.0)
+        lg_pull_air = float(league["is_pull_air"].sum()) / max(lg_bbe, 1.0)
+        lg_hr = float(league["is_hr"].sum()) / max(lg_pa, 1.0)
+
+        for player_id in player_ids:
+            rows = league[league["batter"].eq(player_id)].copy()
+            pitches_seen = int(len(rows))
+            swings = int(rows["is_swing"].sum())
+            contacts = int(rows["is_contact"].sum())
+            whiffs = int(rows["is_whiff"].sum())
+            bbe = int(rows["is_bbe"].sum())
+            pa_ends = int(rows["is_pa_end"].sum())
+            home_runs = int(rows["is_hr"].sum())
+            barrels = int(rows["is_barrel"].sum())
+            hard_hits = int(rows["is_hard_hit"].sum())
+            pull_air = int(rows["is_pull_air"].sum())
+            xslg_sum = float(rows.loc[rows["is_bbe"], "xslg_value"].sum())
+            xba_sum = float(rows.loc[rows["is_bbe"], "xba_value"].sum())
+
+            contact = shrunk_rate(contacts, swings, lg_contact, 35)
+            whiff = shrunk_rate(whiffs, swings, lg_whiff, 35)
+            xslg = shrunk_rate(xslg_sum, bbe, lg_xslg, 12)
+            xba = shrunk_rate(xba_sum, bbe, lg_xba, 12)
+            barrel = shrunk_rate(barrels, bbe, lg_barrel, 15)
+            hard_hit = shrunk_rate(hard_hits, bbe, lg_hard_hit, 18)
+            pull_air_rate = shrunk_rate(pull_air, bbe, lg_pull_air, 18)
+            hr_rate = shrunk_rate(home_runs, pa_ends, lg_hr, 30)
+
+            matchup_ratio = (
+                0.30 * safe_ratio(xslg, lg_xslg)
+                + 0.22 * safe_ratio(barrel, lg_barrel)
+                + 0.16 * safe_ratio(hr_rate, lg_hr)
+                + 0.12 * safe_ratio(hard_hit, lg_hard_hit)
+                + 0.08 * safe_ratio(pull_air_rate, lg_pull_air)
+                + 0.07 * safe_ratio(contact, lg_contact)
+                + 0.05 * safe_ratio(lg_whiff, whiff)
+            )
+            reliability = float(1.0 - np.exp(-(pitches_seen + 3.0 * bbe) / 80.0))
+            raw_score = float(np.clip(50.0 + 55.0 * (matchup_ratio - 1.0), 0.0, 100.0))
+            pitch_score = float(np.clip(50.0 + reliability * (raw_score - 50.0), 0.0, 100.0))
+            sample = "High" if pitches_seen >= 100 or bbe >= 25 else "Medium" if pitches_seen >= 40 or bbe >= 10 else "Low"
+
+            output.append(
+                {
+                    "player_id": player_id,
+                    "Player": player_names.get(player_id, f"MLB ID {player_id}"),
+                    "Pitch Type": pitch_name,
+                    "Pitcher Usage": float(pitch_row.get("Usage", np.nan)),
+                    "Pitcher Velo": float(pitch_row.get("Avg_Speed", np.nan)),
+                    "Pitches Seen": pitches_seen,
+                    "PA Ends": pa_ends,
+                    "BBE": bbe,
+                    "HR": home_runs,
+                    "HR/PA": hr_rate,
+                    "Brl/BIP": barrel,
+                    "xSLG Contact": xslg,
+                    "xBA Contact": xba,
+                    "Hard Hit%": hard_hit,
+                    "Pull Air/BIP": pull_air_rate,
+                    "Contact%": contact,
+                    "Whiff%": whiff,
+                    "Pitch Type Score": pitch_score,
+                    "Sample": sample,
+                }
+            )
+
+    return pd.DataFrame(output)
+
 def hr_zone_fit(
     df: pd.DataFrame,
     player_ids: Iterable[int],
@@ -1203,22 +1319,260 @@ def parse_bat_tracking_upload(
 
     return _calculate_bat_tracking_score(board)
 
+
+def load_stadium_weather_metadata(venue: str) -> dict:
+    """Read fallback coordinates, approximate outfield bearing and roof type."""
+    paths = [
+        Path(__file__).resolve().parent / "stadium_weather.csv",
+        Path.cwd() / "stadium_weather.csv",
+    ]
+    csv_path = next((path for path in paths if path.exists()), None)
+    if csv_path is None:
+        return {
+            "ok": False,
+            "latitude": None,
+            "longitude": None,
+            "outfield_bearing": None,
+            "roof_type": "open",
+            "error": "stadium_weather.csv was not found beside the dashboard file.",
+        }
+    try:
+        table = pd.read_csv(csv_path)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "latitude": None,
+            "longitude": None,
+            "outfield_bearing": None,
+            "roof_type": "open",
+            "error": f"stadium_weather.csv could not be read: {type(exc).__name__}: {exc}",
+        }
+
+    required = {"venue", "latitude", "longitude", "outfield_bearing", "roof_type"}
+    if not required.issubset(table.columns):
+        return {
+            "ok": False,
+            "latitude": None,
+            "longitude": None,
+            "outfield_bearing": None,
+            "roof_type": "open",
+            "error": "stadium_weather.csv is missing required columns.",
+        }
+
+    matches = table[table["venue"].apply(lambda value: venue_names_match(value, venue))]
+    if matches.empty:
+        return {
+            "ok": False,
+            "latitude": None,
+            "longitude": None,
+            "outfield_bearing": None,
+            "roof_type": "open",
+            "error": f"No stadium_weather.csv row matched {venue}.",
+        }
+    row = matches.iloc[0]
+    return {
+        "ok": True,
+        "latitude": float(row["latitude"]),
+        "longitude": float(row["longitude"]),
+        "outfield_bearing": float(row["outfield_bearing"]),
+        "roof_type": str(row["roof_type"]).lower().strip(),
+        "source": "stadium_weather.csv",
+        "error": None,
+    }
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_mlb_venue_coordinates(venue_id: object) -> dict:
+    """Use MLB's venue record for coordinates; return an empty result on failure."""
+    numeric = pd.to_numeric(pd.Series([venue_id]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return {"ok": False, "latitude": None, "longitude": None, "error": "No venue ID."}
+    url = f"https://statsapi.mlb.com/api/v1/venues/{int(numeric)}"
+    request = Request(url, headers={"User-Agent": "MLB-Statcast-Dashboard/3.0"})
+    try:
+        with urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+        venues = payload.get("venues", [])
+        if not venues:
+            raise ValueError("MLB venue response was empty")
+        coordinates = venues[0].get("location", {}).get("defaultCoordinates", {})
+        latitude = pd.to_numeric(pd.Series([coordinates.get("latitude")]), errors="coerce").iloc[0]
+        longitude = pd.to_numeric(pd.Series([coordinates.get("longitude")]), errors="coerce").iloc[0]
+        if pd.isna(latitude) or pd.isna(longitude):
+            raise ValueError("MLB venue response did not include coordinates")
+        return {
+            "ok": True,
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "source": "MLB venue coordinates",
+            "error": None,
+        }
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+        return {
+            "ok": False,
+            "latitude": None,
+            "longitude": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def classify_stadium_wind(wind_from_degrees: float, outfield_bearing: float | None) -> tuple[str, float | None]:
+    """Convert meteorological wind-from degrees to Out/In/Cross at the stadium."""
+    if pd.isna(wind_from_degrees) or outfield_bearing is None or pd.isna(outfield_bearing):
+        return "Cross/Calm", None
+    wind_toward = (float(wind_from_degrees) + 180.0) % 360.0
+    difference = abs((wind_toward - float(outfield_bearing) + 180.0) % 360.0 - 180.0)
+    if difference <= 45.0:
+        return "Out", difference
+    if difference >= 135.0:
+        return "In", difference
+    return "Cross/Calm", difference
+
+
+def weather_code_text(code: object) -> str:
+    numeric = pd.to_numeric(pd.Series([code]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "Forecast"
+    code = int(numeric)
+    if code == 0:
+        return "Clear"
+    if code in {1, 2, 3}:
+        return "Partly cloudy" if code < 3 else "Overcast"
+    if code in {45, 48}:
+        return "Fog"
+    if code in {51, 53, 55, 56, 57}:
+        return "Drizzle"
+    if code in {61, 63, 65, 66, 67, 80, 81, 82}:
+        return "Rain"
+    if code in {71, 73, 75, 77, 85, 86}:
+        return "Snow"
+    if code in {95, 96, 99}:
+        return "Thunderstorms"
+    return "Forecast"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_open_meteo_game_weather(
+    latitude: float,
+    longitude: float,
+    game_datetime_utc: str,
+    outfield_bearing: float | None,
+) -> dict:
+    """Fetch the hourly forecast closest to scheduled first pitch."""
+    target = pd.to_datetime(game_datetime_utc, utc=True, errors="coerce")
+    if pd.isna(target):
+        return {"ok": False, "error": "The selected game did not have a valid first-pitch time."}
+
+    target_date = target.strftime("%Y-%m-%d")
+    params = {
+        "latitude": round(float(latitude), 5),
+        "longitude": round(float(longitude), 5),
+        "hourly": (
+            "temperature_2m,relative_humidity_2m,precipitation_probability,"
+            "pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code"
+        ),
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "timezone": "GMT",
+        "start_date": target_date,
+        "end_date": target_date,
+    }
+    url = "https://api.open-meteo.com/v1/forecast?" + urlencode(params)
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "MLB-Statcast-Dashboard/3.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+        hourly = pd.DataFrame(payload.get("hourly", {}))
+        if hourly.empty or "time" not in hourly.columns:
+            raise ValueError("Open-Meteo returned no hourly forecast rows")
+        hourly["forecast_time"] = pd.to_datetime(hourly["time"], utc=True, errors="coerce")
+        hourly = hourly.dropna(subset=["forecast_time"]).copy()
+        if hourly.empty:
+            raise ValueError("Open-Meteo returned invalid hourly timestamps")
+        nearest_index = (hourly["forecast_time"] - target).abs().idxmin()
+        row = hourly.loc[nearest_index]
+        wind_from = float(pd.to_numeric(pd.Series([row.get("wind_direction_10m")]), errors="coerce").iloc[0])
+        stadium_wind, angle_difference = classify_stadium_wind(wind_from, outfield_bearing)
+        return {
+            "ok": True,
+            "temperature_f": float(row.get("temperature_2m")),
+            "humidity_pct": float(row.get("relative_humidity_2m")),
+            "precip_probability": float(row.get("precipitation_probability", 0.0)),
+            "pressure_hpa": float(row.get("pressure_msl", 1013.25)),
+            "wind_mph": float(row.get("wind_speed_10m", 0.0)),
+            "wind_gust_mph": float(row.get("wind_gusts_10m", 0.0)),
+            "wind_from_degrees": wind_from,
+            "wind_direction": stadium_wind,
+            "wind_angle_difference": angle_difference,
+            "weather_code": row.get("weather_code"),
+            "condition": weather_code_text(row.get("weather_code")),
+            "forecast_time_utc": row["forecast_time"].strftime("%Y-%m-%d %H:%M UTC"),
+            "source": "Open-Meteo hourly forecast",
+            "error": None,
+        }
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError, TypeError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def automatic_game_weather(matchup: dict) -> dict:
+    metadata = load_stadium_weather_metadata(str(matchup.get("venue", "")))
+    mlb_location = fetch_mlb_venue_coordinates(matchup.get("venue_id"))
+    latitude = mlb_location.get("latitude") if mlb_location.get("ok") else metadata.get("latitude")
+    longitude = mlb_location.get("longitude") if mlb_location.get("ok") else metadata.get("longitude")
+    if latitude is None or longitude is None:
+        return {
+            "ok": False,
+            "metadata": metadata,
+            "error": metadata.get("error") or mlb_location.get("error") or "No stadium coordinates were available.",
+        }
+    result = fetch_open_meteo_game_weather(
+        float(latitude),
+        float(longitude),
+        str(matchup.get("game_datetime_utc") or ""),
+        metadata.get("outfield_bearing"),
+    )
+    result["metadata"] = metadata
+    result["coordinate_source"] = mlb_location.get("source") if mlb_location.get("ok") else metadata.get("source")
+    return result
+
 def weather_carry_multiplier(
     temperature_f: float,
     humidity_pct: float,
     wind_mph: float,
     wind_direction: str,
+    pressure_hpa: float,
     manual_multiplier: float,
+    enclosed: bool = False,
 ) -> float:
+    if enclosed:
+        return float(np.clip(manual_multiplier, 0.80, 1.20))
     temperature_factor = 1.0 + (temperature_f - 70.0) * 0.0025
     humidity_factor = 1.0 + (humidity_pct - 50.0) * 0.0003
+    pressure_factor = 1.0 + (1013.25 - pressure_hpa) * 0.00025
     if wind_direction == "Out":
         wind_factor = 1.0 + wind_mph * 0.008
     elif wind_direction == "In":
         wind_factor = 1.0 - wind_mph * 0.008
     else:
         wind_factor = 1.0
-    return float(np.clip(temperature_factor * humidity_factor * wind_factor * manual_multiplier, 0.72, 1.32))
+    return float(
+        np.clip(
+            temperature_factor
+            * humidity_factor
+            * pressure_factor
+            * wind_factor
+            * manual_multiplier,
+            0.72,
+            1.32,
+        )
+    )
 
 
 def build_hr_board(
@@ -1849,12 +2203,15 @@ def inject_clean_css() -> None:
             --line: rgba(148, 163, 184, 0.28);
             --glass: rgba(255, 255, 255, 0.88);
         }
+        html, body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
         .stApp {
-            background:
-                radial-gradient(circle at 7% 2%, rgba(59,130,246,.14), transparent 26rem),
-                radial-gradient(circle at 93% 5%, rgba(249,115,22,.13), transparent 25rem),
-                linear-gradient(180deg, #f8fbff 0%, #f2f6fc 48%, #f8fafc 100%);
-            color: var(--ink);
+            background: #ffffff !important;
+            color: var(--ink) !important;
+        }
+        [data-testid="stHeader"] {
+            background: rgba(255, 255, 255, 0.96) !important;
         }
         .block-container {
             max-width: 1780px;
@@ -2116,7 +2473,9 @@ def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
                     "home_pitcher_id": home_probable.get("id"),
                     "home_pitcher_name": home_probable.get("fullName", "TBD"),
                     "time_et": game_time,
+                    "game_datetime_utc": raw_time,
                     "venue": game.get("venue", {}).get("name", "Venue TBD"),
+                    "venue_id": game.get("venue", {}).get("id"),
                     "status": game.get("status", {}).get("detailedState", "Scheduled"),
                 }
             )
@@ -2181,7 +2540,9 @@ def manual_matchup_controls(
         "batting_team": selected_team,
         "home_away": side,
         "venue": "Manual matchup",
+        "venue_id": None,
         "time_et": "",
+        "game_datetime_utc": None,
         "status": "Manual",
         "away_abbr": selected_team if side == "Away" else str(row["Pitcher_Team"]),
         "home_abbr": selected_team if side == "Home" else str(row["Pitcher_Team"]),
@@ -2399,7 +2760,9 @@ def matchup_selector(
                 "batting_team": selected_team,
                 "home_away": "Away" if away_offense else "Home",
                 "venue": game["venue"],
+                "venue_id": game.get("venue_id"),
                 "time_et": game["time_et"],
+                "game_datetime_utc": game.get("game_datetime_utc"),
                 "status": game["status"],
                 "away_abbr": game["away_abbr"],
                 "home_abbr": game["home_abbr"],
@@ -2579,7 +2942,7 @@ with st.expander("Game, park and weather adjustments", expanded=True):
             "Manual park-factor override",
             value=False,
             key=f"clean_hr_manual_park_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
-            help="Leave this off to use the automatic Baseball Savant 3-year factors.",
+            help="Leave this off to use the local three-year park_factors.csv values.",
         )
         if manual_park_override:
             park_hr_factor_lhb = st.number_input(
@@ -2610,27 +2973,97 @@ with st.expander("Game, park and weather adjustments", expanded=True):
         if st.button("Refresh park factors", key=f"clean_hr_refresh_park_{matchup.get('game_pk')}"):
             fetch_savant_park_factors.clear()
             st.rerun()
-        temperature_f = st.number_input(
-            "Temperature °F", 35.0, 110.0, 75.0, 1.0, key="clean_hr_temp"
-        )
+
     with c3:
+        use_auto_weather = st.checkbox(
+            "Automatic game-time weather",
+            value=True,
+            key=f"clean_hr_auto_weather_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            help="Uses the Open-Meteo hourly forecast nearest scheduled first pitch.",
+        )
+        weather_result = automatic_game_weather(matchup) if use_auto_weather else {"ok": False, "error": "Automatic weather disabled."}
+        metadata = weather_result.get("metadata") or load_stadium_weather_metadata(str(matchup.get("venue", "")))
+        roof_type = str(metadata.get("roof_type", "open")).lower()
+        if roof_type == "fixed":
+            roof_status = "Closed (fixed roof)"
+            roof_closed = True
+            st.info("Fixed roof: outdoor weather is neutralized.")
+        elif roof_type == "retractable":
+            roof_status = st.selectbox(
+                "Roof status",
+                ["Open / use forecast", "Closed / neutral weather"],
+                key=f"clean_hr_roof_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            )
+            roof_closed = roof_status.startswith("Closed")
+        else:
+            roof_status = "Open air"
+            roof_closed = False
+
+        if use_auto_weather and weather_result.get("ok"):
+            st.success(
+                f"{weather_result.get('condition', 'Forecast')} · "
+                f"{weather_result.get('forecast_time_utc', '')}"
+            )
+            default_temperature = float(np.clip(weather_result.get("temperature_f", 75.0), 20.0, 120.0))
+            default_humidity = float(np.clip(weather_result.get("humidity_pct", 50.0), 1.0, 100.0))
+            default_wind = float(np.clip(weather_result.get("wind_mph", 5.0), 0.0, 50.0))
+            default_pressure = float(np.clip(weather_result.get("pressure_hpa", 1013.25), 930.0, 1060.0))
+            default_wind_direction = str(weather_result.get("wind_direction", "Cross/Calm"))
+            precip_probability = float(weather_result.get("precip_probability", 0.0))
+            weather_source = str(weather_result.get("source", "Open-Meteo"))
+            st.caption(
+                f"Rain chance {precip_probability:.0f}% · gusts {weather_result.get('wind_gust_mph', 0.0):.0f} mph · "
+                f"wind from {weather_result.get('wind_from_degrees', 0.0):.0f}° classified {default_wind_direction}."
+            )
+        else:
+            default_temperature = 75.0
+            default_humidity = 50.0
+            default_wind = 5.0
+            default_pressure = 1013.25
+            default_wind_direction = "Cross/Calm"
+            precip_probability = np.nan
+            weather_source = "Manual fallback"
+            if use_auto_weather:
+                st.warning("Automatic weather was unavailable; the editable manual defaults are being used.")
+                if weather_result.get("error"):
+                    st.caption(str(weather_result["error"])[:300])
+
+        weather_key = f"{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}"
+        temperature_f = st.number_input(
+            "Temperature °F", 20.0, 120.0, default_temperature, 1.0,
+            key=f"clean_hr_temp_{weather_key}",
+        )
         humidity_pct = st.number_input(
-            "Humidity %", 5.0, 100.0, 50.0, 1.0, key="clean_hr_humidity"
+            "Humidity %", 1.0, 100.0, default_humidity, 1.0,
+            key=f"clean_hr_humidity_{weather_key}",
         )
         wind_mph = st.number_input(
-            "Wind mph", 0.0, 30.0, 5.0, 1.0, key="clean_hr_wind"
+            "Wind mph", 0.0, 50.0, default_wind, 1.0,
+            key=f"clean_hr_wind_{weather_key}",
         )
+        wind_options = ["Cross/Calm", "Out", "In"]
+        wind_index = wind_options.index(default_wind_direction) if default_wind_direction in wind_options else 0
         wind_direction = st.selectbox(
-            "Wind direction", ["Cross/Calm", "Out", "In"], key="clean_hr_wind_dir"
+            "Stadium wind effect", wind_options, index=wind_index,
+            key=f"clean_hr_wind_dir_{weather_key}",
+        )
+        pressure_hpa = st.number_input(
+            "Sea-level pressure (hPa)", 930.0, 1060.0, default_pressure, 0.5,
+            key=f"clean_hr_pressure_{weather_key}",
         )
         manual_weather = st.number_input(
-            "Manual weather multiplier",
+            "Extra manual weather multiplier",
             0.80,
             1.20,
             1.00,
             0.01,
-            key="clean_hr_weather_manual",
+            key=f"clean_hr_weather_manual_{weather_key}",
         )
+        if st.button("Refresh weather", key=f"clean_hr_refresh_weather_{weather_key}"):
+            fetch_open_meteo_game_weather.clear()
+            fetch_mlb_venue_coordinates.clear()
+            st.rerun()
+
     with c4:
         use_auto_bat_tracking = st.checkbox(
             "Automatic Savant bat tracking",
@@ -2675,6 +3108,7 @@ with st.expander("Game, park and weather adjustments", expanded=True):
             Park LHB: ×{park_hr_factor_lhb / 100:.2f}<br>
             Park RHB: ×{park_hr_factor_rhb / 100:.2f}<br>
             Park source: {escape(park_source)}<br>
+            Weather: {escape(weather_source)} · {escape(roof_status)}<br>
             Bat source: {escape(str(bat_tracking_result.get('source', 'Disabled')))}
             </div>
             """,
@@ -2694,11 +3128,17 @@ with st.expander("Game, park and weather adjustments", expanded=True):
         )
 
 weather_multiplier = weather_carry_multiplier(
-    temperature_f, humidity_pct, wind_mph, wind_direction, manual_weather
+    temperature_f,
+    humidity_pct,
+    wind_mph,
+    wind_direction,
+    pressure_hpa,
+    manual_weather,
+    enclosed=roof_closed,
 )
 st.caption(
     f"Weather carry adjustment: ×{weather_multiplier:.3f}. "
-    "This is a simple transparent adjustment, not an official ball-flight model."
+    "Automatic values are editable. This is a simple transparent adjustment, not an official ball-flight model."
 )
 
 preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
@@ -2775,8 +3215,18 @@ if rankings.empty:
 render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HOME RUN BOARD")
 render_leader_cards(rankings, "Model_1plus_HR", "HRScore", "model 1+ HR")
 
-quick_tab, power_tab, matchup_tab, tracking_tab, pitcher_tab, notes_tab = st.tabs(
-    ["Quick board", "Power profile", "Matchup detail", "Bat tracking", "Pitcher profile", "Model notes"]
+quick_tab, power_tab, matchup_tab, pitch_type_tab, tracking_tab, pitcher_tab, notes_tab = st.tabs(
+    [
+        "Quick board", "Power profile", "Matchup detail", "Batter vs pitch type",
+        "Bat tracking", "Pitcher profile", "Model notes"
+    ]
+)
+
+pitch_type_table = build_batter_pitch_type_table(
+    df,
+    rankings,
+    pitch_mix,
+    preview_hand,
 )
 
 with quick_tab:
@@ -2890,6 +3340,55 @@ with matchup_tab:
         height=520,
     )
 
+
+with pitch_type_tab:
+    st.caption(
+        "Historical results against each pitch type used by the selected starter, filtered to "
+        "the starter's throwing hand. Rates are shrunk toward league pitch-type averages, so "
+        "small samples stay near neutral. Pitch Type Score is 0–100; 50 is neutral."
+    )
+    if pitch_type_table.empty:
+        st.info("No batter-versus-pitch-type data were available for this matchup.")
+    else:
+        hitter_options = rankings.sort_values("Rank")["Player"].tolist()
+        selected_pitch_hitter = st.selectbox(
+            "Hitter",
+            hitter_options,
+            key=f"clean_hr_pitch_type_hitter_{selected_pitcher}_{selected_team}",
+        )
+        pitch_view = pitch_type_table[pitch_type_table["Player"].eq(selected_pitch_hitter)].copy()
+        pitch_view = pitch_view.sort_values("Pitcher Usage", ascending=False)
+        display_columns = [
+            "Pitch Type", "Pitcher Usage", "Pitcher Velo", "Pitches Seen", "PA Ends", "BBE", "HR",
+            "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
+            "Pull Air/BIP", "Contact%", "Whiff%", "Pitch Type Score", "Sample",
+        ]
+        pitch_view = pitch_view[[column for column in display_columns if column in pitch_view.columns]]
+        positive = [
+            column for column in [
+                "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
+                "Pull Air/BIP", "Contact%", "Pitch Type Score"
+            ] if column in pitch_view.columns
+        ]
+        risk = [column for column in ["Whiff%"] if column in pitch_view.columns]
+        pitch_style = pitch_view.style
+        if positive:
+            pitch_style = pitch_style.background_gradient(cmap="RdYlGn", subset=positive, axis=0)
+        if risk:
+            pitch_style = pitch_style.background_gradient(cmap="RdYlGn_r", subset=risk, axis=0)
+        pitch_style = pitch_style.format({
+            "Pitcher Usage": "{:.1%}", "Pitcher Velo": "{:.1f}", "HR/PA": "{:.2%}",
+            "Brl/BIP": "{:.1%}", "xSLG Contact": "{:.3f}", "xBA Contact": "{:.3f}",
+            "Hard Hit%": "{:.1%}", "Pull Air/BIP": "{:.1%}", "Contact%": "{:.1%}",
+            "Whiff%": "{:.1%}", "Pitch Type Score": "{:.1f}",
+        })
+        st.dataframe(
+            pitch_style,
+            use_container_width=True,
+            hide_index=True,
+            height=470,
+        )
+
 with tracking_tab:
     available_count = int(rankings.get("BatTrackingAvailable", pd.Series(False, index=rankings.index)).sum())
     st.caption(
@@ -2972,6 +3471,7 @@ with notes_tab:
         - **HR Score** is a 0–100 comparison score within the selected offense, not a literal probability.
         - **Pitcher Read / Side Attack** grades whether the starter has been more attackable or avoidable for LHB or RHB, with small samples shrunk toward neutral.
         - **Pitch Match** compares the hitter with the starter's pitch types, velocity, movement and extension.
+        - **Batter vs pitch type** surfaces the underlying historical split against the starter's pitch mix and throwing hand; it is already summarized by Pitch Match and is not added a second time.
         - **Zone Fit** weights hitter power by the locations the starter uses.
         - **Park Factor** is automatically matched to the selected venue from Baseball Savant when its live table is available; 110 means ×1.10 and 90 means ×0.90. A neutral/manual fallback remains available.
         - The weather multiplier is applied after the park adjustment.

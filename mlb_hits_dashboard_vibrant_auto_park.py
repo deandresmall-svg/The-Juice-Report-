@@ -2333,13 +2333,36 @@ with contact_tab:
         "HH_Pct": "Hard Hit%", "SweetSpot_Pct": "Sweet Spot%",
         "Sprint_Speed": "Sprint Speed",
     })
+    st.caption(
+        "Green highlights stronger hit-probability ingredients within the selected offense. "
+        "Whiff% and K% are reversed, so lower swing-and-miss risk appears greener."
+    )
+    positive_columns = [
+        column for column in [
+            "H/PA", "xHit/PA", "xBA Contact", "Contact%", "Zone Contact%",
+            "LD%", "Hard Hit%", "Sweet Spot%", "Sprint Speed"
+        ] if column in contact.columns
+    ]
+    risk_columns = [column for column in ["Whiff%", "K%"] if column in contact.columns]
+    contact_style = contact.style
+    if positive_columns:
+        contact_style = contact_style.background_gradient(
+            cmap="RdYlGn", subset=positive_columns, axis=0
+        )
+    if risk_columns:
+        contact_style = contact_style.background_gradient(
+            cmap="RdYlGn_r", subset=risk_columns, axis=0
+        )
+    contact_style = contact_style.set_properties(
+        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+    ).format({
+        "H/PA": "{:.1%}", "xHit/PA": "{:.1%}", "xBA Contact": "{:.3f}",
+        "Contact%": "{:.1%}", "Zone Contact%": "{:.1%}", "Whiff%": "{:.1%}",
+        "K%": "{:.1%}", "LD%": "{:.1%}", "Hard Hit%": "{:.1%}",
+        "Sweet Spot%": "{:.1%}", "Sprint Speed": "{:.1f}",
+    })
     st.dataframe(
-        contact.style.format({
-            "H/PA": "{:.1%}", "xHit/PA": "{:.1%}", "xBA Contact": "{:.3f}",
-            "Contact%": "{:.1%}", "Zone Contact%": "{:.1%}", "Whiff%": "{:.1%}",
-            "K%": "{:.1%}", "LD%": "{:.1%}", "Hard Hit%": "{:.1%}",
-            "Sweet Spot%": "{:.1%}", "Sprint Speed": "{:.1f}",
-        }),
+        contact_style,
         use_container_width=True,
         hide_index=True,
         height=520,
