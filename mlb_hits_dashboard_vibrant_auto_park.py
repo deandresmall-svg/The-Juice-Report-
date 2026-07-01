@@ -653,37 +653,82 @@ def hit_zone_fit(
 
 
 def bvp_hit_stats(df: pd.DataFrame, player_ids: Iterable[int], pitcher_id: int) -> pd.DataFrame:
-    rows = df[df["pitcher"].eq(pitcher_id) & df["batter"].isin(list(player_ids))]
+    ids = list(dict.fromkeys(int(player_id) for player_id in player_ids if pd.notna(player_id)))
+    base = pd.DataFrame({"player_id": ids})
+    defaults = {
+        "BvP_PA": 0,
+        "BvP_H": 0,
+        "BvP_xH": 0.0,
+        "BvP_K": 0,
+        "BvP_BBE": 0,
+        "BvP_Hard_Hits": 0,
+        "BvP_Avg_EV": np.nan,
+        "BvP_Hit_PA": 0.0,
+        "BvP_xHit_PA": 0.0,
+        "BvP_K_Pct": 0.0,
+        "BvP_HH_Pct": 0.0,
+        "BvPScore": 50.0,
+        "BvP_Last_Date": pd.NaT,
+    }
+    rows = df[df["pitcher"].eq(pitcher_id) & df["batter"].isin(ids)].copy()
+    if rows.empty:
+        for column, value in defaults.items():
+            base[column] = value
+        return base
+
     pa = rows[rows["is_pa_end"]]
     if pa.empty:
-        return pd.DataFrame(
-            {
-                "player_id": list(player_ids),
-                "BvP_PA": 0,
-                "BvP_H": 0,
-                "BvP_xH": 0.0,
-                "BvPScore": 50.0,
-            }
-        )
+        for column, value in defaults.items():
+            base[column] = value
+        return base
+
     result = (
         pa.groupby("batter")
         .agg(
             BvP_PA=("pa_key", "nunique"),
             BvP_H=("is_hit", "sum"),
             BvP_xH=("xba_value", "sum"),
+            BvP_K=("is_k", "sum"),
+            BvP_Last_Date=("game_date", "max"),
         )
         .reset_index()
         .rename(columns={"batter": "player_id"})
     )
-    raw = 0.5 * safe_divide(result["BvP_H"], result["BvP_PA"], 0.0) + 0.5 * safe_divide(
-        result["BvP_xH"], result["BvP_PA"], 0.0
-    )
+
+    bbe = rows[rows["is_bbe"]]
+    if not bbe.empty:
+        batted = (
+            bbe.groupby("batter")
+            .agg(
+                BvP_BBE=("is_bbe", "sum"),
+                BvP_Hard_Hits=("is_hard_hit", "sum"),
+                BvP_Avg_EV=("launch_speed", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"batter": "player_id"})
+        )
+        result = result.merge(batted, on="player_id", how="left")
+
+    for column in ["BvP_PA", "BvP_H", "BvP_xH", "BvP_K", "BvP_BBE", "BvP_Hard_Hits"]:
+        result[column] = pd.to_numeric(result.get(column, 0), errors="coerce").fillna(0)
+
+    result["BvP_Hit_PA"] = safe_divide(result["BvP_H"], result["BvP_PA"], 0.0)
+    result["BvP_xHit_PA"] = safe_divide(result["BvP_xH"], result["BvP_PA"], 0.0)
+    result["BvP_K_Pct"] = safe_divide(result["BvP_K"], result["BvP_PA"], 0.0)
+    result["BvP_HH_Pct"] = safe_divide(result["BvP_Hard_Hits"], result["BvP_BBE"], 0.0)
+
+    raw = 0.5 * result["BvP_Hit_PA"] + 0.5 * result["BvP_xHit_PA"]
     performance = percentile(raw)
     reliability = np.minimum(result["BvP_PA"] / 20.0, 1.0)
     result["BvPScore"] = 50 + reliability * (performance - 50)
-    return pd.DataFrame({"player_id": list(player_ids)}).merge(result, on="player_id", how="left").fillna(
-        {"BvP_PA": 0, "BvP_H": 0, "BvP_xH": 0.0, "BvPScore": 50.0}
-    )
+
+    output = base.merge(result, on="player_id", how="left")
+    for column, value in defaults.items():
+        if column not in output.columns:
+            output[column] = value
+        elif column != "BvP_Last_Date":
+            output[column] = output[column].fillna(value)
+    return output
 
 
 def infer_recent_lineup(df: pd.DataFrame, team: str) -> pd.DataFrame:
@@ -846,6 +891,7 @@ def build_hit_board(
     is_away: bool,
     starter_innings: float,
     bullpen_multiplier: float,
+    lineup_override: pd.DataFrame | None,
     lineup_edits: pd.DataFrame | None,
     sprint_upload,
     active_roster: pd.DataFrame | None,
@@ -855,7 +901,9 @@ def build_hit_board(
     if not pitcher_hand:
         return pd.DataFrame(), profile
 
-    recent_lineup = infer_recent_lineup(df, team)
+    recent_lineup = _clean_lineup_seed(lineup_override)
+    if recent_lineup.empty:
+        recent_lineup = infer_recent_lineup(df, team)
     board = aggregate_hitters(df, pitcher_hand, 0)
     board = add_roster_candidates(
         board, team, active_roster, recent_lineup, min_pa, include_low_sample
@@ -1694,6 +1742,219 @@ def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
     return games, None
 
 
+def _parse_mlb_team_lineup(team_box: dict) -> pd.DataFrame:
+    """Extract the original 1-9 batting order from an MLB boxscore team block."""
+    columns = [
+        "player_id", "Player_MLB", "Position_MLB", "LineupSpot",
+        "LineupRole", "RawBattingOrder",
+    ]
+    if not isinstance(team_box, dict):
+        return pd.DataFrame(columns=columns)
+
+    players = team_box.get("players", {}) or {}
+    candidates: list[dict] = []
+
+    for player_key, record in players.items():
+        if not isinstance(record, dict):
+            continue
+        person = record.get("person", {}) or {}
+        player_id = person.get("id")
+        if player_id is None:
+            digits = "".join(character for character in str(player_key) if character.isdigit())
+            player_id = int(digits) if digits else None
+        numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+        if pd.isna(numeric_id):
+            continue
+
+        raw_order = record.get("battingOrder")
+        numeric_order = pd.to_numeric(pd.Series([raw_order]), errors="coerce").iloc[0]
+        if pd.isna(numeric_order):
+            continue
+        numeric_order = int(numeric_order)
+        lineup_spot = numeric_order // 100 if numeric_order >= 100 else numeric_order
+        if lineup_spot < 1 or lineup_spot > 9:
+            continue
+
+        game_status = record.get("gameStatus", {}) or {}
+        is_substitute = bool(game_status.get("isSubstitute", False))
+        is_on_bench = bool(game_status.get("isOnBench", False))
+        position = record.get("position", {}) or {}
+        candidates.append(
+            {
+                "player_id": int(numeric_id),
+                "Player_MLB": person.get("fullName") or person.get("fullNameLastFirst") or f"MLB ID {int(numeric_id)}",
+                "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                "LineupSpot": int(lineup_spot),
+                "LineupRole": "Substitute" if is_substitute else "Starter",
+                "RawBattingOrder": int(numeric_order),
+                "_substitute": is_substitute,
+                "_bench": is_on_bench,
+            }
+        )
+
+    # Some versions of the game feed expose the ordered player IDs separately.
+    # Use that list only to fill missing lineup spots.
+    ordered_ids = team_box.get("battingOrder") or []
+    if not isinstance(ordered_ids, list) or len(ordered_ids) < 9:
+        ordered_ids = team_box.get("batters") or []
+    if isinstance(ordered_ids, list) and len(ordered_ids) >= 9:
+        existing_spots = {int(row["LineupSpot"]) for row in candidates}
+        player_lookup = {}
+        for player_key, record in players.items():
+            if not isinstance(record, dict):
+                continue
+            person = record.get("person", {}) or {}
+            pid = person.get("id")
+            if pid is None:
+                digits = "".join(character for character in str(player_key) if character.isdigit())
+                pid = int(digits) if digits else None
+            if pid is not None:
+                player_lookup[int(pid)] = record
+
+        for spot, player_id in enumerate(ordered_ids[:9], start=1):
+            if spot in existing_spots:
+                continue
+            numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+            if pd.isna(numeric_id):
+                continue
+            numeric_id = int(numeric_id)
+            record = player_lookup.get(numeric_id, {})
+            person = record.get("person", {}) or {}
+            position = record.get("position", {}) or {}
+            candidates.append(
+                {
+                    "player_id": numeric_id,
+                    "Player_MLB": person.get("fullName") or f"MLB ID {numeric_id}",
+                    "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                    "LineupSpot": spot,
+                    "LineupRole": "Starter",
+                    "RawBattingOrder": spot * 100,
+                    "_substitute": False,
+                    "_bench": False,
+                }
+            )
+
+    if not candidates:
+        return pd.DataFrame(columns=columns)
+
+    lineup = pd.DataFrame(candidates)
+    lineup = lineup.sort_values(
+        ["LineupSpot", "_substitute", "_bench", "RawBattingOrder"],
+        ascending=[True, True, True, True],
+    )
+    lineup = lineup.drop_duplicates("LineupSpot", keep="first")
+    lineup = lineup[lineup["LineupSpot"].between(1, 9)].copy()
+    lineup = lineup.sort_values("LineupSpot").reset_index(drop=True)
+    return lineup[columns]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_mlb_confirmed_lineup(game_pk: object, team_side: str) -> dict:
+    """Fetch a posted lineup from MLB's game feed with a boxscore fallback."""
+    numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
+    side = str(team_side).lower().strip()
+    if pd.isna(numeric_game) or side not in {"away", "home"}:
+        return {
+            "ok": False,
+            "status": "Unavailable",
+            "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+            "source": "Manual/recent lineup",
+            "game_state": "",
+            "updated": "",
+            "error": "A valid MLB game and team side were not available.",
+        }
+
+    game_pk_int = int(numeric_game)
+    endpoints = [
+        ("MLB live game feed", f"https://statsapi.mlb.com/api/v1.1/game/{game_pk_int}/feed/live"),
+        ("MLB boxscore", f"https://statsapi.mlb.com/api/v1/game/{game_pk_int}/boxscore"),
+    ]
+    errors: list[str] = []
+
+    for source_name, url in endpoints:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 MLB-Statcast-Dashboard/3.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=12) as response:
+                payload = json.load(response)
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}: {exc}")
+            continue
+
+        if "liveData" in payload:
+            team_box = (
+                payload.get("liveData", {})
+                .get("boxscore", {})
+                .get("teams", {})
+                .get(side, {})
+            )
+            game_state = (
+                payload.get("gameData", {})
+                .get("status", {})
+                .get("detailedState", "")
+            )
+            feed_timestamp = payload.get("metaData", {}).get("timeStamp")
+        else:
+            team_box = payload.get("teams", {}).get(side, {})
+            game_state = ""
+            feed_timestamp = None
+
+        lineup = _parse_mlb_team_lineup(team_box)
+        unique_spots = int(lineup["LineupSpot"].nunique()) if not lineup.empty else 0
+        if unique_spots:
+            status = "Confirmed" if unique_spots >= 9 else "Partial"
+            updated = str(feed_timestamp or pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %I:%M %p ET"))
+            return {
+                "ok": unique_spots >= 9,
+                "status": status,
+                "lineup": lineup,
+                "source": source_name,
+                "game_state": game_state,
+                "updated": updated,
+                "error": None,
+            }
+
+    return {
+        "ok": False,
+        "status": "Not posted",
+        "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+        "source": "Recent lineup fallback",
+        "game_state": "",
+        "updated": "",
+        "error": " | ".join(errors[-2:]) if errors else "No batting order was present in the MLB game feed yet.",
+    }
+
+
+def _clean_lineup_seed(lineup: pd.DataFrame | None) -> pd.DataFrame:
+    if lineup is None or lineup.empty:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean = lineup[[column for column in ["player_id", "LineupSpot"] if column in lineup.columns]].copy()
+    if set(clean.columns) != {"player_id", "LineupSpot"}:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean["player_id"] = pd.to_numeric(clean["player_id"], errors="coerce")
+    clean["LineupSpot"] = pd.to_numeric(clean["LineupSpot"], errors="coerce")
+    clean = clean.dropna(subset=["player_id", "LineupSpot"])
+    clean = clean[clean["LineupSpot"].between(1, 9)]
+    clean["player_id"] = clean["player_id"].astype(int)
+    clean["LineupSpot"] = clean["LineupSpot"].astype(int)
+    return clean.drop_duplicates("LineupSpot").sort_values("LineupSpot").reset_index(drop=True)
+
+
+def _lineup_fingerprint(lineup: pd.DataFrame) -> str:
+    clean = _clean_lineup_seed(lineup)
+    if clean.empty:
+        return "fallback"
+    return "_".join(
+        f"{int(row.player_id)}-{int(row.LineupSpot)}"
+        for row in clean.itertuples(index=False)
+    )
+
+
 def match_statcast_team(team_code: str, available_teams: list[str]) -> str | None:
     if team_code in available_teams:
         return team_code
@@ -2217,10 +2478,71 @@ with st.expander("Game context and model adjustments", expanded=True):
         )
 
 preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
+
 preview_recent_lineup = infer_recent_lineup(df, selected_team)
+lineup_seed = preview_recent_lineup.copy()
+lineup_source_label = "Latest observed lineup from the loaded Statcast sample"
+lineup_result = None
+lineup_game_pk = matchup.get("game_pk")
+lineup_side = "away" if home_away == "Away" else "home"
+
+with st.expander("Automatic MLB lineup", expanded=True):
+    use_mlb_lineup = st.checkbox(
+        "Use the posted MLB lineup automatically",
+        value=bool(lineup_game_pk),
+        disabled=not bool(lineup_game_pk),
+        key=f"clean_hits_use_mlb_lineup_{lineup_game_pk}_{selected_team}",
+        help="When all nine hitters are posted, they replace the recent-lineup fallback and set batting order automatically.",
+    )
+
+    if lineup_game_pk and use_mlb_lineup:
+        lineup_result = fetch_mlb_confirmed_lineup(lineup_game_pk, lineup_side)
+        posted_lineup = _clean_lineup_seed(lineup_result.get("lineup"))
+        if lineup_result.get("ok") and len(posted_lineup) >= 9:
+            lineup_seed = posted_lineup
+            lineup_source_label = f"Confirmed MLB lineup · {lineup_result.get('source', '')}"
+            st.success(
+                f"Confirmed lineup loaded: {len(posted_lineup)} hitters · "
+                f"{lineup_result.get('game_state') or matchup.get('status', '')}"
+            )
+            lineup_display = lineup_result["lineup"].copy()
+            lineup_display = lineup_display.rename(columns={
+                "LineupSpot": "Order", "Player_MLB": "Player", "Position_MLB": "Pos",
+                "LineupRole": "Role",
+            })
+            st.dataframe(
+                lineup_display[[column for column in ["Order", "Player", "Pos", "Role"] if column in lineup_display.columns]],
+                hide_index=True,
+                use_container_width=True,
+                height=360,
+            )
+        elif lineup_result.get("status") == "Partial":
+            st.warning(
+                f"MLB currently shows only {len(posted_lineup)} lineup spots. "
+                "The recent observed lineup remains the default until all nine are posted."
+            )
+        else:
+            st.info(
+                "The confirmed lineup has not been posted yet. "
+                "The most recent observed lineup remains the default."
+            )
+            if lineup_result.get("error"):
+                with st.expander("Lineup connection details"):
+                    st.code(str(lineup_result["error"]))
+
+        if st.button(
+            "Refresh MLB lineup",
+            key=f"clean_hits_refresh_lineup_{lineup_game_pk}_{selected_team}",
+        ):
+            fetch_mlb_confirmed_lineup.clear()
+            st.rerun()
+    elif not lineup_game_pk:
+        st.caption("Automatic lineups require a game selected from the MLB slate. Manual matchups use the recent-lineup fallback.")
+
+st.caption(f"Lineup source: {lineup_source_label}")
 preview_board = aggregate_hitters(df, preview_hand, 0)
 preview_board = add_roster_candidates(
-    preview_board, selected_team, active_roster, preview_recent_lineup, min_pa, include_low_sample
+    preview_board, selected_team, active_roster, lineup_seed, min_pa, include_low_sample
 )
 if preview_board.empty:
     st.warning(
@@ -2236,7 +2558,7 @@ preview_board["Player"] = preview_board["Player"].fillna(
     "MLB ID " + preview_board["player_id"].astype("Int64").astype(str)
 )
 preview_board = preview_board.drop(columns=["Player_Lookup"], errors="ignore")
-preview_board = preview_board.merge(preview_recent_lineup, on="player_id", how="left")
+preview_board = preview_board.merge(lineup_seed, on="player_id", how="left")
 lineup_input = preview_board[["player_id", "Player", "Position", "Bats", "PA", "SampleStatus", "LineupSpot"]].copy()
 default_selected = lineup_input["LineupSpot"].notna()
 if not default_selected.any():
@@ -2246,8 +2568,8 @@ lineup_input = lineup_input.sort_values(["LineupSpot", "Player"], na_position="l
 
 with st.expander("Confirm lineup", expanded=False):
     st.caption(
-        "The default order is inferred from the team's latest game in the loaded sample. "
-        "Update it when the confirmed lineup is available."
+        f"Default order: {lineup_source_label}. "
+        "You can still edit the order or remove a late scratch below."
     )
     lineup_edits = st.data_editor(
         lineup_input,
@@ -2260,7 +2582,7 @@ with st.expander("Confirm lineup", expanded=False):
                 "Lineup spot", min_value=1, max_value=9, step=1
             ),
         },
-        key=f"clean_hits_lineup_{selected_pitcher}_{selected_team}",
+        key=f"clean_hits_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
     )
 
 rankings, pitch_mix = build_hit_board(
@@ -2275,6 +2597,7 @@ rankings, pitch_mix = build_hit_board(
     is_away=home_away == "Away",
     starter_innings=starter_innings,
     bullpen_multiplier=bullpen_multiplier,
+    lineup_override=lineup_seed,
     lineup_edits=lineup_edits,
     sprint_upload=sprint_upload,
     active_roster=active_roster,
@@ -2288,8 +2611,11 @@ if rankings.empty:
 render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HIT BOARD")
 render_leader_cards(rankings, "Model_1plus_Hit", "HitScore", "model 1+ hit")
 
-quick_tab, contact_tab, matchup_tab, pitcher_tab, notes_tab = st.tabs(
-    ["Quick board", "Contact profile", "Matchup detail", "Pitcher profile", "Model notes"]
+quick_tab, contact_tab, matchup_tab, bvp_tab, pitcher_tab, notes_tab = st.tabs(
+    [
+        "Quick board", "Contact profile", "Matchup detail", "Batter vs pitcher",
+        "Pitcher profile", "Model notes"
+    ]
 )
 
 with quick_tab:
@@ -2387,6 +2713,49 @@ with matchup_tab:
         detail.style.background_gradient(cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100).format(
             {column: "{:.1f}" for column in score_cols}
         ),
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
+
+
+with bvp_tab:
+    st.caption(
+        "Direct history against the selected starting pitcher. BvP Score is heavily "
+        "shrunk toward 50 until the hitter reaches a meaningful sample; treat very small "
+        "samples as context rather than a standalone reason to bet."
+    )
+    bvp_columns = [
+        "Player", "BvP_PA", "BvP_H", "BvP_Hit_PA", "BvP_xHit_PA",
+        "BvP_K", "BvP_K_Pct", "BvP_BBE", "BvP_Avg_EV", "BvP_HH_Pct",
+        "BvPScore", "BvP_Last_Date",
+    ]
+    bvp_view = rankings[[column for column in bvp_columns if column in rankings.columns]].copy()
+    bvp_view = bvp_view.rename(columns={
+        "BvP_PA": "PA", "BvP_H": "Hits", "BvP_Hit_PA": "H/PA",
+        "BvP_xHit_PA": "xH/PA", "BvP_K": "K", "BvP_K_Pct": "K%",
+        "BvP_BBE": "BBE", "BvP_Avg_EV": "Avg EV", "BvP_HH_Pct": "Hard Hit%",
+        "BvPScore": "BvP Score", "BvP_Last_Date": "Last Faced",
+    })
+    if "Last Faced" in bvp_view.columns:
+        bvp_view["Last Faced"] = pd.to_datetime(bvp_view["Last Faced"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+    bvp_view = bvp_view.sort_values(["PA", "BvP Score"], ascending=[False, False])
+    positive_bvp = [column for column in ["H/PA", "xH/PA", "Avg EV", "Hard Hit%", "BvP Score"] if column in bvp_view.columns]
+    risk_bvp = [column for column in ["K%"] if column in bvp_view.columns]
+    bvp_style = bvp_view.style
+    if positive_bvp:
+        bvp_style = bvp_style.background_gradient(cmap="RdYlGn", subset=positive_bvp, axis=0)
+    if risk_bvp:
+        bvp_style = bvp_style.background_gradient(cmap="RdYlGn_r", subset=risk_bvp, axis=0)
+    bvp_style = bvp_style.set_properties(
+        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+    ).format({
+        "PA": "{:.0f}", "Hits": "{:.0f}", "H/PA": "{:.1%}", "xH/PA": "{:.1%}",
+        "K": "{:.0f}", "K%": "{:.1%}", "BBE": "{:.0f}", "Avg EV": "{:.1f}",
+        "Hard Hit%": "{:.1%}", "BvP Score": "{:.1f}",
+    }, na_rep="—")
+    st.dataframe(
+        bvp_style,
         use_container_width=True,
         hide_index=True,
         height=520,

@@ -1588,6 +1588,7 @@ def build_hr_board(
     starter_innings: float,
     bullpen_multiplier: float,
     weather_multiplier: float,
+    lineup_override: pd.DataFrame | None,
     lineup_edits: pd.DataFrame | None,
     bat_tracking_upload,
     bat_tracking_auto: pd.DataFrame | None,
@@ -1598,7 +1599,9 @@ def build_hr_board(
     if not pitcher_hand:
         return pd.DataFrame(), profile
 
-    recent_lineup = infer_recent_lineup(df, team)
+    recent_lineup = _clean_lineup_seed(lineup_override)
+    if recent_lineup.empty:
+        recent_lineup = infer_recent_lineup(df, team)
     board = aggregate_hr_hitters(df, pitcher_hand, 0)
     board = add_roster_candidates(
         board, team, active_roster, recent_lineup, min_pa, include_low_sample
@@ -2482,6 +2485,219 @@ def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
     return games, None
 
 
+def _parse_mlb_team_lineup(team_box: dict) -> pd.DataFrame:
+    """Extract the original 1-9 batting order from an MLB boxscore team block."""
+    columns = [
+        "player_id", "Player_MLB", "Position_MLB", "LineupSpot",
+        "LineupRole", "RawBattingOrder",
+    ]
+    if not isinstance(team_box, dict):
+        return pd.DataFrame(columns=columns)
+
+    players = team_box.get("players", {}) or {}
+    candidates: list[dict] = []
+
+    for player_key, record in players.items():
+        if not isinstance(record, dict):
+            continue
+        person = record.get("person", {}) or {}
+        player_id = person.get("id")
+        if player_id is None:
+            digits = "".join(character for character in str(player_key) if character.isdigit())
+            player_id = int(digits) if digits else None
+        numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+        if pd.isna(numeric_id):
+            continue
+
+        raw_order = record.get("battingOrder")
+        numeric_order = pd.to_numeric(pd.Series([raw_order]), errors="coerce").iloc[0]
+        if pd.isna(numeric_order):
+            continue
+        numeric_order = int(numeric_order)
+        lineup_spot = numeric_order // 100 if numeric_order >= 100 else numeric_order
+        if lineup_spot < 1 or lineup_spot > 9:
+            continue
+
+        game_status = record.get("gameStatus", {}) or {}
+        is_substitute = bool(game_status.get("isSubstitute", False))
+        is_on_bench = bool(game_status.get("isOnBench", False))
+        position = record.get("position", {}) or {}
+        candidates.append(
+            {
+                "player_id": int(numeric_id),
+                "Player_MLB": person.get("fullName") or person.get("fullNameLastFirst") or f"MLB ID {int(numeric_id)}",
+                "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                "LineupSpot": int(lineup_spot),
+                "LineupRole": "Substitute" if is_substitute else "Starter",
+                "RawBattingOrder": int(numeric_order),
+                "_substitute": is_substitute,
+                "_bench": is_on_bench,
+            }
+        )
+
+    # Some versions of the game feed expose the ordered player IDs separately.
+    # Use that list only to fill missing lineup spots.
+    ordered_ids = team_box.get("battingOrder") or []
+    if not isinstance(ordered_ids, list) or len(ordered_ids) < 9:
+        ordered_ids = team_box.get("batters") or []
+    if isinstance(ordered_ids, list) and len(ordered_ids) >= 9:
+        existing_spots = {int(row["LineupSpot"]) for row in candidates}
+        player_lookup = {}
+        for player_key, record in players.items():
+            if not isinstance(record, dict):
+                continue
+            person = record.get("person", {}) or {}
+            pid = person.get("id")
+            if pid is None:
+                digits = "".join(character for character in str(player_key) if character.isdigit())
+                pid = int(digits) if digits else None
+            if pid is not None:
+                player_lookup[int(pid)] = record
+
+        for spot, player_id in enumerate(ordered_ids[:9], start=1):
+            if spot in existing_spots:
+                continue
+            numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+            if pd.isna(numeric_id):
+                continue
+            numeric_id = int(numeric_id)
+            record = player_lookup.get(numeric_id, {})
+            person = record.get("person", {}) or {}
+            position = record.get("position", {}) or {}
+            candidates.append(
+                {
+                    "player_id": numeric_id,
+                    "Player_MLB": person.get("fullName") or f"MLB ID {numeric_id}",
+                    "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                    "LineupSpot": spot,
+                    "LineupRole": "Starter",
+                    "RawBattingOrder": spot * 100,
+                    "_substitute": False,
+                    "_bench": False,
+                }
+            )
+
+    if not candidates:
+        return pd.DataFrame(columns=columns)
+
+    lineup = pd.DataFrame(candidates)
+    lineup = lineup.sort_values(
+        ["LineupSpot", "_substitute", "_bench", "RawBattingOrder"],
+        ascending=[True, True, True, True],
+    )
+    lineup = lineup.drop_duplicates("LineupSpot", keep="first")
+    lineup = lineup[lineup["LineupSpot"].between(1, 9)].copy()
+    lineup = lineup.sort_values("LineupSpot").reset_index(drop=True)
+    return lineup[columns]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_mlb_confirmed_lineup(game_pk: object, team_side: str) -> dict:
+    """Fetch a posted lineup from MLB's game feed with a boxscore fallback."""
+    numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
+    side = str(team_side).lower().strip()
+    if pd.isna(numeric_game) or side not in {"away", "home"}:
+        return {
+            "ok": False,
+            "status": "Unavailable",
+            "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+            "source": "Manual/recent lineup",
+            "game_state": "",
+            "updated": "",
+            "error": "A valid MLB game and team side were not available.",
+        }
+
+    game_pk_int = int(numeric_game)
+    endpoints = [
+        ("MLB live game feed", f"https://statsapi.mlb.com/api/v1.1/game/{game_pk_int}/feed/live"),
+        ("MLB boxscore", f"https://statsapi.mlb.com/api/v1/game/{game_pk_int}/boxscore"),
+    ]
+    errors: list[str] = []
+
+    for source_name, url in endpoints:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 MLB-Statcast-Dashboard/3.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=12) as response:
+                payload = json.load(response)
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}: {exc}")
+            continue
+
+        if "liveData" in payload:
+            team_box = (
+                payload.get("liveData", {})
+                .get("boxscore", {})
+                .get("teams", {})
+                .get(side, {})
+            )
+            game_state = (
+                payload.get("gameData", {})
+                .get("status", {})
+                .get("detailedState", "")
+            )
+            feed_timestamp = payload.get("metaData", {}).get("timeStamp")
+        else:
+            team_box = payload.get("teams", {}).get(side, {})
+            game_state = ""
+            feed_timestamp = None
+
+        lineup = _parse_mlb_team_lineup(team_box)
+        unique_spots = int(lineup["LineupSpot"].nunique()) if not lineup.empty else 0
+        if unique_spots:
+            status = "Confirmed" if unique_spots >= 9 else "Partial"
+            updated = str(feed_timestamp or pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %I:%M %p ET"))
+            return {
+                "ok": unique_spots >= 9,
+                "status": status,
+                "lineup": lineup,
+                "source": source_name,
+                "game_state": game_state,
+                "updated": updated,
+                "error": None,
+            }
+
+    return {
+        "ok": False,
+        "status": "Not posted",
+        "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+        "source": "Recent lineup fallback",
+        "game_state": "",
+        "updated": "",
+        "error": " | ".join(errors[-2:]) if errors else "No batting order was present in the MLB game feed yet.",
+    }
+
+
+def _clean_lineup_seed(lineup: pd.DataFrame | None) -> pd.DataFrame:
+    if lineup is None or lineup.empty:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean = lineup[[column for column in ["player_id", "LineupSpot"] if column in lineup.columns]].copy()
+    if set(clean.columns) != {"player_id", "LineupSpot"}:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean["player_id"] = pd.to_numeric(clean["player_id"], errors="coerce")
+    clean["LineupSpot"] = pd.to_numeric(clean["LineupSpot"], errors="coerce")
+    clean = clean.dropna(subset=["player_id", "LineupSpot"])
+    clean = clean[clean["LineupSpot"].between(1, 9)]
+    clean["player_id"] = clean["player_id"].astype(int)
+    clean["LineupSpot"] = clean["LineupSpot"].astype(int)
+    return clean.drop_duplicates("LineupSpot").sort_values("LineupSpot").reset_index(drop=True)
+
+
+def _lineup_fingerprint(lineup: pd.DataFrame) -> str:
+    clean = _clean_lineup_seed(lineup)
+    if clean.empty:
+        return "fallback"
+    return "_".join(
+        f"{int(row.player_id)}-{int(row.LineupSpot)}"
+        for row in clean.itertuples(index=False)
+    )
+
+
 def match_statcast_team(team_code: str, available_teams: list[str]) -> str | None:
     if team_code in available_teams:
         return team_code
@@ -3142,10 +3358,71 @@ st.caption(
 )
 
 preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
+
 preview_recent_lineup = infer_recent_lineup(df, selected_team)
+lineup_seed = preview_recent_lineup.copy()
+lineup_source_label = "Latest observed lineup from the loaded Statcast sample"
+lineup_result = None
+lineup_game_pk = matchup.get("game_pk")
+lineup_side = "away" if home_away == "Away" else "home"
+
+with st.expander("Automatic MLB lineup", expanded=True):
+    use_mlb_lineup = st.checkbox(
+        "Use the posted MLB lineup automatically",
+        value=bool(lineup_game_pk),
+        disabled=not bool(lineup_game_pk),
+        key=f"clean_hr_use_mlb_lineup_{lineup_game_pk}_{selected_team}",
+        help="When all nine hitters are posted, they replace the recent-lineup fallback and set batting order automatically.",
+    )
+
+    if lineup_game_pk and use_mlb_lineup:
+        lineup_result = fetch_mlb_confirmed_lineup(lineup_game_pk, lineup_side)
+        posted_lineup = _clean_lineup_seed(lineup_result.get("lineup"))
+        if lineup_result.get("ok") and len(posted_lineup) >= 9:
+            lineup_seed = posted_lineup
+            lineup_source_label = f"Confirmed MLB lineup · {lineup_result.get('source', '')}"
+            st.success(
+                f"Confirmed lineup loaded: {len(posted_lineup)} hitters · "
+                f"{lineup_result.get('game_state') or matchup.get('status', '')}"
+            )
+            lineup_display = lineup_result["lineup"].copy()
+            lineup_display = lineup_display.rename(columns={
+                "LineupSpot": "Order", "Player_MLB": "Player", "Position_MLB": "Pos",
+                "LineupRole": "Role",
+            })
+            st.dataframe(
+                lineup_display[[column for column in ["Order", "Player", "Pos", "Role"] if column in lineup_display.columns]],
+                hide_index=True,
+                use_container_width=True,
+                height=360,
+            )
+        elif lineup_result.get("status") == "Partial":
+            st.warning(
+                f"MLB currently shows only {len(posted_lineup)} lineup spots. "
+                "The recent observed lineup remains the default until all nine are posted."
+            )
+        else:
+            st.info(
+                "The confirmed lineup has not been posted yet. "
+                "The most recent observed lineup remains the default."
+            )
+            if lineup_result.get("error"):
+                with st.expander("Lineup connection details"):
+                    st.code(str(lineup_result["error"]))
+
+        if st.button(
+            "Refresh MLB lineup",
+            key=f"clean_hr_refresh_lineup_{lineup_game_pk}_{selected_team}",
+        ):
+            fetch_mlb_confirmed_lineup.clear()
+            st.rerun()
+    elif not lineup_game_pk:
+        st.caption("Automatic lineups require a game selected from the MLB slate. Manual matchups use the recent-lineup fallback.")
+
+st.caption(f"Lineup source: {lineup_source_label}")
 preview_board = aggregate_hr_hitters(df, preview_hand, 0)
 preview_board = add_roster_candidates(
-    preview_board, selected_team, active_roster, preview_recent_lineup, min_pa, include_low_sample
+    preview_board, selected_team, active_roster, lineup_seed, min_pa, include_low_sample
 )
 if preview_board.empty:
     st.warning(
@@ -3161,7 +3438,7 @@ preview_board["Player"] = preview_board["Player"].fillna(
     "MLB ID " + preview_board["player_id"].astype("Int64").astype(str)
 )
 preview_board = preview_board.drop(columns=["Player_Lookup"], errors="ignore")
-preview_board = preview_board.merge(preview_recent_lineup, on="player_id", how="left")
+preview_board = preview_board.merge(lineup_seed, on="player_id", how="left")
 lineup_input = preview_board[["player_id", "Player", "Position", "Bats", "PA", "SampleStatus", "LineupSpot"]].copy()
 default_selected = lineup_input["LineupSpot"].notna()
 if not default_selected.any():
@@ -3171,8 +3448,8 @@ lineup_input = lineup_input.sort_values(["LineupSpot", "Player"], na_position="l
 
 with st.expander("Confirm lineup", expanded=False):
     st.caption(
-        "The default order is inferred from the team's latest game in the loaded sample. "
-        "Update it when the confirmed lineup is available."
+        f"Default order: {lineup_source_label}. "
+        "You can still edit the order or remove a late scratch below."
     )
     lineup_edits = st.data_editor(
         lineup_input,
@@ -3185,7 +3462,7 @@ with st.expander("Confirm lineup", expanded=False):
                 "Lineup spot", min_value=1, max_value=9, step=1
             ),
         },
-        key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}",
+        key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
     )
 
 rankings, pitch_mix = build_hr_board(
@@ -3201,6 +3478,7 @@ rankings, pitch_mix = build_hr_board(
     starter_innings=starter_innings,
     bullpen_multiplier=bullpen_multiplier,
     weather_multiplier=weather_multiplier,
+    lineup_override=lineup_seed,
     lineup_edits=lineup_edits,
     bat_tracking_upload=bat_tracking_upload,
     bat_tracking_auto=bat_tracking_auto,
