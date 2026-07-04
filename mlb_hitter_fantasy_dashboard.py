@@ -65,17 +65,44 @@ def normalize_name(value: object) -> str:
     return "".join(character.lower() for character in str(value) if character.isalnum())
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+def compact_statcast_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce the in-memory size of the prepared Statcast sample."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    compact = frame.copy()
+    for column in compact.select_dtypes(include=["float64"]).columns:
+        compact[column] = pd.to_numeric(compact[column], errors="coerce", downcast="float")
+    for column in compact.select_dtypes(include=["int64"]).columns:
+        compact[column] = pd.to_numeric(compact[column], errors="coerce", downcast="integer")
+    for column in [
+        "pitch_name", "p_throws", "stand", "zone_group", "events", "description",
+        "home_team", "away_team", "inning_topbot", "batter_team",
+    ]:
+        if column in compact.columns:
+            compact[column] = compact[column].astype("category")
+    return compact
+
+
+@st.cache_data(ttl=21600, max_entries=2, show_spinner=False)
 def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
-    return statcast(
+    """Fetch, prepare and compact one bounded Statcast sample.
+
+    Caching the raw pybaseball frame and then storing a second prepared copy in
+    session state used substantially more memory. Only the compact prepared
+    frame is cached now.
+    """
+    raw = statcast(
         start_dt=start_date,
         end_dt=end_date,
         verbose=False,
         parallel=False,
     )
+    prepared = add_fantasy_event_flags(prepare_data(raw))
+    del raw
+    return compact_statcast_frame(prepared)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=8, show_spinner=False)
 def lookup_names(player_ids: tuple[int, ...]) -> pd.DataFrame:
     if not player_ids:
         return pd.DataFrame(columns=["player_id", "Player"])
@@ -1103,7 +1130,7 @@ def _read_url_text_allowing_error_body(url: str) -> tuple[str | None, str | None
         return None, str(exc)
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=8, show_spinner=False)
 def fetch_savant_bat_tracking_dataset(year: int) -> dict:
     """Best-effort automatic Baseball Savant bat-tracking download.
 
@@ -1388,7 +1415,7 @@ def load_stadium_weather_metadata(venue: str) -> dict:
     }
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=8, show_spinner=False)
 def fetch_mlb_venue_coordinates(venue_id: object) -> dict:
     """Use MLB's venue record for coordinates; return an empty result on failure."""
     numeric = pd.to_numeric(pd.Series([venue_id]), errors="coerce").iloc[0]
@@ -1458,7 +1485,7 @@ def weather_code_text(code: object) -> str:
     return "Forecast"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=24, show_spinner=False)
 def fetch_open_meteo_game_weather(
     latitude: float,
     longitude: float,
@@ -1822,6 +1849,9 @@ def build_hr_board(
 # Clean slate/matchup interface helpers
 # -----------------------------------------------------------------------------
 import json
+import re
+import unicodedata
+from difflib import SequenceMatcher
 from html import escape
 from io import StringIO
 from pathlib import Path
@@ -2020,7 +2050,7 @@ def _fetch_savant_side_factor(venue: str, year: int, side: str, metric: str) -> 
     return None, last_error
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, max_entries=8, show_spinner=False)
 def fetch_savant_park_factors(venue: str, year: int, metric: str) -> dict:
     """Read handed park factors from the repository's park_factors.csv file."""
     if not venue or normalize_name(venue) in {"manualmatchup", "venuetbd"}:
@@ -2127,7 +2157,7 @@ def team_id_from_code(team_code: object) -> int | None:
     return None
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=24, show_spinner=False)
 def fetch_active_roster(team_id: int | None, roster_date: str | None) -> tuple[pd.DataFrame, str | None]:
     """Return active non-pitchers, including bat side, from the MLB Stats API."""
     empty = pd.DataFrame(
@@ -2431,7 +2461,7 @@ def inject_clean_css() -> None:
     )
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=24, show_spinner=False)
 def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
     """Load an MLB slate. Gracefully falls back to manual selection on failure."""
     url = (
@@ -2598,7 +2628,7 @@ def _parse_mlb_team_lineup(team_box: dict) -> pd.DataFrame:
     return lineup[columns]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=48, show_spinner=False)
 def fetch_mlb_confirmed_lineup(game_pk: object, team_side: str) -> dict:
     """Fetch a posted lineup from MLB's game feed with a boxscore fallback."""
     numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
@@ -3105,7 +3135,7 @@ def _aggregate_event_counts(frame: pd.DataFrame, group_col: str, prefix: str) ->
     return grouped
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=21600, max_entries=3, show_spinner=False)
 def fetch_mlb_hitting_season_stats(player_ids: tuple[int, ...], season: int) -> pd.DataFrame:
     """Fetch season counting stats used for run, RBI and stolen-base baselines."""
     columns = [
@@ -3249,7 +3279,7 @@ def build_fantasy_components(
         return pd.DataFrame()
 
     board = hr_board.copy()
-    event_df = add_fantasy_event_flags(df)
+    event_df = df if "fs_single" in df.columns else add_fantasy_event_flags(df)
     player_ids = board["player_id"].dropna().astype(int).tolist()
 
     overall = _aggregate_event_counts(event_df[event_df["batter"].isin(player_ids)], "batter", "FSAll")
@@ -3431,7 +3461,7 @@ def _seed_for_player(player_id: object, extra: str = "") -> int:
 def simulate_fantasy_scores(
     row: pd.Series,
     scoring: dict[str, float],
-    simulations: int = 7000,
+    simulations: int = 3000,
     seed_extra: str = "",
 ) -> np.ndarray:
     rng = np.random.default_rng(_seed_for_player(row.get("player_id"), seed_extra))
@@ -3478,7 +3508,7 @@ def add_distribution_columns(board: pd.DataFrame, scoring: dict[str, float]) -> 
     output = board.copy()
     p25, p50, p75, p90, stds = [], [], [], [], []
     for _, row in output.iterrows():
-        scores = simulate_fantasy_scores(row, scoring, simulations=6000, seed_extra="distribution")
+        scores = simulate_fantasy_scores(row, scoring, simulations=2500, seed_extra="distribution")
         p25.append(float(np.quantile(scores, 0.25)))
         p50.append(float(np.quantile(scores, 0.50)))
         p75.append(float(np.quantile(scores, 0.75)))
@@ -3558,7 +3588,8 @@ def build_selected_slate(
     environments: list[dict] = []
     lineup_rows: list[dict] = []
     errors: list[str] = []
-    event_df = add_fantasy_event_flags(df)
+    event_df = df if "fs_single" in df.columns else add_fantasy_event_flags(df)
+    build_deep_details = len(games) <= 4
     available_teams = sorted(df["batter_team"].dropna().astype(str).unique().tolist())
 
     for game in games:
@@ -3667,6 +3698,9 @@ def build_selected_slate(
             fantasy["Team"] = team_code
             fantasy["Opponent"] = opponent_code
             fantasy["Game"] = f"{game.get('away_abbr')} @ {game.get('home_abbr')}"
+            fantasy["GamePK"] = game.get("game_pk")
+            fantasy["SlateDate"] = game.get("slate_date")
+            fantasy["GameDatetimeUTC"] = game.get("game_datetime_utc")
             fantasy["Pitcher"] = pitcher_name
             fantasy["PitcherHand"] = pitcher_hand
             fantasy["Venue"] = game.get("venue")
@@ -3677,16 +3711,20 @@ def build_selected_slate(
             fantasy["LineupSource"] = lineup_source
             boards.append(fantasy)
 
-            pitch_table = build_batter_pitch_type_table(event_df, fantasy, profile, pitcher_hand)
-            if not pitch_table.empty:
-                pitch_table["Team"] = team_code
-                pitch_table["Opponent"] = opponent_code
-                pitch_table["Pitcher"] = pitcher_name
-                pitch_tables.append(pitch_table)
+            # Detailed split tables are expensive across an entire MLB slate.
+            # Build them for up to four selected games; the main fantasy board
+            # still evaluates every selected game.
+            if build_deep_details:
+                pitch_table = build_batter_pitch_type_table(event_df, fantasy, profile, pitcher_hand)
+                if not pitch_table.empty:
+                    pitch_table["Team"] = team_code
+                    pitch_table["Opponent"] = opponent_code
+                    pitch_table["Pitcher"] = pitcher_name
+                    pitch_tables.append(pitch_table)
 
-            bvp = build_fantasy_bvp_table(event_df, fantasy, pitcher_id, pitcher_name, team_code, opponent_code)
-            if not bvp.empty:
-                bvp_tables.append(bvp)
+                bvp = build_fantasy_bvp_table(event_df, fantasy, pitcher_id, pitcher_name, team_code, opponent_code)
+                if not bvp.empty:
+                    bvp_tables.append(bvp)
 
             # Be defensive with partial or malformed lineup feeds. MLB can post
             # incomplete batting orders, and recent-game fallbacks can contain
@@ -3713,6 +3751,7 @@ def build_selected_slate(
             "board": pd.DataFrame(), "pitch_types": pd.DataFrame(), "bvp": pd.DataFrame(),
             "environment": pd.DataFrame(environments), "lineups": pd.DataFrame(lineup_rows),
             "errors": errors,
+            "details_skipped": not build_deep_details,
         }
     board = pd.concat(boards, ignore_index=True)
     board = finalize_fantasy_rankings(board)
@@ -3724,6 +3763,7 @@ def build_selected_slate(
         "environment": pd.DataFrame(environments),
         "lineups": pd.DataFrame(lineup_rows),
         "errors": errors,
+        "details_skipped": not build_deep_details,
     }
 
 
@@ -3746,6 +3786,405 @@ def render_fantasy_leaders(board: pd.DataFrame) -> None:
             )
 
 
+# -----------------------------------------------------------------------------
+# Automatic PrizePicks hitter fantasy-score lines via The Odds API
+# -----------------------------------------------------------------------------
+ODDS_API_SPORT = "baseball_mlb"
+PP_FANTASY_MARKET = "batter_fantasy_score"
+PP_FANTASY_ALT_MARKET = "batter_fantasy_score_alternate"
+PP_BOOKMAKER_KEY = "prizepicks"
+
+
+def read_streamlit_secret(name: str) -> str:
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return str(value or "").strip()
+
+
+def odds_person_key(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    tokens = [
+        token for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in {"jr", "sr", "ii", "iii", "iv"}
+    ]
+    return "".join(tokens)
+
+
+def odds_player_match_score(target: object, candidate: object) -> float:
+    target_key = odds_person_key(target)
+    candidate_key = odds_person_key(candidate)
+    if not target_key or not candidate_key:
+        return 0.0
+    if target_key == candidate_key:
+        return 1.0
+
+    def tokens(value: object) -> list[str]:
+        raw = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+        return [
+            token for token in re.findall(r"[a-z0-9]+", raw.lower())
+            if token not in {"jr", "sr", "ii", "iii", "iv"}
+        ]
+
+    target_tokens = tokens(target)
+    candidate_tokens = tokens(candidate)
+    ratio = SequenceMatcher(None, target_key, candidate_key).ratio()
+    if target_tokens and candidate_tokens and target_tokens[-1] == candidate_tokens[-1]:
+        if target_tokens[0][:1] == candidate_tokens[0][:1]:
+            return max(0.94, ratio)
+        return max(0.78, ratio)
+    return ratio
+
+
+def odds_team_key(value: object) -> str:
+    text = normalize_name(value)
+    aliases = {
+        "oaklandathletics": "athletics",
+        "sacramentoathletics": "athletics",
+        "athletics": "athletics",
+        "whitesox": "chicagowhitesox",
+        "redsox": "bostonredsox",
+    }
+    return aliases.get(text, text)
+
+
+def odds_api_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"HTTP {exc.code}: {(body[:500].strip() or exc.reason)}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def odds_quota(response) -> dict:
+    headers = getattr(response, "headers", {})
+    return {
+        "requests_remaining": headers.get("x-requests-remaining"),
+        "requests_used": headers.get("x-requests-used"),
+        "requests_last": headers.get("x-requests-last"),
+    }
+
+
+@st.cache_data(ttl=600, max_entries=8, show_spinner=False)
+def fetch_odds_api_events_fs(
+    api_key: str,
+    commence_from: str,
+    commence_to: str,
+) -> tuple[list[dict], dict, str | None]:
+    params = urlencode({
+        "apiKey": api_key,
+        "dateFormat": "iso",
+        "commenceTimeFrom": commence_from,
+        "commenceTimeTo": commence_to,
+    })
+    url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/events?{params}"
+    request = Request(
+        url,
+        headers={"User-Agent": "MLB-Hitter-Fantasy-Dashboard/1.1", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+            quota = odds_quota(response)
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+        return [], {}, odds_api_error(exc)
+    if not isinstance(payload, list):
+        return [], quota, "The Odds API events endpoint returned an unexpected response."
+    return payload, quota, None
+
+
+@st.cache_data(ttl=300, max_entries=64, show_spinner=False)
+def fetch_prizepicks_event_fs(
+    api_key: str,
+    event_id: str,
+    include_alternates: bool,
+) -> tuple[dict, dict, str | None]:
+    markets = [PP_FANTASY_MARKET]
+    if include_alternates:
+        markets.append(PP_FANTASY_ALT_MARKET)
+    params = urlencode({
+        "apiKey": api_key,
+        "bookmakers": PP_BOOKMAKER_KEY,
+        "markets": ",".join(markets),
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeMultipliers": "true",
+    })
+    url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/events/{event_id}/odds?{params}"
+    request = Request(
+        url,
+        headers={"User-Agent": "MLB-Hitter-Fantasy-Dashboard/1.1", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=25) as response:
+            payload = json.load(response)
+            quota = odds_quota(response)
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+        return {}, {}, odds_api_error(exc)
+    if not isinstance(payload, dict):
+        return {}, quota, "The PrizePicks event-odds response had an unexpected format."
+    return payload, quota, None
+
+
+def slate_utc_bounds_for_odds(slate_date: object) -> tuple[str, str]:
+    day = pd.Timestamp(slate_date)
+    try:
+        start = day.tz_localize("America/New_York").tz_convert("UTC")
+    except Exception:
+        start = day.tz_localize("UTC")
+    return (
+        (start - pd.Timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+        (start + pd.Timedelta(days=1, hours=8)).isoformat().replace("+00:00", "Z"),
+    )
+
+
+def match_odds_event_for_game(game: dict, events: list[dict]) -> dict | None:
+    away_keys = {odds_team_key(game.get("away_name")), odds_team_key(game.get("away_abbr"))}
+    home_keys = {odds_team_key(game.get("home_name")), odds_team_key(game.get("home_abbr"))}
+    candidates: list[dict] = []
+    for event in events:
+        event_away = odds_team_key(event.get("away_team"))
+        event_home = odds_team_key(event.get("home_team"))
+        if event_away in away_keys and event_home in home_keys:
+            candidates.append(event)
+    if not candidates:
+        return None
+    game_time = pd.to_datetime(game.get("game_datetime_utc"), utc=True, errors="coerce")
+    if pd.isna(game_time) or len(candidates) == 1:
+        return candidates[0]
+
+    def time_distance(event: dict) -> float:
+        event_time = pd.to_datetime(event.get("commence_time"), utc=True, errors="coerce")
+        if pd.isna(event_time):
+            return float("inf")
+        return abs((event_time - game_time).total_seconds())
+
+    return min(candidates, key=time_distance)
+
+
+def _numeric_or_nan(value: object) -> float:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else np.nan
+    if isinstance(value, dict):
+        for key in ("value", "multiplier", "decimal"):
+            if key in value:
+                value = value[key]
+                break
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) else np.nan
+
+
+def parse_prizepicks_fantasy_payload(payload: dict, game: dict) -> pd.DataFrame:
+    rows: list[dict] = []
+    for bookmaker in payload.get("bookmakers", []) or []:
+        bookmaker_key = str(bookmaker.get("key", ""))
+        if bookmaker_key != PP_BOOKMAKER_KEY:
+            continue
+        bookmaker_title = str(bookmaker.get("title") or "PrizePicks")
+        for market in bookmaker.get("markets", []) or []:
+            market_key = str(market.get("key", ""))
+            if market_key not in {PP_FANTASY_MARKET, PP_FANTASY_ALT_MARKET}:
+                continue
+            grouped: dict[tuple[str, float, str], dict] = {}
+            for outcome in market.get("outcomes", []) or []:
+                raw_side = str(outcome.get("name", "")).strip().lower()
+                side_map = {
+                    "over": "Over", "more": "Over", "higher": "Over",
+                    "under": "Under", "less": "Under", "lower": "Under",
+                }
+                side = side_map.get(raw_side)
+                if side is None:
+                    continue
+                player = str(outcome.get("description") or outcome.get("participant") or "").strip()
+                point = _numeric_or_nan(outcome.get("point"))
+                if not player or not np.isfinite(point):
+                    continue
+                key = (odds_person_key(player), float(point), market_key)
+                record = grouped.setdefault(key, {
+                    "SlateDate": str(game.get("slate_date", "")),
+                    "GamePK": game.get("game_pk"),
+                    "OddsEventID": payload.get("id"),
+                    "BookmakerKey": bookmaker_key,
+                    "Bookmaker": bookmaker_title,
+                    "MarketKey": market_key,
+                    "LineType": "Standard" if market_key == PP_FANTASY_MARKET else "Alternate",
+                    "Player": player,
+                    "PlayerNorm": odds_person_key(player),
+                    "Line": float(point),
+                    "OverOdds": np.nan,
+                    "UnderOdds": np.nan,
+                    "OverMultiplier": np.nan,
+                    "UnderMultiplier": np.nan,
+                    "LastUpdate": market.get("last_update"),
+                })
+                price = _numeric_or_nan(outcome.get("price"))
+                multiplier = _numeric_or_nan(
+                    outcome.get("multiplier")
+                    if outcome.get("multiplier") is not None
+                    else outcome.get("multipliers")
+                )
+                record[f"{side}Odds"] = price
+                record[f"{side}Multiplier"] = multiplier
+            rows.extend(grouped.values())
+    return pd.DataFrame(rows)
+
+
+def fetch_prizepicks_fantasy_quotes(
+    api_key: str,
+    games: list[dict],
+    include_alternates: bool,
+) -> tuple[pd.DataFrame, dict, list[str]]:
+    if not games:
+        return pd.DataFrame(), {}, ["No MLB games were selected."]
+    slate_date = games[0].get("slate_date") or date.today()
+    commence_from, commence_to = slate_utc_bounds_for_odds(slate_date)
+    events, quota, event_error = fetch_odds_api_events_fs(api_key, commence_from, commence_to)
+    errors: list[str] = []
+    if event_error:
+        return pd.DataFrame(), quota, [event_error]
+
+    frames: list[pd.DataFrame] = []
+    credits_used = 0.0
+    queried = 0
+    matched = 0
+    for game in games:
+        event = match_odds_event_for_game(game, events)
+        if event is None:
+            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: no matching Odds API event.")
+            continue
+        matched += 1
+        payload, call_quota, call_error = fetch_prizepicks_event_fs(
+            api_key, str(event.get("id")), bool(include_alternates)
+        )
+        queried += 1
+        if call_quota:
+            quota.update({key: value for key, value in call_quota.items() if value is not None})
+            try:
+                credits_used += float(call_quota.get("requests_last") or 0)
+            except (TypeError, ValueError):
+                pass
+        if call_error:
+            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: {call_error}")
+            continue
+        parsed = parse_prizepicks_fantasy_payload(payload, game)
+        if not parsed.empty:
+            frames.append(parsed)
+
+    quota["events_matched"] = matched
+    quota["events_queried"] = queried
+    quota["estimated_credits_used_this_fetch"] = int(credits_used) if credits_used.is_integer() else round(credits_used, 2)
+    if not frames:
+        return pd.DataFrame(), quota, errors
+    quotes = pd.concat(frames, ignore_index=True, sort=False)
+    quotes["_Updated"] = pd.to_datetime(quotes.get("LastUpdate"), utc=True, errors="coerce")
+    quotes = quotes.sort_values("_Updated", na_position="first").drop_duplicates(
+        ["GamePK", "MarketKey", "PlayerNorm", "Line"], keep="last"
+    )
+    return quotes.drop(columns="_Updated").reset_index(drop=True), quota, errors
+
+
+def combine_prizepicks_quote_frames(
+    existing: pd.DataFrame,
+    new_quotes: pd.DataFrame,
+    slate_date: object,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    slate_text = str(pd.Timestamp(slate_date).date())
+    if existing is not None and not existing.empty:
+        old = existing.copy()
+        if "SlateDate" in old.columns:
+            old = old[old["SlateDate"].astype(str).eq(slate_text)]
+        if not old.empty:
+            frames.append(old)
+    if new_quotes is not None and not new_quotes.empty:
+        frames.append(new_quotes.copy())
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined["_Updated"] = pd.to_datetime(combined.get("LastUpdate"), utc=True, errors="coerce")
+    combined = combined.sort_values("_Updated", na_position="first").drop_duplicates(
+        ["GamePK", "MarketKey", "PlayerNorm", "Line"], keep="last"
+    )
+    return combined.drop(columns="_Updated").reset_index(drop=True)
+
+
+def match_prizepicks_quote(
+    quotes: pd.DataFrame,
+    game_pk: object,
+    player_name: str,
+    allow_alternate_fallback: bool = False,
+) -> dict | None:
+    if quotes is None or quotes.empty:
+        return None
+    candidates = quotes.copy()
+    numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
+    if pd.notna(numeric_game) and "GamePK" in candidates.columns:
+        same_game = pd.to_numeric(candidates["GamePK"], errors="coerce").eq(int(numeric_game))
+        if same_game.any():
+            candidates = candidates[same_game].copy()
+    if candidates.empty:
+        return None
+    candidates["_Match"] = candidates["Player"].map(
+        lambda candidate: odds_player_match_score(player_name, candidate)
+    )
+    candidates = candidates[candidates["_Match"] >= 0.78].copy()
+    if candidates.empty:
+        return None
+    standard = candidates[candidates["MarketKey"].eq(PP_FANTASY_MARKET)].copy()
+    if not standard.empty:
+        candidates = standard
+    elif not allow_alternate_fallback:
+        return None
+    candidates["_Updated"] = pd.to_datetime(candidates.get("LastUpdate"), utc=True, errors="coerce")
+    candidates = candidates.sort_values(["_Match", "_Updated"], ascending=[False, False], na_position="last")
+    return candidates.iloc[0].drop(labels=["_Match", "_Updated"], errors="ignore").to_dict()
+
+
+def attach_prizepicks_lines(
+    board: pd.DataFrame,
+    quotes: pd.DataFrame,
+    allow_alternate_fallback: bool = False,
+) -> pd.DataFrame:
+    result = board.copy()
+    defaults = {
+        "Auto_PP_Line": np.nan,
+        "PP_Line_Type": "",
+        "PP_Line_Source": "",
+        "PP_Over_Odds": np.nan,
+        "PP_Under_Odds": np.nan,
+        "PP_Over_Multiplier": np.nan,
+        "PP_Under_Multiplier": np.nan,
+        "PP_Line_Updated": "",
+        "PP_Player_Matched": "",
+    }
+    for column, default in defaults.items():
+        result[column] = default
+    if quotes is None or quotes.empty:
+        return result
+    for index, row in result.iterrows():
+        selected = match_prizepicks_quote(
+            quotes,
+            row.get("GamePK"),
+            str(row.get("Player", "")),
+            allow_alternate_fallback=allow_alternate_fallback,
+        )
+        if not selected:
+            continue
+        result.at[index, "Auto_PP_Line"] = _numeric_or_nan(selected.get("Line"))
+        result.at[index, "PP_Line_Type"] = str(selected.get("LineType") or "")
+        result.at[index, "PP_Line_Source"] = str(selected.get("Bookmaker") or "PrizePicks")
+        result.at[index, "PP_Over_Odds"] = _numeric_or_nan(selected.get("OverOdds"))
+        result.at[index, "PP_Under_Odds"] = _numeric_or_nan(selected.get("UnderOdds"))
+        result.at[index, "PP_Over_Multiplier"] = _numeric_or_nan(selected.get("OverMultiplier"))
+        result.at[index, "PP_Under_Multiplier"] = _numeric_or_nan(selected.get("UnderMultiplier"))
+        result.at[index, "PP_Line_Updated"] = str(selected.get("LastUpdate") or "")
+        result.at[index, "PP_Player_Matched"] = str(selected.get("Player") or "")
+    return result
+
+
 inject_clean_css()
 MODEL_KEY = "hitter_fs"
 
@@ -3761,23 +4200,38 @@ with st.sidebar:
     st.header("Model sample")
     yesterday = date.today() - timedelta(days=1)
     end_date_value = st.date_input("Stats through", value=yesterday, max_value=yesterday, key="fs_end")
-    lookback_days = st.slider("Lookback days", 28, 120, 60, 7, key="fs_lookback")
+    lookback_days = st.slider("Lookback days", 28, 120, 45, 7, key="fs_lookback", help="45 days is the balanced default. Longer windows use more memory.")
     min_pa = st.slider("Minimum hitter PA", 10, 100, 25, 5, key="fs_min_pa")
     include_low_sample = st.checkbox(
         "Include low-sample active hitters", value=True, key="fs_low_sample"
     )
     refresh_data = st.button("Load / refresh Statcast", type="primary", key="fs_refresh_data")
     st.divider()
+    st.header("Automatic PrizePicks lines")
+    secret_odds_api_key = read_streamlit_secret("THE_ODDS_API_KEY")
+    if secret_odds_api_key:
+        odds_api_key = secret_odds_api_key
+        st.caption("THE_ODDS_API_KEY loaded from this app's Streamlit Secrets.")
+    else:
+        odds_api_key = st.text_input(
+            "Temporary The Odds API key",
+            value="",
+            type="password",
+            key="fs_odds_api_key",
+            help="Recommended: save THE_ODDS_API_KEY in this Streamlit app's Secrets.",
+        ).strip()
+    st.caption("Lines are fetched only when you press the button, which protects API credits.")
+    st.divider()
     st.header("PrizePicks scoring")
     st.caption(
-        "PrizePicks hitter fantasy score: single 3, double 5, triple 8, home run 10, "
+        "PrizePicks hitter fantasy score: single 3, double 6, triple 10, home run 18, "
         "run 2, RBI 2, walk 2, hit by pitch 2, stolen base 5. Values remain editable."
     )
     scoring = {
         "Single": st.number_input("Single", 0.0, 20.0, 3.0, 0.5, key="fs_pts_single"),
-        "Double": st.number_input("Double", 0.0, 20.0, 5.0, 0.5, key="fs_pts_double"),
-        "Triple": st.number_input("Triple", 0.0, 25.0, 8.0, 0.5, key="fs_pts_triple"),
-        "HomeRun": st.number_input("Home run", 0.0, 30.0, 10.0, 0.5, key="fs_pts_hr"),
+        "Double": st.number_input("Double", 0.0, 20.0, 6.0, 0.5, key="fs_pts_double"),
+        "Triple": st.number_input("Triple", 0.0, 25.0, 10.0, 0.5, key="fs_pts_triple"),
+        "HomeRun": st.number_input("Home run", 0.0, 30.0, 18.0, 0.5, key="fs_pts_hr"),
         "Run": st.number_input("Run", 0.0, 10.0, 2.0, 0.5, key="fs_pts_run"),
         "RBI": st.number_input("RBI", 0.0, 10.0, 2.0, 0.5, key="fs_pts_rbi"),
         "Walk": st.number_input("Walk", 0.0, 10.0, 2.0, 0.5, key="fs_pts_walk"),
@@ -3786,18 +4240,18 @@ with st.sidebar:
     }
 
 start_date_value = end_date_value - timedelta(days=lookback_days - 1)
-if refresh_data or "fs_statcast_data" not in st.session_state:
-    with st.spinner(f"Loading Statcast from {start_date_value} through {end_date_value}..."):
-        raw = load_statcast(start_date_value.strftime("%Y-%m-%d"), end_date_value.strftime("%Y-%m-%d"))
-        st.session_state["fs_statcast_data"] = add_fantasy_event_flags(prepare_data(raw))
-        st.session_state["fs_loaded_dates"] = (start_date_value, end_date_value)
-
-df = st.session_state.get("fs_statcast_data", pd.DataFrame())
+if refresh_data:
+    load_statcast.clear()
+with st.spinner(f"Loading Statcast from {start_date_value} through {end_date_value}..."):
+    df = load_statcast(
+        start_date_value.strftime("%Y-%m-%d"),
+        end_date_value.strftime("%Y-%m-%d"),
+    )
 if df.empty:
     st.warning("No Statcast data was returned. Use completed dates and try again.")
     st.stop()
 
-loaded_start, loaded_end = st.session_state["fs_loaded_dates"]
+loaded_start, loaded_end = start_date_value, end_date_value
 st.caption(f"Using {len(df):,} pitches from {loaded_start} through {loaded_end}.")
 
 st.subheader("Choose the PrizePicks slate")
@@ -3943,45 +4397,213 @@ with board_tab:
     st.dataframe(style, width="stretch", hide_index=True, height=620)
 
 with pp_tab:
-    st.caption("Enter the current PrizePicks Hitter Fantasy Score line. Probabilities come from a discrete event simulation, not a normal distribution.")
-    comparison_seed = board[["player_id", "Player", "Team", "Opponent", "Projected_FS", "FS_Median", "FS_P75"]].copy()
-    comparison_seed["PP Line"] = comparison_seed["Projected_FS"].round() - 0.5
+    st.caption(
+        "Automatically fetch PrizePicks MLB Hitter Fantasy Score lines through The Odds API, "
+        "then compare each line with the dashboard simulation. Missing lines remain editable."
+    )
+
+    quote_state_key = f"fs_pp_quotes_{pd.Timestamp(slate_date).date()}"
+    quota_state_key = f"fs_pp_quota_{pd.Timestamp(slate_date).date()}"
+    error_state_key = f"fs_pp_errors_{pd.Timestamp(slate_date).date()}"
+
+    with st.expander("Automatic PrizePicks line fetch", expanded=True):
+        f1, f2 = st.columns([1, 1])
+        with f1:
+            include_alt_lines = st.checkbox(
+                "Also fetch Goblin/Demon alternate lines",
+                value=False,
+                key="fs_pp_include_alt",
+                help="Alternate markets can use additional Odds API credits. Standard lines are enough for the main comparison.",
+            )
+        with f2:
+            allow_alt_fallback = st.checkbox(
+                "Use an alternate line when a standard line is missing",
+                value=False,
+                key="fs_pp_alt_fallback",
+            )
+
+        fetch_lines = st.button(
+            f"Fetch / refresh PrizePicks lines for {len(selected_games)} selected game(s)",
+            type="primary",
+            width="stretch",
+            key="fs_fetch_pp_lines",
+        )
+        if fetch_lines:
+            if not odds_api_key:
+                st.error("Add THE_ODDS_API_KEY in this app's Streamlit Secrets or enter a temporary key in the sidebar.")
+            else:
+                with st.spinner("Fetching PrizePicks hitter fantasy-score lines..."):
+                    new_quotes, quota, fetch_errors = fetch_prizepicks_fantasy_quotes(
+                        odds_api_key,
+                        selected_games,
+                        include_alternates=include_alt_lines,
+                    )
+                existing_quotes = st.session_state.get(quote_state_key, pd.DataFrame())
+                st.session_state[quote_state_key] = combine_prizepicks_quote_frames(
+                    existing_quotes,
+                    new_quotes,
+                    slate_date,
+                )
+                st.session_state[quota_state_key] = quota
+                st.session_state[error_state_key] = fetch_errors
+
+        pp_quotes = st.session_state.get(quote_state_key, pd.DataFrame())
+        pp_quota = st.session_state.get(quota_state_key, {})
+        pp_errors = st.session_state.get(error_state_key, [])
+
+        metrics = st.columns(4)
+        standard_count = 0
+        alternate_count = 0
+        if isinstance(pp_quotes, pd.DataFrame) and not pp_quotes.empty:
+            standard_count = int(pp_quotes["MarketKey"].eq(PP_FANTASY_MARKET).sum())
+            alternate_count = int(pp_quotes["MarketKey"].eq(PP_FANTASY_ALT_MARKET).sum())
+        metrics[0].metric("Standard lines", f"{standard_count:,}")
+        metrics[1].metric("Alternate lines", f"{alternate_count:,}")
+        metrics[2].metric("Events queried", pp_quota.get("events_queried", "—"))
+        metrics[3].metric("API credits remaining", pp_quota.get("requests_remaining", "—"))
+
+        if pp_errors:
+            with st.expander("Line-fetch details"):
+                for error in pp_errors[:50]:
+                    st.code(error)
+
+        if isinstance(pp_quotes, pd.DataFrame) and not pp_quotes.empty:
+            st.success(
+                "PrizePicks lines are loaded for this slate. Player matching uses game ID plus a normalized name match."
+            )
+            if alternate_count:
+                with st.expander("View fetched alternate lines"):
+                    alt_view = pp_quotes[pp_quotes["MarketKey"].eq(PP_FANTASY_ALT_MARKET)].copy()
+                    show_cols = [
+                        "Player", "Line", "LineType", "OverMultiplier", "UnderMultiplier",
+                        "GamePK", "LastUpdate",
+                    ]
+                    st.dataframe(
+                        alt_view[[column for column in show_cols if column in alt_view.columns]],
+                        width="stretch",
+                        hide_index=True,
+                        height=360,
+                    )
+        else:
+            st.info("No PrizePicks lines are loaded yet. Build the board, then press the fetch button.")
+
+    pp_quotes = st.session_state.get(quote_state_key, pd.DataFrame())
+    board_with_lines = attach_prizepicks_lines(
+        board,
+        pp_quotes,
+        allow_alternate_fallback=allow_alt_fallback,
+    )
+
+    comparison_columns = [
+        "player_id", "Player", "Team", "Opponent", "Projected_FS", "FS_Median", "FS_P75",
+        "Auto_PP_Line", "PP_Line_Type", "PP_Over_Multiplier", "PP_Under_Multiplier",
+        "PP_Line_Source", "PP_Line_Updated", "PP_Player_Matched",
+    ]
+    comparison_seed = board_with_lines[
+        [column for column in comparison_columns if column in board_with_lines.columns]
+    ].copy()
+    comparison_seed["Suggested Line"] = comparison_seed["Projected_FS"].round() - 0.5
+    comparison_seed["PP Line"] = pd.to_numeric(comparison_seed.get("Auto_PP_Line"), errors="coerce")
+    comparison_seed["Line Status"] = np.where(
+        comparison_seed["PP Line"].notna(),
+        "Automatic",
+        "Missing — enter manually",
+    )
+
+    quote_signature = "none"
+    if isinstance(pp_quotes, pd.DataFrame) and not pp_quotes.empty:
+        signature_frame = pp_quotes[[
+            column for column in ["GamePK", "PlayerNorm", "Line", "MarketKey", "LastUpdate"]
+            if column in pp_quotes.columns
+        ]].astype(str)
+        quote_signature = str(abs(hash(tuple(signature_frame.to_numpy().ravel().tolist()))))
+
     comparison = st.data_editor(
         comparison_seed,
         hide_index=True,
         width="stretch",
-        disabled=["player_id", "Player", "Team", "Opponent", "Projected_FS", "FS_Median", "FS_P75"],
+        disabled=[
+            column for column in comparison_seed.columns
+            if column not in {"PP Line"}
+        ],
         column_config={
             "player_id": None,
+            "Auto_PP_Line": None,
             "Projected_FS": st.column_config.NumberColumn("Projection", format="%.2f"),
             "FS_Median": st.column_config.NumberColumn("Median", format="%.1f"),
             "FS_P75": st.column_config.NumberColumn("75th %ile", format="%.1f"),
-            "PP Line": st.column_config.NumberColumn(min_value=0.0, max_value=40.0, step=0.5, format="%.1f"),
+            "Suggested Line": st.column_config.NumberColumn(format="%.1f"),
+            "PP Line": st.column_config.NumberColumn(
+                min_value=0.0, max_value=50.0, step=0.5, format="%.1f"
+            ),
+            "PP_Over_Multiplier": st.column_config.NumberColumn("More Mult", format="%.2f"),
+            "PP_Under_Multiplier": st.column_config.NumberColumn("Less Mult", format="%.2f"),
+            "PP_Line_Type": "PP Type",
+            "PP_Line_Source": "Source",
+            "PP_Line_Updated": "Updated",
+            "PP_Player_Matched": "Matched Name",
         },
-        key="fs_pp_lines",
+        key=f"fs_pp_lines_{pd.Timestamp(slate_date).date()}_{quote_signature}",
     )
+
     model_lookup = board.set_index("player_id")
     over_probs, under_probs, push_probs = [], [], []
     for _, line_row in comparison.iterrows():
+        line = pd.to_numeric(pd.Series([line_row.get("PP Line")]), errors="coerce").iloc[0]
+        if pd.isna(line):
+            over_probs.append(np.nan)
+            under_probs.append(np.nan)
+            push_probs.append(np.nan)
+            continue
         model_row = model_lookup.loc[int(line_row["player_id"])]
-        scores = simulate_fantasy_scores(model_row, scoring, simulations=9000, seed_extra=f"line-{line_row['PP Line']}")
-        line = float(line_row["PP Line"])
-        over_probs.append(float(np.mean(scores > line)))
-        under_probs.append(float(np.mean(scores < line)))
-        push_probs.append(float(np.mean(np.isclose(scores, line))))
-    comparison["Edge"] = comparison["Projected_FS"] - comparison["PP Line"]
+        scores = simulate_fantasy_scores(
+            model_row,
+            scoring,
+            simulations=4000,
+            seed_extra=f"line-{float(line):.2f}",
+        )
+        over_probs.append(float(np.mean(scores > float(line))))
+        under_probs.append(float(np.mean(scores < float(line))))
+        push_probs.append(float(np.mean(np.isclose(scores, float(line)))))
+
+    comparison["Projection Edge"] = comparison["Projected_FS"] - comparison["PP Line"]
     comparison["Over Prob"] = over_probs
     comparison["Under Prob"] = under_probs
     comparison["Push Prob"] = push_probs
-    comparison = comparison.sort_values(["Over Prob", "Edge"], ascending=False)
-    style = comparison.drop(columns=["player_id"]).style.background_gradient(
-        cmap="RdYlGn", subset=["Edge", "Over Prob"], axis=0
-    ).format({
-        "Projected_FS": "{:.2f}", "FS_Median": "{:.1f}", "FS_P75": "{:.1f}",
-        "PP Line": "{:.1f}", "Edge": "{:+.2f}", "Over Prob": "{:.1%}",
-        "Under Prob": "{:.1%}", "Push Prob": "{:.1%}",
+    comparison = comparison.sort_values(
+        ["Over Prob", "Projection Edge"],
+        ascending=False,
+        na_position="last",
+    )
+
+    drop_columns = [column for column in ["player_id", "Auto_PP_Line"] if column in comparison.columns]
+    display_comparison = comparison.drop(columns=drop_columns)
+    gradient_columns = [
+        column for column in ["Projection Edge", "Over Prob"]
+        if column in display_comparison.columns
+    ]
+    style = display_comparison.style
+    if gradient_columns:
+        style = style.background_gradient(cmap="RdYlGn", subset=gradient_columns, axis=0)
+    style = style.format({
+        "Projected_FS": "{:.2f}",
+        "FS_Median": "{:.1f}",
+        "FS_P75": "{:.1f}",
+        "Suggested Line": "{:.1f}",
+        "PP Line": "{:.1f}",
+        "Projection Edge": "{:+.2f}",
+        "Over Prob": "{:.1%}",
+        "Under Prob": "{:.1%}",
+        "Push Prob": "{:.1%}",
+        "PP_Over_Multiplier": "{:.2f}",
+        "PP_Under_Multiplier": "{:.2f}",
     })
-    st.dataframe(style, width="stretch", hide_index=True, height=620)
+    st.dataframe(style, width="stretch", hide_index=True, height=650)
+
+    st.caption(
+        "The Odds API labels PrizePicks as a US DFS source. Lines and multipliers can vary by user selection, "
+        "so confirm the final line in PrizePicks before submitting an entry."
+    )
 
 with breakdown_tab:
     columns = [
@@ -4076,7 +4698,10 @@ with run_tab:
 with pitch_tab:
     pitch_types = bundle.get("pitch_types", pd.DataFrame())
     if pitch_types.empty:
-        st.info("No batter-versus-pitch-type rows were available.")
+        if bundle.get("details_skipped"):
+            st.info("Detailed pitch-type tables are skipped when more than four games are selected to protect Streamlit resources. Select four or fewer games to open this tab.")
+        else:
+            st.info("No batter-versus-pitch-type rows were available.")
     else:
         player_options = board.sort_values("Rank")["Player"].tolist()
         selected_player = st.selectbox("Hitter", player_options, key="fs_pitch_player")
@@ -4103,7 +4728,10 @@ with pitch_tab:
 with bvp_tab:
     bvp = bundle.get("bvp", pd.DataFrame())
     if bvp.empty:
-        st.info("No direct batter-versus-pitcher history was available for the selected games.")
+        if bundle.get("details_skipped"):
+            st.info("Detailed BvP tables are skipped when more than four games are selected to protect Streamlit resources. Select four or fewer games to open this tab.")
+        else:
+            st.info("No direct batter-versus-pitcher history was available for the selected games.")
     else:
         display_columns = [
             "Player", "Team", "Pitcher", "PA", "H", "HR", "BB", "HBP", "K", "H/PA", "xH/PA",
