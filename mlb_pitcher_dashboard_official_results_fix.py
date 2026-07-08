@@ -1,31 +1,3 @@
-Ctrl+K
-Ctrl+J
-
-
-
-
-pasted-text.txt
-i need you to rewrite this code for my model to make more accurate pitcher projections
-
-
-Worked for 36s
-Here's an improved version of your pitcher projection model. I focused on the core projection logic while keeping the overall app structure intact (you can drop these updated functions into your existing code).
-
-Key Improvements for Accuracy
-Smarter recent-form weighting (exponential decay + last-5-start emphasis).
-Better K-rate modeling (combines Stuff/CSW, pitch-type matchup, and opponent-specific contact quality).
-Improved ER projection (uses xwOBA + barrel/hard-hit + HR% with park/weather multipliers tuned on recent MLB data).
-More robust innings/outs projection (accounts for pitch efficiency and recent workload trends).
-Enhanced pitch-type matchup (usage-weighted + velocity + movement considerations).
-Better confidence & shrinkage (sample-size aware, with rest-days bonus if detectable).
-Minor cleanups (reduced over-shrinkage, better variance estimation).
-Updated Core Functions
-Replace the relevant sections in your code with these:
-
-# -----------------------------------------------------------------------------
-# Enhanced Projection Model
-# -----------------------------------------------------------------------------
-
 def game_log_profile(logs: pd.DataFrame, league: dict) -> dict:
     if logs is None or logs.empty:
         return {
