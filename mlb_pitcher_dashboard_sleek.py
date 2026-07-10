@@ -5,6 +5,7 @@ import math
 import re
 import unicodedata
 from difflib import SequenceMatcher
+from itertools import combinations
 from datetime import date, timedelta
 from html import escape
 from io import StringIO
@@ -2802,6 +2803,119 @@ def inject_edge_theme() -> None:
     )
 
 
+
+def default_k_line_from_projection(projection: object) -> float:
+    """Fallback strikeout line used only when no auto/manual line is available."""
+    value = pd.to_numeric(pd.Series([projection]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return np.nan
+    return float(np.clip(round(float(value) * 2.0) / 2.0, 0.5, 14.5))
+
+
+def prepare_k_parlay_candidates(board: pd.DataFrame) -> pd.DataFrame:
+    """Create editable strikeout-over candidate rows for the 3-man generator."""
+    if board is None or board.empty:
+        return pd.DataFrame()
+    candidates = board.copy()
+    required = ["Pitcher", "Team", "Opponent", "Game", "GamePK", "Proj_K", "K_Score"]
+    for column in required:
+        if column not in candidates.columns:
+            candidates[column] = np.nan
+    line_values = pd.to_numeric(candidates.get("K_Line"), errors="coerce") if "K_Line" in candidates.columns else pd.Series(np.nan, index=candidates.index)
+    fallback_lines = candidates["Proj_K"].apply(default_k_line_from_projection)
+    candidates["K_Line_Used"] = line_values.where(line_values.notna(), fallback_lines)
+    candidates["K_Line_Source_Used"] = candidates.get("K_Line_Source", "").fillna("").astype(str) if "K_Line_Source" in candidates.columns else ""
+    candidates.loc[candidates["K_Line_Source_Used"].str.strip().eq(""), "K_Line_Source_Used"] = "Model-rounded fallback"
+    candidates["K_Projection_Edge"] = pd.to_numeric(candidates["Proj_K"], errors="coerce") - pd.to_numeric(candidates["K_Line_Used"], errors="coerce")
+    candidates["K_Over_Probability"] = [
+        probability_over_line(projection, line) if np.isfinite(float(projection)) and np.isfinite(float(line)) else np.nan
+        for projection, line in zip(pd.to_numeric(candidates["Proj_K"], errors="coerce"), pd.to_numeric(candidates["K_Line_Used"], errors="coerce"))
+    ]
+    candidates["K_Tier"] = np.select(
+        [
+            (candidates["K_Projection_Edge"].ge(1.25) & candidates["K_Score"].between(55, 84, inclusive="both")),
+            (candidates["K_Projection_Edge"].between(0.75, 1.249, inclusive="both") & candidates["K_Score"].between(55, 84, inclusive="both")),
+            (candidates["K_Projection_Edge"].between(0.50, 0.749, inclusive="both") & candidates["K_Score"].between(45, 69, inclusive="both")),
+            (candidates["K_Projection_Edge"].ge(1.50) & candidates["K_Score"].ge(85)),
+            (candidates["K_Projection_Edge"].ge(0.25)),
+        ],
+        ["Best K over", "Strong K over", "Playable K over", "Volatile upside", "Lean only"],
+        default="Avoid over",
+    )
+    keep_columns = [
+        "Pitcher", "Team", "Opponent", "Game", "GamePK", "Proj_K", "K_Line_Used", "K_Projection_Edge",
+        "K_Over_Probability", "K_Score", "PitchTypeScore", "Top6_K_Rate", "PitchMix_Opp_Whiff",
+        "Whiff_Pct", "CSW_Pct", "Confidence_Level", "Projection_Risk_Note", "K_Tier", "K_Line_Source_Used",
+    ]
+    keep_columns = [column for column in keep_columns if column in candidates.columns]
+    return candidates[keep_columns].sort_values(["K_Projection_Edge", "K_Score", "K_Over_Probability"], ascending=False).reset_index(drop=True)
+
+
+def build_three_man_k_parlays(
+    candidates: pd.DataFrame,
+    max_same_team: int = 2,
+    require_different_games: bool = True,
+    ranking_style: str = "Balanced",
+    top_n: int = 30,
+    max_results: int = 100,
+) -> pd.DataFrame:
+    """Generate ranked 3-man strikeout-over combinations from filtered candidates."""
+    if candidates is None or candidates.empty or len(candidates) < 3:
+        return pd.DataFrame()
+    pool = candidates.copy().head(int(top_n)).reset_index(drop=True)
+    rows: list[dict] = []
+    for indexes in combinations(range(len(pool)), 3):
+        combo = pool.iloc[list(indexes)].copy()
+        if require_different_games and "GamePK" in combo.columns and combo["GamePK"].nunique(dropna=False) < 3:
+            continue
+        if max_same_team and "Team" in combo.columns:
+            if combo["Team"].astype(str).value_counts().max() > int(max_same_team):
+                continue
+        probs = pd.to_numeric(combo["K_Over_Probability"], errors="coerce").fillna(0.0).clip(0.01, 0.99)
+        edges = pd.to_numeric(combo["K_Projection_Edge"], errors="coerce").fillna(0.0)
+        scores = pd.to_numeric(combo["K_Score"], errors="coerce").fillna(50.0)
+        confidence_bonus = combo.get("Confidence_Level", pd.Series("", index=combo.index)).astype(str).str.lower().map({"high": 2.0, "medium": 0.75, "low": -2.0}).fillna(0.0).sum()
+        volatility_penalty = combo.get("K_Tier", pd.Series("", index=combo.index)).astype(str).str.contains("Volatile|Avoid", case=False, na=False).sum() * 2.5
+        combined_probability = float(np.prod(probs))
+        avg_edge = float(edges.mean())
+        min_edge = float(edges.min())
+        avg_score = float(scores.mean())
+        min_score = float(scores.min())
+        if ranking_style == "Safest probability":
+            parlay_score = combined_probability * 100.0 + avg_score * 0.15 + avg_edge * 3.0 + confidence_bonus - volatility_penalty
+        elif ranking_style == "Best projection edge":
+            parlay_score = avg_edge * 18.0 + combined_probability * 45.0 + avg_score * 0.15 + confidence_bonus - volatility_penalty
+        elif ranking_style == "High score/upside":
+            parlay_score = avg_score * 0.45 + combined_probability * 35.0 + avg_edge * 6.0 + confidence_bonus - volatility_penalty
+        else:
+            parlay_score = combined_probability * 70.0 + avg_edge * 10.0 + avg_score * 0.25 + confidence_bonus - volatility_penalty
+        leg_texts = []
+        for _, leg in combo.iterrows():
+            leg_texts.append(
+                f"{leg['Pitcher']} O{float(leg['K_Line_Used']):.1f} K "
+                f"({float(leg['Proj_K']):.2f}, {float(leg['K_Projection_Edge']):+.2f}, {float(leg['K_Over_Probability']):.1%})"
+            )
+        rows.append({
+            "Parlay_Score": parlay_score,
+            "Combined_Model_Probability": combined_probability,
+            "Average_Over_Probability": float(probs.mean()),
+            "Average_Edge": avg_edge,
+            "Minimum_Edge": min_edge,
+            "Average_K_Score": avg_score,
+            "Minimum_K_Score": min_score,
+            "Leg_1": leg_texts[0],
+            "Leg_2": leg_texts[1],
+            "Leg_3": leg_texts[2],
+            "Pitchers": " / ".join(combo["Pitcher"].astype(str).tolist()),
+            "Games": " / ".join(combo["Game"].astype(str).tolist()),
+            "Tiers": " / ".join(combo["K_Tier"].astype(str).tolist()),
+        })
+    if not rows:
+        return pd.DataFrame()
+    result = pd.DataFrame(rows).sort_values("Parlay_Score", ascending=False).head(int(max_results)).reset_index(drop=True)
+    result.insert(0, "Rank", np.arange(1, len(result) + 1))
+    return result
+
 def render_edge_header() -> None:
     st.markdown(
         """
@@ -3080,10 +3194,10 @@ with leaders[3]:
     render_leader(overall_row, "Best overall", f"{overall_row['Overall_Score']:.0f}", score_label(overall_row["Overall_Score"]))
 
 (
-    board_tab, k_tab, er_tab, outs_tab, lineup_tab, pitch_tab, logs_tab, lines_tab, backtest_tab, notes_tab
+    board_tab, k_tab, er_tab, outs_tab, lineup_tab, pitch_tab, logs_tab, lines_tab, k_parlay_tab, backtest_tab, notes_tab
 ) = st.tabs([
     "Pitcher board", "Strikeouts", "Earned runs", "Outs / innings", "Opponent lineup",
-    "Pitch-type matchup", "Recent starts", "Line comparison", "Backtest & calibration", "Model notes",
+    "Pitch-type matchup", "Recent starts", "Line comparison", "K 3-man generator", "Backtest & calibration", "Model notes",
 ])
 
 with board_tab:
@@ -3259,6 +3373,160 @@ with lines_tab:
     st.caption(
         "K and ER probabilities use a Poisson approximation. Outs use the pitcher's recent-start variance with a normal approximation. "
         "Use the Backtest & calibration tab to measure projection accuracy first; prop-line probability calibration is optional."
+    )
+
+
+with k_parlay_tab:
+    st.markdown("### Strikeout 3-man parlay generator")
+    st.caption(
+        "Builds 3-leg strikeout-over combinations using model projection edge, K Score, over probability, matchup quality and confidence. "
+        "Auto-fetched K lines are used when available; otherwise the table starts with a model-rounded fallback line that you can edit."
+    )
+    k_candidates = prepare_k_parlay_candidates(board)
+    if k_candidates.empty or len(k_candidates) < 3:
+        st.info("Build the pitcher board first. At least three pitchers are needed for the generator.")
+    else:
+        controls = st.columns(6)
+        with controls[0]:
+            min_edge = st.number_input("Minimum K edge", min_value=-2.0, max_value=5.0, value=0.50, step=0.25, key="k_parlay_min_edge")
+        with controls[1]:
+            min_score = st.number_input("Minimum K Score", min_value=0, max_value=100, value=55, step=5, key="k_parlay_min_score")
+        with controls[2]:
+            min_probability = st.number_input("Minimum over probability", min_value=0.0, max_value=1.0, value=0.52, step=0.01, format="%.2f", key="k_parlay_min_prob")
+        with controls[3]:
+            top_n = st.number_input("Candidate pool", min_value=3, max_value=60, value=min(24, max(3, len(k_candidates))), step=1, key="k_parlay_pool")
+        with controls[4]:
+            max_same_team = st.number_input("Max same team", min_value=1, max_value=3, value=2, step=1, key="k_parlay_max_team")
+        with controls[5]:
+            max_results = st.number_input("Show parlays", min_value=5, max_value=250, value=40, step=5, key="k_parlay_results")
+
+        controls2 = st.columns(3)
+        with controls2[0]:
+            require_different_games = st.checkbox("Require three different games", value=True, key="k_parlay_diff_games")
+        with controls2[1]:
+            exclude_low_confidence = st.checkbox("Exclude low-confidence pitchers", value=True, key="k_parlay_exclude_low")
+        with controls2[2]:
+            ranking_style = st.selectbox(
+                "Ranking style",
+                ["Balanced", "Safest probability", "Best projection edge", "High score/upside"],
+                index=0,
+                key="k_parlay_style",
+            )
+
+        editable_columns = [
+            "Pitcher", "Team", "Opponent", "Game", "Proj_K", "K_Line_Used", "K_Projection_Edge",
+            "K_Over_Probability", "K_Score", "PitchTypeScore", "Top6_K_Rate", "PitchMix_Opp_Whiff",
+            "Confidence_Level", "Projection_Risk_Note", "K_Tier", "K_Line_Source_Used", "GamePK",
+        ]
+        editable_columns = [column for column in editable_columns if column in k_candidates.columns]
+        st.markdown("#### Candidate lines")
+        st.caption("Edit the K line column to match the book you are actually using, then the edge and over probability are recalculated below.")
+        edited_candidates = st.data_editor(
+            k_candidates[editable_columns],
+            width="stretch",
+            hide_index=True,
+            disabled=[column for column in editable_columns if column not in {"K_Line_Used"}],
+            key="k_parlay_candidate_editor",
+            column_config={
+                "K_Line_Used": st.column_config.NumberColumn("K Line", min_value=0.5, max_value=14.5, step=0.5, format="%.1f"),
+                "Proj_K": st.column_config.NumberColumn("Proj K", format="%.2f"),
+                "K_Projection_Edge": st.column_config.NumberColumn("K Edge", format="%+.2f"),
+                "K_Over_Probability": st.column_config.NumberColumn("Over Prob", format="%.1%"),
+                "K_Score": st.column_config.NumberColumn("K Score", format="%.0f"),
+                "PitchTypeScore": st.column_config.NumberColumn("Pitch Match", format="%.0f"),
+                "Top6_K_Rate": st.column_config.NumberColumn("Top6 K%", format="%.1%"),
+                "PitchMix_Opp_Whiff": st.column_config.NumberColumn("Pitch-Mix Whiff%", format="%.1%"),
+            },
+        )
+        recalculated = edited_candidates.copy()
+        recalculated["Proj_K"] = pd.to_numeric(recalculated["Proj_K"], errors="coerce")
+        recalculated["K_Line_Used"] = pd.to_numeric(recalculated["K_Line_Used"], errors="coerce")
+        recalculated["K_Score"] = pd.to_numeric(recalculated["K_Score"], errors="coerce")
+        recalculated["K_Projection_Edge"] = recalculated["Proj_K"] - recalculated["K_Line_Used"]
+        recalculated["K_Over_Probability"] = [
+            probability_over_line(projection, line) if np.isfinite(float(projection)) and np.isfinite(float(line)) else np.nan
+            for projection, line in zip(recalculated["Proj_K"].fillna(np.nan), recalculated["K_Line_Used"].fillna(np.nan))
+        ]
+        filtered = recalculated[
+            recalculated["K_Projection_Edge"].ge(float(min_edge))
+            & recalculated["K_Score"].ge(float(min_score))
+            & recalculated["K_Over_Probability"].ge(float(min_probability))
+        ].copy()
+        if exclude_low_confidence and "Confidence_Level" in filtered.columns:
+            filtered = filtered[~filtered["Confidence_Level"].astype(str).str.lower().eq("low")]
+        filtered = filtered.sort_values(["K_Projection_Edge", "K_Over_Probability", "K_Score"], ascending=False).reset_index(drop=True)
+
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("Eligible pitchers", f"{len(filtered)}")
+        summary_cols[1].metric("Avg K edge", f"{filtered['K_Projection_Edge'].mean():+.2f}" if not filtered.empty else "—")
+        summary_cols[2].metric("Avg over prob", f"{filtered['K_Over_Probability'].mean():.1%}" if not filtered.empty else "—")
+        summary_cols[3].metric("Avg K Score", f"{filtered['K_Score'].mean():.0f}" if not filtered.empty else "—")
+
+        if filtered.empty or len(filtered) < 3:
+            st.warning("Not enough pitchers passed the filters. Lower the minimum edge/score/probability or check the K lines.")
+        else:
+            st.markdown("#### Eligible K over legs")
+            leg_display = filtered.drop(columns=["GamePK"], errors="ignore").copy()
+            styled_legs = style_board(
+                leg_display,
+                ["Proj_K", "K_Projection_Edge", "K_Over_Probability", "K_Score", "PitchTypeScore", "Top6_K_Rate", "PitchMix_Opp_Whiff"],
+            ).format({
+                "Proj_K": "{:.2f}", "K_Line_Used": "{:.1f}", "K_Projection_Edge": "{:+.2f}",
+                "K_Over_Probability": "{:.1%}", "K_Score": "{:.0f}", "PitchTypeScore": "{:.0f}",
+                "Top6_K_Rate": "{:.1%}", "PitchMix_Opp_Whiff": "{:.1%}",
+            })
+            st.dataframe(styled_legs, width="stretch", hide_index=True, height=min(520, 38 * (len(filtered) + 1)))
+
+            parlays = build_three_man_k_parlays(
+                filtered,
+                max_same_team=int(max_same_team),
+                require_different_games=bool(require_different_games),
+                ranking_style=str(ranking_style),
+                top_n=int(top_n),
+                max_results=int(max_results),
+            )
+            if parlays.empty:
+                st.warning("No 3-man combinations met the diversification settings. Turn off different-game requirement or raise max same-team.")
+            else:
+                st.markdown("#### Generated 3-man K over parlays")
+                st.caption("Combined model probability is the simple product of the three leg over probabilities; use it as a ranking tool, not a guarantee.")
+                styled_parlays = style_board(
+                    parlays,
+                    ["Combined_Model_Probability", "Average_Over_Probability", "Average_Edge", "Minimum_Edge", "Average_K_Score", "Minimum_K_Score", "Parlay_Score"],
+                ).format({
+                    "Parlay_Score": "{:.1f}", "Combined_Model_Probability": "{:.1%}",
+                    "Average_Over_Probability": "{:.1%}", "Average_Edge": "{:+.2f}",
+                    "Minimum_Edge": "{:+.2f}", "Average_K_Score": "{:.0f}", "Minimum_K_Score": "{:.0f}",
+                })
+                st.dataframe(styled_parlays, width="stretch", hide_index=True, height=min(650, 40 * (len(parlays) + 1)))
+                cdl1, cdl2 = st.columns(2)
+                with cdl1:
+                    st.download_button(
+                        "Download eligible K legs",
+                        filtered.to_csv(index=False).encode("utf-8"),
+                        file_name=f"k_over_parlay_legs_{pd.Timestamp(slate_date).strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+                with cdl2:
+                    st.download_button(
+                        "Download 3-man K parlays",
+                        parlays.to_csv(index=False).encode("utf-8"),
+                        file_name=f"k_over_3man_parlays_{pd.Timestamp(slate_date).strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+
+    st.divider()
+    st.markdown("#### Strikeout parlay rules used")
+    st.markdown(
+        """
+        - **Best K over:** projection edge +1.25 or better with K Score 55–84.
+        - **Strong K over:** projection edge +0.75 to +1.24 with K Score 55–84.
+        - **Playable K over:** projection edge +0.50 to +0.74 with K Score 45–69.
+        - **Volatile upside:** K Score 85–100 requires bigger edge because that bucket has overprojected so far.
+        - Prefer different games and avoid low-confidence pitchers when building 3-leg slips.
+        """
     )
 
 with backtest_tab:
