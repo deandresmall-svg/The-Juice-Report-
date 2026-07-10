@@ -74,6 +74,24 @@ def normalize_name(value: object) -> str:
     return "".join(character.lower() for character in str(value) if character.isalnum())
 
 
+def is_barrel(exit_velocity: float, launch_angle: float) -> int:
+    """Return 1 when a batted ball falls inside an approximate Statcast barrel window."""
+    ev = float(exit_velocity) if pd.notna(exit_velocity) else 0.0
+    la = float(launch_angle) if pd.notna(launch_angle) else 0.0
+
+    if ev < 98:
+        return 0
+
+    if ev >= 116:
+        min_la, max_la = 8.0, 50.0
+    else:
+        expansion = (ev - 98.0) * 2.5
+        min_la = 26.0 - expansion
+        max_la = 30.0 + expansion
+
+    return int(min_la <= la <= max_la)
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
     return statcast(
@@ -196,6 +214,34 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
     df["is_barrel"] = df["launch_speed_angle"].eq(6).fillna(False)
     df["is_hard_hit"] = df["launch_speed"].ge(95).fillna(False)
     df["is_sweet_spot"] = df["launch_angle"].between(8, 32, inclusive="both").fillna(False)
+
+    # Improved launch-angle features.  Missing launch angles are treated as non-matches
+    # so nullable Statcast rows do not crash when converting to integers.
+    df["Sweet_Spot"] = df["launch_angle"].between(8, 32, inclusive="both").fillna(False).astype(int)
+    df["Barrel_Range"] = (
+        (df["launch_speed"].ge(98))
+        & (
+            df["launch_angle"].between(26, 30, inclusive="both")
+            | (df["launch_speed"].ge(105) & df["launch_angle"].between(20, 35, inclusive="both"))
+        )
+    ).fillna(False).astype(int)
+
+    ev = pd.to_numeric(df["launch_speed"], errors="coerce").astype("float64")
+    la = pd.to_numeric(df["launch_angle"], errors="coerce").astype("float64")
+    barrel_expansion = (ev - 98.0) * 2.5
+    ev_ge_116 = ev.ge(116).fillna(False).to_numpy(dtype=bool)
+    barrel_min_la = np.where(ev_ge_116, 8.0, 26.0 - barrel_expansion.to_numpy(dtype=float))
+    barrel_max_la = np.where(ev_ge_116, 50.0, 30.0 + barrel_expansion.to_numpy(dtype=float))
+    dynamic_barrel_mask = (
+        ev.ge(98).fillna(False)
+        & la.ge(barrel_min_la).fillna(False)
+        & la.le(barrel_max_la).fillna(False)
+    )
+    df["Dynamic_Barrel"] = dynamic_barrel_mask.astype(int)
+
+    df["LA_Deviation_from_Optimal"] = (la - 27.0).abs()
+    df["LA_Optimization_Score"] = (100.0 - df["LA_Deviation_from_Optimal"] * 3.0).clip(0, 100).fillna(50.0)
+
     df["is_line_drive"] = df["bb_type"].eq("line_drive").fillna(False)
     df["is_fly_ball"] = df["bb_type"].eq("fly_ball").fillna(False)
     df["is_ground_ball"] = df["bb_type"].eq("ground_ball").fillna(False)
@@ -272,6 +318,10 @@ def aggregate_hitters(df: pd.DataFrame, pitcher_hand: str, min_pa: int) -> pd.Da
             Line_Drives=("is_line_drive", "sum"),
             Hard_Hits=("is_hard_hit", "sum"),
             Sweet_Spots=("is_sweet_spot", "sum"),
+            Sweet_Spot=("Sweet_Spot", "sum"),
+            Barrel_Range=("Barrel_Range", "sum"),
+            Dynamic_Barrels=("Dynamic_Barrel", "sum"),
+            LA_Optimization_Score=("LA_Optimization_Score", "mean"),
             Avg_EV=("launch_speed", "mean"),
         )
         .reset_index()
@@ -296,6 +346,12 @@ def aggregate_hitters(df: pd.DataFrame, pitcher_hand: str, min_pa: int) -> pd.Da
     board["LD_Pct"] = safe_divide(board["Line_Drives"], board["BBE"])
     board["HH_Pct"] = safe_divide(board["Hard_Hits"], board["BBE"])
     board["SweetSpot_Pct"] = safe_divide(board["Sweet_Spots"], board["BBE"])
+    board["Sweet_Spot_Pct"] = safe_divide(board.get("Sweet_Spot", 0), board["BBE"], 0.0)
+    board["Barrel_Range_Pct"] = safe_divide(board.get("Barrel_Range", 0), board["BBE"], 0.0)
+    board["Dynamic_Barrel_Pct"] = safe_divide(board.get("Dynamic_Barrels", 0), board["BBE"], 0.0)
+    board["LA_Optimization_Score"] = pd.to_numeric(
+        board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index)), errors="coerce"
+    ).fillna(50.0)
 
     split_df = df[df["p_throws"].eq(pitcher_hand)].copy()
     split_pa = split_df[split_df["is_pa_end"]]
@@ -839,6 +895,41 @@ def projected_pa(lineup_spot: pd.Series, team_runs: float, is_away: bool) -> pd.
     return base.clip(3.2, 5.4)
 
 
+def probability_two_plus_hits(per_pa: pd.Series, projected_pa_values: pd.Series) -> pd.Series:
+    """Estimate P(2+ hits) from per-PA hit probability and projected PA.
+
+    Projected plate appearances are fractional.  We calculate the exact binomial
+    probability at the floor and ceiling PA counts, then linearly interpolate
+    between them.  This preserves a discrete plate-appearance interpretation
+    without changing the dashboard's established 1+ hit model.
+    """
+    p = pd.to_numeric(per_pa, errors="coerce").clip(0.0, 0.999999)
+    pa = pd.to_numeric(projected_pa_values, errors="coerce").clip(lower=0.0)
+    q = 1.0 - p
+
+    low = np.floor(pa.fillna(0.0).to_numpy(float)).astype(int)
+    high = np.ceil(pa.fillna(0.0).to_numpy(float)).astype(int)
+    weight = pa.fillna(0.0).to_numpy(float) - low
+    p_arr = p.fillna(0.0).to_numpy(float)
+    q_arr = q.fillna(1.0).to_numpy(float)
+
+    def at_least_two(n_values: np.ndarray) -> np.ndarray:
+        p0 = np.power(q_arr, n_values)
+        p1 = np.zeros_like(p_arr, dtype=float)
+        mask = n_values >= 1
+        p1[mask] = (
+            n_values[mask]
+            * p_arr[mask]
+            * np.power(q_arr[mask], n_values[mask] - 1)
+        )
+        return np.clip(1.0 - p0 - p1, 0.0, 1.0)
+
+    low_probability = at_least_two(low)
+    high_probability = at_least_two(high)
+    result = (1.0 - weight) * low_probability + weight * high_probability
+    return pd.Series(np.clip(result, 0.0, 1.0), index=per_pa.index, dtype=float)
+
+
 def parse_sprint_upload(uploaded_file, board: pd.DataFrame) -> pd.DataFrame:
     board = board.copy()
     board["Sprint_Speed"] = np.nan
@@ -925,7 +1016,8 @@ def build_hit_board(
     zero_columns = [
         "PA", "Hits", "HR", "Strikeouts", "Walks", "xHits", "Pitches", "Swings",
         "Contacts", "Whiffs", "Zone_Swings", "Zone_Contacts", "BBE", "Line_Drives",
-        "Hard_Hits", "Sweet_Spots", "Platoon_PA", "Platoon_H", "Platoon_xH", "Platoon_K",
+        "Hard_Hits", "Sweet_Spots", "Sweet_Spot", "Barrel_Range", "Dynamic_Barrels",
+        "Platoon_PA", "Platoon_H", "Platoon_xH", "Platoon_K",
     ]
     for column in zero_columns:
         board[column] = pd.to_numeric(board.get(column, 0), errors="coerce").fillna(0)
@@ -1040,7 +1132,16 @@ def build_hit_board(
     board["Model_Hit_Per_PA"] = game_per_pa.clip(0.04, 0.43)
     board["Projected_PA"] = projected_pa(board["LineupSpot"], team_runs, is_away)
     board["Model_1plus_Hit"] = 1 - (1 - board["Model_Hit_Per_PA"]) ** board["Projected_PA"]
+    board["Model_2plus_Hit"] = probability_two_plus_hits(
+        board["Model_Hit_Per_PA"], board["Projected_PA"]
+    )
     board["Projected_Hits"] = board["Model_Hit_Per_PA"] * board["Projected_PA"]
+
+    board["Barrel_Range_Pct"] = safe_divide(board.get("Barrel_Range", 0), board["BBE"], 0.0)
+    board["Dynamic_Barrel_Pct"] = safe_divide(board.get("Dynamic_Barrels", 0), board["BBE"], 0.0)
+    board["LA_Optimization_Score"] = pd.to_numeric(
+        board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index)), errors="coerce"
+    ).fillna(50.0)
 
     board["PitchMatchScore"] = percentile(board["PitchMatchRatio"])
     board["ZoneFitScore"] = percentile(board["ZoneFitRatio"])
@@ -1051,17 +1152,15 @@ def build_hit_board(
     board["SprintScore"] = percentile(board["Sprint_Speed"]).where(board["Sprint_Speed"].notna(), 50.0)
 
     board["HitScore"] = (
-        percentile(board["Adj_xHit_PA"]) * 0.20
-        + percentile(board["Contact_Pct"]) * 0.13
-        + percentile(board["K_Pct"], higher_is_better=False) * 0.10
-        + board["PitchMatchScore"] * 0.15
-        + board["ZoneFitScore"] * 0.10
-        + board["PitcherHitScore"] * 0.10
-        + percentile(board["LD_Pct"]) * 0.06
-        + percentile(board["SweetSpot_Pct"]) * 0.04
-        + board["RecentFormScore"] * 0.07
-        + board["SprintScore"] * 0.05
-    )
+        percentile(board["Model_1plus_Hit"]) * 0.25
+        + percentile(board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index))) * 0.15
+        + percentile(board.get("Barrel_Range", pd.Series(0.0, index=board.index))) * 0.10
+        + percentile(board["PitchMatchScore"]) * 0.15
+        + percentile(board["ZoneFitScore"]) * 0.12
+        + percentile(board["PitcherSideAttackScore"]) * 0.10
+        + percentile(board["BvPScore"]) * 0.08
+        + percentile(board["RecentFormScore"]) * 0.05
+    ).clip(0, 100)
 
     sample_conf = 100 * (1 - np.exp(-board["PA"] / 130.0))
     bbe_conf = 100 * (1 - np.exp(-board["BBE"].fillna(0) / 80.0))
@@ -1100,6 +1199,9 @@ MLB_TEAM_ABBR = {
 }
 
 TEAM_ALIASES = {
+    # Baseball Savant/Statcast can use AZ while the MLB Stats API uses ARI.
+    "ARI": "AZ",
+    "AZ": "ARI",
     "OAK": "ATH",
     "ATH": "OAK",
 }
@@ -1107,7 +1209,7 @@ TEAM_ALIASES = {
 
 # Team presentation metadata used only for the dashboard UI.
 TEAM_COLORS = {
-    "ARI": ("#A71930", "#E3D4AD"), "ATH": ("#003831", "#EFB21E"),
+    "ARI": ("#A71930", "#E3D4AD"), "AZ": ("#A71930", "#E3D4AD"), "ATH": ("#003831", "#EFB21E"),
     "OAK": ("#003831", "#EFB21E"), "ATL": ("#CE1141", "#13274F"),
     "BAL": ("#DF4601", "#000000"), "BOS": ("#BD3039", "#0C2340"),
     "CHC": ("#0E3386", "#CC3433"), "CWS": ("#27251F", "#C4CED4"),
@@ -1380,6 +1482,8 @@ def fetch_savant_park_factors(venue: str, year: int, metric: str) -> dict:
 def team_id_from_code(team_code: object) -> int | None:
     """Translate a Statcast/scoreboard abbreviation to an MLB team ID."""
     code = str(team_code or "").upper().strip()
+    if code == "AZ":
+        code = "ARI"
     if code == "OAK":
         code = "ATH"
     for team_id, abbreviation in MLB_TEAM_ABBR.items():
@@ -1963,11 +2067,13 @@ def _lineup_fingerprint(lineup: pd.DataFrame) -> str:
 
 
 def match_statcast_team(team_code: str, available_teams: list[str]) -> str | None:
-    if team_code in available_teams:
-        return team_code
-    alias = TEAM_ALIASES.get(team_code)
-    if alias in available_teams:
-        return alias
+    code = str(team_code or "").upper().strip()
+    available_lookup = {str(team).upper().strip(): str(team) for team in available_teams}
+    if code in available_lookup:
+        return available_lookup[code]
+    alias = TEAM_ALIASES.get(code)
+    if alias in available_lookup:
+        return available_lookup[alias]
     return None
 
 
@@ -2279,17 +2385,26 @@ def render_leader_cards(
             confidence_text = row.get("Confidence_Level", "")
             expected_count = pd.to_numeric(pd.Series([row.get(BINARY_EXPECTED_COUNT_COLUMN)]), errors="coerce").iloc[0]
             expected_text = (
-                f" · {BINARY_EXPECTED_COUNT_LABEL.lower()} {expected_count:.2f}"
+                f"{BINARY_EXPECTED_COUNT_LABEL.lower()} {expected_count:.2f}"
                 if pd.notna(expected_count) else ""
             )
+            two_plus_probability = pd.to_numeric(
+                pd.Series([row.get("Model_2plus_Hit")]), errors="coerce"
+            ).iloc[0]
+            two_plus_text = (
+                f"2+ hit {two_plus_probability:.1%}"
+                if pd.notna(two_plus_probability) else "2+ hit —"
+            )
+            detail_parts = [part for part in [two_plus_text, expected_text] if part]
+            detail_text = " · ".join(detail_parts)
             st.markdown(
                 f"""
                 <div class="leader-card">
                     <div class="leader-rank">RANK {int(row['Rank'])}</div>
                     <div class="leader-name">{row['Player']}</div>
                     <div class="leader-prob">{row[probability_column]:.1%}</div>
-                    <div class="leader-sub">{probability_label}{expected_text} · {score_column.replace('Score', ' score')} {row[score_column]:.1f}</div>
-                    <div class="leader-sub">{lineup_text} · {confidence_text} confidence</div>
+                    <div class="leader-sub">{probability_label} · {detail_text}</div>
+                    <div class="leader-sub">{score_column.replace('Score', ' score')} {row[score_column]:.1f} · {lineup_text} · {confidence_text} confidence</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -2450,6 +2565,9 @@ def build_binary_projection_snapshot(
     snapshot["ModelProbability"] = pd.to_numeric(
         snapshot.get(BINARY_PROBABILITY_COLUMN), errors="coerce"
     )
+    snapshot["TwoPlusProbability"] = pd.to_numeric(
+        snapshot.get("Model_2plus_Hit"), errors="coerce"
+    )
     snapshot["ModelScore"] = pd.to_numeric(snapshot.get(BINARY_SCORE_COLUMN), errors="coerce")
     snapshot["ExpectedCount"] = pd.to_numeric(snapshot.get(BINARY_EXPECTED_COUNT_COLUMN), errors="coerce")
     snapshot["ModelPerPA"] = pd.to_numeric(snapshot.get(BINARY_PER_PA_COLUMN), errors="coerce")
@@ -2475,6 +2593,7 @@ def build_binary_projection_snapshot(
         errors="coerce",
     )
     snapshot["Actual_Event"] = np.nan
+    snapshot["Actual_2plus_Hit"] = np.nan
     snapshot["Actual_Hits"] = np.nan
     snapshot["Actual_HR"] = np.nan
     snapshot["Actual_PA"] = np.nan
@@ -2490,10 +2609,10 @@ def build_binary_projection_snapshot(
         "Team", "Opponent", "HomeAway", "Venue", "StartingPitcherID", "StartingPitcher",
         "LineupStatus", "LineupSpot", "Projected_PA", "ModelPerPA", "ExpectedCount", "EffectiveStand", "SampleStatus",
         "Confidence", "Confidence_Level", "ParkFactor", "WeatherMultiplier",
-        "RawProbability", "ModelProbability", "ModelScore", "Calibration_Applied",
+        "RawProbability", "ModelProbability", "TwoPlusProbability", "ModelScore", "Calibration_Applied",
         "Calibration_Version", "Market_Line", "Over_Odds", "Under_Odds", "Line_Source", "Line_Updated", "SportsbookOdds", "MarketProbability",
         "ModelOverProbability", "ProjectionEdge",
-        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_Hits",
+        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_2plus_Hit", "Actual_Hits",
         "Actual_HR", "Actual_PA", "Actual_AB", "ResultStatus", "Notes",
     ]
     existing = [column for column in preferred if column in snapshot.columns]
@@ -2534,14 +2653,23 @@ def normalize_binary_history(history: pd.DataFrame) -> pd.DataFrame:
     numeric_columns = [
         "GamePK", "PlayerID", "StartingPitcherID", "LookbackDays", "LineupSpot",
         "Projected_PA", "ModelPerPA", "ExpectedCount", "Confidence", "ParkFactor", "WeatherMultiplier", "RawProbability",
-        "ModelProbability", "ModelScore", "ModelOverProbability", "ProjectionEdge", "SportsbookOdds", "MarketProbability",
-        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_Hits",
+        "ModelProbability", "TwoPlusProbability", "ModelScore", "ModelOverProbability", "ProjectionEdge", "SportsbookOdds", "MarketProbability",
+        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_2plus_Hit", "Actual_Hits",
         "Actual_HR", "Actual_PA", "Actual_AB",
     ]
     for column in numeric_columns:
         if column not in result.columns:
             result[column] = np.nan
         result[column] = pd.to_numeric(result[column], errors="coerce")
+    missing_two_plus = result["TwoPlusProbability"].isna()
+    if missing_two_plus.any():
+        derived_two_plus = probability_two_plus_hits(result["ModelPerPA"], result["Projected_PA"])
+        result.loc[missing_two_plus, "TwoPlusProbability"] = derived_two_plus.loc[missing_two_plus]
+    missing_two_plus_actual = result["Actual_2plus_Hit"].isna() & result["Actual_Hits"].notna()
+    result.loc[missing_two_plus_actual, "Actual_2plus_Hit"] = (
+        result.loc[missing_two_plus_actual, "Actual_Hits"] >= 2
+    ).astype(float)
+
     odds_implied = result["SportsbookOdds"].map(american_odds_to_probability)
     result["MarketImpliedProbability"] = result["MarketImpliedProbability"].fillna(odds_implied)
     fair_market = result["MarketProbability"].where(
@@ -2683,6 +2811,9 @@ def fill_binary_actual_results(history: pd.DataFrame) -> tuple[pd.DataFrame, dic
                         if BINARY_EVENT_KIND == "hr"
                         else actual.get("Actual_Hits", 0) > 0
                     )
+                    result.at[row_index, "Actual_2plus_Hit"] = float(
+                        actual.get("Actual_Hits", 0) >= 2
+                    )
                     result.at[row_index, "ResultStatus"] = str(game_result.get("status") or "Final")
                     summary["matched"] += 1
         progress.progress(index / total, text=f"Checked {index} of {total} games")
@@ -2690,18 +2821,26 @@ def fill_binary_actual_results(history: pd.DataFrame) -> tuple[pd.DataFrame, dic
     return normalize_binary_history(result), summary
 
 
-def binary_probability_metrics(history: pd.DataFrame, probability_column: str = "ModelProbability") -> dict:
-    if history is None or history.empty or probability_column not in history.columns:
+def binary_probability_metrics(
+    history: pd.DataFrame,
+    probability_column: str = "ModelProbability",
+    event_column: str = "Actual_Event",
+) -> dict:
+    if (
+        history is None or history.empty
+        or probability_column not in history.columns
+        or event_column not in history.columns
+    ):
         return {"N": 0, "Mean_Probability": np.nan, "Actual_Rate": np.nan, "Brier": np.nan, "Log_Loss": np.nan, "Bias": np.nan}
-    frame = history[[probability_column, "Actual_Event"]].copy()
+    frame = history[[probability_column, event_column]].copy()
     frame[probability_column] = pd.to_numeric(frame[probability_column], errors="coerce")
-    frame["Actual_Event"] = pd.to_numeric(frame["Actual_Event"], errors="coerce")
+    frame[event_column] = pd.to_numeric(frame[event_column], errors="coerce")
     frame = frame.dropna()
-    frame = frame[frame["Actual_Event"].isin([0, 1])]
+    frame = frame[frame[event_column].isin([0, 1])]
     if frame.empty:
         return {"N": 0, "Mean_Probability": np.nan, "Actual_Rate": np.nan, "Brier": np.nan, "Log_Loss": np.nan, "Bias": np.nan}
     p = _clip_probability(frame[probability_column])
-    y = frame["Actual_Event"].to_numpy(float)
+    y = frame[event_column].to_numpy(float)
     return {
         "N": int(len(frame)),
         "Mean_Probability": float(np.mean(p)),
@@ -2712,26 +2851,35 @@ def binary_probability_metrics(history: pd.DataFrame, probability_column: str = 
     }
 
 
-def binary_probability_calibration_table(history: pd.DataFrame) -> pd.DataFrame:
-    frame = history[["ModelProbability", "Actual_Event"]].copy()
-    frame["ModelProbability"] = pd.to_numeric(frame["ModelProbability"], errors="coerce")
-    frame["Actual_Event"] = pd.to_numeric(frame["Actual_Event"], errors="coerce")
+def binary_probability_calibration_table(
+    history: pd.DataFrame,
+    probability_column: str = "ModelProbability",
+    event_column: str = "Actual_Event",
+    bins: list[float] | None = None,
+    labels: list[str] | None = None,
+) -> pd.DataFrame:
+    if probability_column not in history.columns or event_column not in history.columns:
+        return pd.DataFrame()
+    frame = history[[probability_column, event_column]].copy()
+    frame[probability_column] = pd.to_numeric(frame[probability_column], errors="coerce")
+    frame[event_column] = pd.to_numeric(frame[event_column], errors="coerce")
     frame = frame.dropna()
     if frame.empty:
         return pd.DataFrame()
-    if BINARY_EVENT_KIND == "hr":
-        bins = [0, .05, .08, .11, .14, .17, .20, .25, .35, 1.001]
-        labels = ["<5%", "5–7%", "8–10%", "11–13%", "14–16%", "17–19%", "20–24%", "25–34%", "35%+"]
-    else:
-        bins = [0, .40, .45, .50, .55, .60, .65, .70, .75, .80, 1.001]
-        labels = ["<40%", "40–44%", "45–49%", "50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75–79%", "80%+"]
+    if bins is None or labels is None:
+        if BINARY_EVENT_KIND == "hr":
+            bins = [0, .05, .08, .11, .14, .17, .20, .25, .35, 1.001]
+            labels = ["<5%", "5–7%", "8–10%", "11–13%", "14–16%", "17–19%", "20–24%", "25–34%", "35%+"]
+        else:
+            bins = [0, .40, .45, .50, .55, .60, .65, .70, .75, .80, 1.001]
+            labels = ["<40%", "40–44%", "45–49%", "50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75–79%", "80%+"]
     frame["Probability_Bucket"] = pd.cut(
-        frame["ModelProbability"], bins=bins, labels=labels, right=False, include_lowest=True
+        frame[probability_column], bins=bins, labels=labels, right=False, include_lowest=True
     )
     grouped = frame.groupby("Probability_Bucket", observed=False).agg(
-        Sample=("Actual_Event", "size"),
-        Average_Probability=("ModelProbability", "mean"),
-        Actual_Rate=("Actual_Event", "mean"),
+        Sample=(event_column, "size"),
+        Average_Probability=(probability_column, "mean"),
+        Actual_Rate=(event_column, "mean"),
     ).reset_index()
     grouped["Calibration_Gap"] = grouped["Actual_Rate"] - grouped["Average_Probability"]
     return grouped
@@ -3146,14 +3294,14 @@ def render_binary_backtest_tab(
     )
     editor_columns = [
         "PlayerID", "Player", "Team", "Opponent", "LineupSpot", "Projected_PA",
-        "ModelPerPA", "ExpectedCount", "ModelProbability", "ModelScore",
+        "ModelPerPA", "ExpectedCount", "ModelProbability", "TwoPlusProbability", "ModelScore",
         "Market_Line", "Over_Odds", "Under_Odds", "MarketProbability", "Line_Source", "Notes",
     ]
     editable = snapshot[[column for column in editor_columns if column in snapshot.columns]].copy()
     editable = editable.rename(columns={
         "LineupSpot": "Order", "Projected_PA": "Proj PA", "ModelPerPA": "Per PA",
         "ExpectedCount": "Projected Hits", "ModelProbability": "1+ Hit",
-        "ModelScore": "Model Score", "Market_Line": "Line", "Over_Odds": "Over Odds",
+        "TwoPlusProbability": "2+ Hit", "ModelScore": "Model Score", "Market_Line": "Line", "Over_Odds": "Over Odds",
         "Under_Odds": "Under Odds", "MarketProbability": "No-vig Market",
         "Line_Source": "Line Source",
     })
@@ -3314,6 +3462,41 @@ def render_binary_backtest_tab(
     if not calibration_table.empty:
         st.dataframe(
             calibration_table.style.format({
+                "Average_Probability": "{:.1%}", "Actual_Rate": "{:.1%}", "Calibration_Gap": "{:+.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+    st.markdown("#### 3b. Supplemental 2+ hit accuracy")
+    st.caption(
+        "The 2+ hit estimate is derived from the raw per-PA hit model and projected plate appearances. "
+        "The active 1+ hit calibration is intentionally not applied to this separate outcome."
+    )
+    two_plus_metrics = binary_probability_metrics(
+        completed_history, "TwoPlusProbability", "Actual_2plus_Hit"
+    )
+    if two_plus_metrics.get("N", 0) == 0:
+        st.info("No usable 2+ hit probability outcomes are available yet.")
+    else:
+        two_plus_table = pd.DataFrame([{
+            "Probability": "Raw 2+ hit", **two_plus_metrics
+        }])
+        st.dataframe(
+            two_plus_table.style.format({
+                "Mean_Probability": "{:.1%}", "Actual_Rate": "{:.1%}",
+                "Brier": "{:.4f}", "Log_Loss": "{:.4f}", "Bias": "{:+.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+        two_plus_calibration = binary_probability_calibration_table(
+            completed_history,
+            "TwoPlusProbability",
+            "Actual_2plus_Hit",
+            bins=[0, .10, .15, .20, .25, .30, .35, .40, .50, 1.001],
+            labels=["<10%", "10–14%", "15–19%", "20–24%", "25–29%", "30–34%", "35–39%", "40–49%", "50%+"],
+        )
+        st.dataframe(
+            two_plus_calibration.style.format({
                 "Average_Probability": "{:.1%}", "Actual_Rate": "{:.1%}", "Calibration_Gap": "{:+.1%}",
             }),
             width="stretch", hide_index=True,
@@ -4226,13 +4409,14 @@ def render_slate_tools(
     ranked_slate = add_slate_grade(slate_board, probability_weight, score_weight, confidence_weight)
     top_columns = [
         "SlateRank", "Player", "Team", "Opponent", "Game", "LineupSpot",
-        BINARY_EXPECTED_COUNT_COLUMN, BINARY_PROBABILITY_COLUMN, BINARY_SCORE_COLUMN, "Confidence", "Confidence_Level",
+        BINARY_EXPECTED_COUNT_COLUMN, BINARY_PROBABILITY_COLUMN, "Model_2plus_Hit", BINARY_SCORE_COLUMN, "Confidence", "Confidence_Level",
         "SlateGrade", "LineupStatus", "Market_Line", "Market_Over_Prob", "Model_Market_Edge", "Line_Source",
     ]
     top10 = ranked_slate[[column for column in top_columns if column in ranked_slate.columns]].head(10).copy()
     top10 = top10.rename(columns={
         BINARY_EXPECTED_COUNT_COLUMN: BINARY_EXPECTED_COUNT_LABEL,
         BINARY_PROBABILITY_COLUMN: BINARY_TARGET_LABEL,
+        "Model_2plus_Hit": "2+ Hit",
         BINARY_SCORE_COLUMN: "Model Score",
         "LineupSpot": "Order",
         "Market_Over_Prob": "No-vig Market",
@@ -4240,7 +4424,7 @@ def render_slate_tools(
         "Market_Line": "Line",
     })
     format_map = {
-        BINARY_EXPECTED_COUNT_LABEL: "{:.2f}", BINARY_TARGET_LABEL: "{:.1%}", "Model Score": "{:.1f}", "Confidence": "{:.1f}",
+        BINARY_EXPECTED_COUNT_LABEL: "{:.2f}", BINARY_TARGET_LABEL: "{:.1%}", "2+ Hit": "{:.1%}", "Model Score": "{:.1f}", "Confidence": "{:.1f}",
         "SlateGrade": "{:.1f}", "No-vig Market": "{:.1%}", "Model Edge": "{:+.1%}", "Line": "{:.1f}", "Order": "{:.0f}",
     }
     score_subsets = [column for column in ["Model Score", "Confidence", "SlateGrade"] if column in top10.columns]
@@ -4295,149 +4479,115 @@ def render_slate_tools(
     )
 
 
-
-
-# -----------------------------------------------------------------------------
-# Sleek Edge theme overlay
-# -----------------------------------------------------------------------------
 def inject_edge_theme() -> None:
     st.markdown(
         """
         <style>
         :root {
-            --edge-navy:#06162f;
-            --edge-blue:#165dff;
-            --edge-blue-2:#2f7cff;
-            --edge-cyan:#00a6d6;
-            --edge-green:#16a34a;
-            --edge-red:#ef4444;
-            --edge-orange:#f59e0b;
-            --edge-purple:#7c3aed;
-            --edge-ink:#07142f;
-            --edge-muted:#64748b;
-            --edge-line:#dbe4f0;
-            --edge-bg:#f6f8fc;
+            --bg:#f6f1e9;
+            --panel:#fffdf8;
+            --panel-2:#fff8ee;
+            --ink:#162033;
+            --muted:#6b7280;
+            --line:#eadfce;
+            --nav:#102033;
+            --nav-2:#17324d;
+            --blue:#2563eb;
+            --teal:#0f9f9a;
+            --green:#15803d;
+            --orange:#d97706;
+            --red:#dc2626;
+            --purple:#7c3aed;
+            --shadow:0 10px 28px rgba(38,28,12,.08);
         }
-        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"], .stApp {
+        html, body, .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {
             background:
-                radial-gradient(circle at 12% 0%, rgba(22,93,255,.08), transparent 34rem),
-                radial-gradient(circle at 92% 3%, rgba(0,166,214,.07), transparent 30rem),
-                linear-gradient(180deg, #ffffff 0%, var(--edge-bg) 48%, #ffffff 100%) !important;
-            color:var(--edge-ink) !important;
-            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                radial-gradient(circle at 7% 2%, rgba(37,99,235,.10), transparent 28rem),
+                radial-gradient(circle at 94% 6%, rgba(15,159,154,.11), transparent 26rem),
+                linear-gradient(180deg, #faf7f0 0%, var(--bg) 46%, #fbfaf7 100%) !important;
+            color:var(--ink) !important;
         }
-        [data-testid="stHeader"] { background: transparent !important; height:0 !important; }
-        [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { visibility:hidden !important; height:0 !important; }
-        .block-container {
-            max-width:1860px !important;
-            padding-top:.45rem !important;
-            padding-left:1.45rem !important;
-            padding-right:1.45rem !important;
-            padding-bottom:2.2rem !important;
+        [data-testid="stHeader"] { background:rgba(250,247,240,.88) !important; backdrop-filter:blur(12px); }
+        .block-container { max-width:1840px; padding-top:.85rem; padding-bottom:2.6rem; }
+        h1,h2,h3,h4,p,span,label,div { color:inherit; }
+        h1 { letter-spacing:-.045em; font-weight:950 !important; color:#101b2d !important; }
+        h2,h3 { letter-spacing:-.025em; font-weight:875 !important; color:#101b2d !important; }
+        .app-kicker {
+            display:inline-flex; align-items:center; gap:.45rem; padding:.34rem .72rem;
+            border-radius:999px; background:linear-gradient(90deg,var(--teal),var(--blue));
+            color:white !important; font-size:.72rem; font-weight:900; letter-spacing:.10em;
+            text-transform:uppercase; box-shadow:0 8px 18px rgba(15,159,154,.20); margin-bottom:.35rem;
         }
-        h1, h2, h3 { color:var(--edge-ink) !important; letter-spacing:-.035em !important; font-weight:900 !important; }
-        h1 { font-size:1.8rem !important; }
-        h2 { font-size:1.35rem !important; }
-        h3 { font-size:1.08rem !important; }
-        .app-kicker { display:none !important; }
-
         .edge-topbar {
-            position:sticky; top:0; z-index:999;
-            margin:-.45rem -1.45rem 1.05rem -1.45rem;
-            min-height:58px; padding:.58rem 1.45rem;
-            background:linear-gradient(90deg,#05132b 0%,#08255a 50%,#05132b 100%);
-            border-bottom:1px solid rgba(255,255,255,.08);
-            box-shadow:0 12px 28px rgba(6,22,47,.18);
             display:flex; align-items:center; justify-content:space-between; gap:1rem;
+            background:linear-gradient(90deg,var(--nav) 0%,var(--nav-2) 100%);
+            border:1px solid rgba(255,255,255,.10); border-radius:18px; padding:.68rem .82rem;
+            box-shadow:var(--shadow); margin:.1rem 0 1rem;
         }
-        .edge-brand { display:flex; align-items:center; gap:.65rem; min-width:240px; }
-        .edge-logo {
-            width:28px; height:28px; border-radius:999px;
-            display:flex; align-items:center; justify-content:center;
-            border:1px solid rgba(255,255,255,.7);
-            color:white; font-size:15px; font-weight:900;
-            background:rgba(255,255,255,.06);
-            box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);
-        }
-        .edge-brand-title { color:white; font-weight:950; font-size:1.05rem; letter-spacing:.03em; }
-        .edge-brand-subtitle { color:#9fb5d6; font-size:.72rem; margin-top:-.12rem; }
-        .edge-nav { display:flex; align-items:center; gap:.32rem; flex:1; justify-content:center; flex-wrap:wrap; }
-        .edge-nav-item {
-            color:#c8d7ef; padding:.62rem .9rem; border-radius:10px;
-            font-size:.82rem; font-weight:780; line-height:1;
-            border:1px solid transparent;
-        }
-        .edge-nav-item.active {
-            color:#fff; background:linear-gradient(180deg,rgba(22,93,255,.35),rgba(22,93,255,.22));
-            border-color:rgba(96,165,250,.45); box-shadow:inset 0 -2px 0 #2f7cff;
-        }
-        .edge-meta { display:flex; align-items:center; gap:.65rem; color:#c8d7ef; font-size:.78rem; white-space:nowrap; }
-        .edge-dot { width:8px; height:8px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 4px rgba(34,197,94,.12); }
-
-        [data-testid="stWidgetLabel"] label, label[data-testid="stWidgetLabel"] { color:#475569 !important; font-weight:800 !important; font-size:.78rem !important; }
-        .stSelectbox [data-baseweb="select"], .stDateInput input, .stNumberInput input, .stTextInput input,
-        div[data-baseweb="select"] > div, div[data-testid="stNumberInput"] input {
-            border-radius:10px !important; border-color:#d8e2ef !important; background:#fff !important;
-            color:var(--edge-ink) !important; box-shadow:0 2px 8px rgba(15,23,42,.04) !important;
-        }
-        div[data-testid="stNumberInput"] button { border-radius:8px !important; border-color:#d8e2ef !important; background:#f8fafc !important; color:var(--edge-ink) !important; }
-        .stButton > button, .stDownloadButton > button {
-            border-radius:10px !important; border:1px solid #d7e2f1 !important; background:#fff !important;
-            color:#0b1b39 !important; font-weight:850 !important; box-shadow:0 6px 16px rgba(15,23,42,.06) !important;
-            transition:all .14s ease !important;
-        }
-        .stButton > button:hover, .stDownloadButton > button:hover { transform:translateY(-1px); border-color:#2f7cff !important; box-shadow:0 10px 22px rgba(47,124,255,.16) !important; }
-        .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] { background:linear-gradient(180deg,#0b63ff,#0645b8) !important; color:#fff !important; border-color:#0b63ff !important; }
-
+        .edge-brand { display:flex; align-items:center; gap:.55rem; color:white !important; font-weight:950; letter-spacing:-.02em; font-size:1.08rem; }
+        .edge-brand .ball { width:26px; height:26px; border-radius:999px; display:grid; place-items:center; background:rgba(255,255,255,.10); border:1px solid rgba(255,255,255,.22); font-size:.9rem; }
+        .edge-nav { display:flex; gap:.35rem; flex-wrap:wrap; }
+        .edge-pill { color:#e5eefc !important; font-weight:750; font-size:.82rem; padding:.42rem .7rem; border-radius:999px; background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.08); }
+        .edge-pill.active { background:#ffffff; color:var(--blue) !important; }
+        .edge-status { color:#dbeafe !important; font-size:.78rem; font-weight:650; }
         div[data-testid="stMetric"] {
-            position:relative; overflow:hidden; min-height:112px;
-            background:linear-gradient(145deg,#fff 0%,#fbfdff 60%,#eef5ff 100%) !important;
-            border:1px solid #dbe7f6 !important; border-radius:16px !important;
-            padding:1rem 1.05rem !important; box-shadow:0 10px 26px rgba(8,24,56,.07) !important;
+            background:linear-gradient(145deg,var(--panel) 0%, #fef7ea 100%) !important;
+            border:1px solid var(--line) !important; border-radius:18px !important; padding:.9rem 1rem !important;
+            box-shadow:var(--shadow) !important;
         }
-        div[data-testid="stMetric"]::after {
-            content:""; position:absolute; right:16px; top:18px; width:54px; height:54px; border-radius:50%;
-            background:radial-gradient(circle, rgba(22,93,255,.22), rgba(22,93,255,.06) 62%, transparent 65%);
+        div[data-testid="stMetric"] label, div[data-testid="stMetric"] [data-testid="stMetricLabel"] { color:#42526b !important; font-weight:800 !important; }
+        div[data-testid="stMetricValue"] { color:#0f3460 !important; font-weight:950 !important; }
+        div[data-testid="stMetricDelta"] { color:var(--green) !important; font-weight:850 !important; }
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]) { gap:.8rem; }
+        .stButton > button, .stDownloadButton > button {
+            border-radius:12px !important; border:1px solid #d9cdb9 !important;
+            background:#fffdf8 !important; color:var(--ink) !important; font-weight:800 !important;
+            box-shadow:0 5px 14px rgba(38,28,12,.06) !important;
         }
-        div[data-testid="stMetricLabel"] p { color:#172554 !important; font-size:.82rem !important; font-weight:900 !important; }
-        div[data-testid="stMetricValue"] { color:#0b63ff !important; font-size:2rem !important; font-weight:950 !important; letter-spacing:-.035em !important; }
-        div[data-testid="stMetricDelta"] { font-weight:850 !important; }
-
-        [data-testid="stDataFrame"] {
-            border:1px solid #d8e2ef !important; border-radius:16px !important; overflow:hidden !important;
-            box-shadow:0 10px 28px rgba(8,24,56,.055) !important; background:#fff !important;
+        .stButton > button:hover, .stDownloadButton > button:hover { border-color:var(--teal) !important; color:var(--teal) !important; transform:translateY(-1px); }
+        .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] { background:linear-gradient(180deg,#2563eb,#1d4ed8) !important; color:#fff !important; border-color:#2563eb !important; }
+        div[data-baseweb="select"] > div,
+        div[data-testid="stNumberInput"] input,
+        div[data-testid="stDateInput"] input,
+        div[data-testid="stTextInput"] input,
+        textarea {
+            background:#fffdf8 !important; color:var(--ink) !important; border:1px solid #d9cdb9 !important; border-radius:12px !important;
         }
-        [data-testid="stTable"] table {
-            border-collapse:separate !important; border-spacing:0 !important; border:1px solid #d8e2ef !important;
-            border-radius:16px !important; overflow:hidden !important; box-shadow:0 10px 28px rgba(8,24,56,.055) !important;
+        div[data-testid="stNumberInput"] button { background:#f3eadc !important; color:var(--ink) !important; border-color:#d9cdb9 !important; border-radius:10px !important; }
+        [data-testid="stSidebar"] { background:linear-gradient(180deg,#102033 0%,#17324d 62%,#102033 100%) !important; border-right:1px solid rgba(255,255,255,.08) !important; }
+        [data-testid="stSidebar"] * { color:#edf6ff !important; }
+        [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea { background:#fffdf8 !important; color:#162033 !important; }
+        [data-testid="stSidebar"] .stButton > button { background:rgba(255,255,255,.08) !important; color:#fff !important; border-color:rgba(255,255,255,.16) !important; }
+        [data-testid="stTabs"] [data-baseweb="tab-list"] { gap:.45rem; border-bottom:1px solid #e4d7c4; }
+        [data-baseweb="tab"] { height:42px !important; border-radius:12px 12px 0 0 !important; background:#fff8ee !important; color:#475569 !important; font-weight:850 !important; border:1px solid #eadfce !important; border-bottom:0 !important; }
+        [aria-selected="true"][data-baseweb="tab"] { background:#fffdf8 !important; color:var(--teal) !important; box-shadow:inset 0 -3px 0 var(--teal) !important; }
+        .hero, .leader, .note, .slate-card, .info-card, .soft-card {
+            background:linear-gradient(145deg,#fffdf8,#fff7ea) !important; border:1px solid var(--line) !important;
+            border-radius:18px !important; box-shadow:var(--shadow) !important; color:var(--ink) !important;
         }
-        [data-testid="stTable"] thead tr th { background:#f7faff !important; color:#667085 !important; font-size:.76rem !important; font-weight:850 !important; border-bottom:1px solid #e5edf7 !important; }
-        [data-testid="stTable"] tbody tr:nth-child(even) { background:#fbfdff !important; }
-        [data-testid="stTable"] tbody tr:hover { background:#f0f6ff !important; }
-
-        .streamlit-expanderHeader { border-radius:14px !important; background:#fff !important; border:1px solid #dbe7f6 !important; font-weight:850 !important; }
-        [data-baseweb="tab-list"] { gap:.45rem; background:transparent !important; border-bottom:1px solid #d8e2ef; }
-        [data-baseweb="tab"] { height:40px !important; border-radius:10px 10px 0 0 !important; background:#f7faff !important; color:#475569 !important; font-weight:850 !important; border:1px solid #e1eaf5 !important; border-bottom:0 !important; }
-        [aria-selected="true"][data-baseweb="tab"] { background:#fff !important; color:#0b63ff !important; box-shadow:inset 0 -3px 0 #0b63ff !important; }
-
-        [data-testid="stSidebar"] { background:linear-gradient(180deg,#06162f 0%,#09234a 60%,#06162f 100%) !important; border-right:1px solid rgba(255,255,255,.07) !important; }
-        [data-testid="stSidebar"] * { color:#eaf2ff !important; }
-        [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea { color:#07142f !important; }
-        [data-testid="stSidebar"] .stButton > button { background:rgba(255,255,255,.08) !important; color:#fff !important; border-color:rgba(255,255,255,.14) !important; }
-
-        .slate-card, .leader, .note, .hero {
-            background:linear-gradient(145deg,#fff,#fbfdff) !important; border:1px solid #dbe7f6 !important;
-            border-radius:16px !important; box-shadow:0 10px 26px rgba(8,24,56,.06) !important; color:var(--edge-ink) !important;
+        .hero h2, .hero h1, .hero p { color:var(--ink) !important; }
+        .leader .label, .slate-time, .muted { color:var(--muted) !important; }
+        .leader .name, .leader .value { color:#0f3460 !important; }
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            border:1px solid var(--line) !important; border-radius:15px !important; overflow:hidden !important;
+            background:#fffdf8 !important; box-shadow:0 7px 20px rgba(38,28,12,.045) !important;
         }
-        .hero { padding:1rem 1.1rem !important; background:linear-gradient(145deg,#fff,#eef5ff) !important; }
-        .hero h2, .hero p { color:var(--edge-ink) !important; }
-        a { color:#0b63ff !important; font-weight:800; }
-
-        @media (max-width:950px) {
-            .edge-topbar { position:relative; flex-direction:column; align-items:flex-start; }
-            .edge-nav { justify-content:flex-start; }
-            .edge-meta { display:none; }
+        [data-testid="stDataFrame"] *, [data-testid="stTable"] * { color:#162033 !important; }
+        [data-testid="stDataFrame"] [role="gridcell"],
+        [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stDataFrame"] [role="rowheader"] {
+            background:#fffdf8 !important; color:#162033 !important; border-color:#efe4d3 !important;
         }
+        [data-testid="stDataFrame"] [role="columnheader"], [data-testid="stTable"] thead tr th {
+            background:#f5eadb !important; color:#42526b !important; font-weight:900 !important;
+        }
+        [data-testid="stTable"] tbody tr:nth-child(even) { background:#fbf6ec !important; }
+        [data-testid="stTable"] tbody tr:hover, [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"] { background:#eef8f7 !important; }
+        .streamlit-expanderHeader { background:#fffdf8 !important; border:1px solid var(--line) !important; border-radius:14px !important; font-weight:850 !important; color:var(--ink) !important; }
+        .stAlert { border-radius:14px !important; }
+        hr { border-color:#e6dac7 !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -4471,12 +4621,12 @@ def render_edge_header() -> None:
 inject_clean_css()
 inject_edge_theme()
 render_edge_header()
-st.caption('Sleek model dashboard for 1+ hit probability, 2-hit probability, score validation, and matchup context.')
 MODEL_KEY = "clean_hits"
 odds_api_key = read_streamlit_secret("THE_ODDS_API_KEY")
 
+st.caption('Sleek model dashboard for 1+ hit probability, 2+ hit probability, score validation, slate Top 10, pairing suggestions, and matchup context.')
 st.caption(
-    "A dedicated one-hit model with expected batting average, contact skill, pitch-shape fit, "
+    "A one-hit-first model with a supplemental 2+ hit probability, expected batting average, contact skill, pitch-shape fit, "
     "zone fit, platoon splits, pitcher vulnerability, recent form and projected opportunities."
 )
 
@@ -4856,7 +5006,7 @@ quick_tab, contact_tab, matchup_tab, bvp_tab, pitcher_tab, slate_tab, backtest_t
 
 with quick_tab:
     quick_columns = [
-        "Rank", "Player", "LineupSpot", "Projected_PA", "Projected_Hits", "Model_1plus_Hit",
+        "Rank", "Player", "LineupSpot", "Projected_PA", "Projected_Hits", "Model_1plus_Hit", "Model_2plus_Hit",
         "Raw_Model_1plus_Hit", "HitScore", "Confidence_Level", "Adj_xHit_PA", "Contact_Pct", "K_Pct",
         "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
         "PitchMatchScore", "ZoneFitScore", "ParkFactor", "Market_Line",
@@ -4867,7 +5017,7 @@ with quick_tab:
         quick = quick.drop(columns=["Raw_Model_1plus_Hit"], errors="ignore")
     quick = quick.rename(columns={
         "LineupSpot": "Order", "Projected_PA": "Proj PA", "Projected_Hits": "Proj Hits", "Model_1plus_Hit": "1+ Hit",
-        "Raw_Model_1plus_Hit": "Raw 1+ Hit", "HitScore": "Hit Score", "Confidence_Level": "Confidence",
+        "Model_2plus_Hit": "2+ Hit", "Raw_Model_1plus_Hit": "Raw 1+ Hit", "HitScore": "Hit Score", "Confidence_Level": "Confidence",
         "Adj_xHit_PA": "Adj xHit/PA", "Contact_Pct": "Contact%", "K_Pct": "K%",
         "EffectiveStand": "Bats vs SP", "PitcherSideRead": "Pitcher Read",
         "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
@@ -4880,7 +5030,7 @@ with quick_tab:
     styler = quick.style.background_gradient(
         cmap="RdYlGn", subset=["Hit Score", "Side Attack", "Pitch Match", "Zone Fit"], vmin=0, vmax=100
     ).format({
-        "Order": "{:.0f}", "Proj PA": "{:.2f}", "Proj Hits": "{:.2f}", "1+ Hit": "{:.1%}", "Raw 1+ Hit": "{:.1%}",
+        "Order": "{:.0f}", "Proj PA": "{:.2f}", "Proj Hits": "{:.2f}", "1+ Hit": "{:.1%}", "2+ Hit": "{:.1%}", "Raw 1+ Hit": "{:.1%}",
         "Hit Score": "{:.1f}", "Adj xHit/PA": "{:.1%}", "Contact%": "{:.1%}",
         "K%": "{:.1%}", "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}",
         "Park Factor": "{:.0f}", "Line": "{:.1f}", "Over Odds": "{:+.0f}",
@@ -4892,7 +5042,8 @@ with contact_tab:
     columns = [
         "Player", "PA", "Hits", "Hit_PA", "xHit_PA", "Avg_xBA_Contact",
         "Contact_Pct", "Zone_Contact_Pct", "Whiff_Pct", "K_Pct", "LD_Pct",
-        "HH_Pct", "SweetSpot_Pct", "Sprint_Speed",
+        "HH_Pct", "SweetSpot_Pct", "Barrel_Range_Pct", "Dynamic_Barrel_Pct",
+        "LA_Optimization_Score", "Sprint_Speed",
     ]
     contact = rankings[[column for column in columns if column in rankings.columns]].copy()
     contact = contact.rename(columns={
@@ -4900,6 +5051,9 @@ with contact_tab:
         "Contact_Pct": "Contact%", "Zone_Contact_Pct": "Zone Contact%",
         "Whiff_Pct": "Whiff%", "K_Pct": "K%", "LD_Pct": "LD%",
         "HH_Pct": "Hard Hit%", "SweetSpot_Pct": "Sweet Spot%",
+        "Barrel_Range_Pct": "Barrel Range%",
+        "Dynamic_Barrel_Pct": "Dynamic Barrel%",
+        "LA_Optimization_Score": "LA Opt Score",
         "Sprint_Speed": "Sprint Speed",
     })
     st.caption(
@@ -4909,7 +5063,8 @@ with contact_tab:
     positive_columns = [
         column for column in [
             "H/PA", "xHit/PA", "xBA Contact", "Contact%", "Zone Contact%",
-            "LD%", "Hard Hit%", "Sweet Spot%", "Sprint Speed"
+            "LD%", "Hard Hit%", "Sweet Spot%", "Barrel Range%",
+            "Dynamic Barrel%", "LA Opt Score", "Sprint Speed"
         ] if column in contact.columns
     ]
     risk_columns = [column for column in ["Whiff%", "K%"] if column in contact.columns]
@@ -4928,7 +5083,9 @@ with contact_tab:
         "H/PA": "{:.1%}", "xHit/PA": "{:.1%}", "xBA Contact": "{:.3f}",
         "Contact%": "{:.1%}", "Zone Contact%": "{:.1%}", "Whiff%": "{:.1%}",
         "K%": "{:.1%}", "LD%": "{:.1%}", "Hard Hit%": "{:.1%}",
-        "Sweet Spot%": "{:.1%}", "Sprint Speed": "{:.1f}",
+        "Sweet Spot%": "{:.1%}", "Barrel Range%": "{:.1%}",
+        "Dynamic Barrel%": "{:.1%}", "LA Opt Score": "{:.1f}",
+        "Sprint Speed": "{:.1f}",
     })
     st.dataframe(
         contact_style,
@@ -5074,7 +5231,8 @@ with notes_tab:
     st.markdown(
         """
         ### Reading the board
-        - **1+ Hit** combines the modeled hit rate per plate appearance with projected plate appearances.
+        - **1+ Hit** remains the primary target and combines the modeled hit rate per plate appearance with projected plate appearances.
+        - **2+ Hit** estimates the chance of a multi-hit game from the same per-PA rate and projected opportunities. It is currently uncalibrated and should be treated as a supplemental signal.
         - **Projected Hits** is the expected event count: modeled rate per PA × projected PA. It is not itself a probability.
         - **Hit Score** is a 0–100 comparison score within the selected offense, not a literal probability.
         - **Pitcher Read / Side Attack** grades whether the starter has been more attackable or avoidable for LHB or RHB, with small samples shrunk toward neutral.
