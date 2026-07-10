@@ -445,6 +445,10 @@ def build_hr_board_v2(df, pitcher_id, team, min_pa, end_date, park_hr_factor_lhb
     board["Player"] = board["Player"].fillna("MLB ID " + board["player_id"].astype("Int64").astype(str))
     board = board.drop(columns=["Player_Lookup"], errors="ignore")
 
+    # Merge lineup information so LineupSpot exists
+    board = board.merge(recent_lineup, on="player_id", how="left")
+    board["LineupSpot"] = pd.to_numeric(board.get("LineupSpot"), errors="coerce").fillna(5)
+
     for col in ["PA", "HR", "Barrels", "Hard_Hits", "xSLG_Total", "xISO_Total"]:
         board[col] = pd.to_numeric(board.get(col, 0), errors="coerce").fillna(0)
 
