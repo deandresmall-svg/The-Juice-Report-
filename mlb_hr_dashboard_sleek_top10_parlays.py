@@ -456,10 +456,15 @@ def build_hr_board_v2(df, pitcher_id, team, min_pa, end_date, park_hr_factor_lhb
     for col in ["Recent_PA", "Recent_HR", "Recent_Barrels", "Recent_xSLG", "Recent_xISO"]:
         board[col] = pd.to_numeric(board.get(col, 0), errors="coerce").fillna(0)
 
+    # Create rate columns that are used later
+    board["Recent_HR_PA"] = safe_divide(board["Recent_HR"], board["Recent_PA"])
+
     pitcher_splits = pitcher_hr_splits(df, pitcher_id)
     board = board.merge(pitcher_splits, left_on="EffectiveStand", right_on="Stand", how="left", suffixes=("", "_Pitcher"))
     for col in ["Pitcher_PA", "Pitcher_HR", "Pitcher_Barrels", "Pitcher_xSLG", "Pitcher_xISO"]:
         board[col] = pd.to_numeric(board.get(col, 0), errors="coerce").fillna(0)
+
+    board["Pitcher_HR_PA"] = safe_divide(board["Pitcher_HR"], board["Pitcher_PA"])
 
     side_attack = pitcher_attack_profile_hr(df, pitcher_id)
     board = board.merge(side_attack[["Side", "PitcherSideAttackScore", "PitcherSideRead"]], left_on="EffectiveStand", right_on="Side", how="left")
@@ -479,9 +484,9 @@ def build_hr_board_v2(df, pitcher_id, team, min_pa, end_date, park_hr_factor_lhb
         recent_vuln = recent_pitcher_pa.groupby("stand").agg(Recent_Pitcher_HR=("is_hr","sum"), Recent_Pitcher_PA=("pa_key","nunique")).reset_index()
         recent_vuln["Recent_Pitcher_HR_PA"] = safe_divide(recent_vuln["Recent_Pitcher_HR"], recent_vuln["Recent_Pitcher_PA"])
         board = board.merge(recent_vuln[["stand", "Recent_Pitcher_HR_PA"]], left_on="EffectiveStand", right_on="stand", how="left")
-        board["Recent_Pitcher_Vuln"] = board["Recent_Pitcher_HR_PA"].fillna(board.get("Pitcher_HR_PA", 0.0))
+        board["Recent_Pitcher_Vuln"] = board["Recent_Pitcher_HR_PA"].fillna(0.0)
     else:
-        board["Recent_Pitcher_Vuln"] = board.get("Pitcher_HR_PA", 0.0)
+        board["Recent_Pitcher_Vuln"] = 0.0
 
     league_pa = max(int(pa_all["pa_key"].nunique()), 1)
     league_hr_rate = float(pa_all["is_hr"].sum() / league_pa)
