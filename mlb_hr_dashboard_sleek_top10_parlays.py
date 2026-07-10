@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from itertools import combinations
 from typing import Iterable
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -66,14 +67,49 @@ def normalize_name(value: object) -> str:
     return "".join(character.lower() for character in str(value) if character.isalnum())
 
 
+def optimize_dataframe_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce Streamlit Cloud memory pressure without changing model outputs."""
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    out = df.copy()
+    # Low-cardinality object columns are much cheaper as categories. Keep name
+    # fields as objects so string operations and display remain predictable.
+    skip_object = {"player_name", "Player", "pitcher_name"}
+    for column in out.select_dtypes(include=["object"]).columns:
+        if column in skip_object:
+            continue
+        try:
+            nunique = out[column].nunique(dropna=True)
+            if nunique and nunique < max(80, len(out) * 0.35):
+                out[column] = out[column].astype("category")
+        except Exception:
+            pass
+    for column in out.select_dtypes(include=["float64"]).columns:
+        out[column] = pd.to_numeric(out[column], downcast="float")
+    for column in out.select_dtypes(include=["int64"]).columns:
+        out[column] = pd.to_numeric(out[column], downcast="integer")
+    return out
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
-    return statcast(
-        start_dt=start_date,
-        end_dt=end_date,
-        verbose=False,
-        parallel=False,
-    )
+    """Best-effort Statcast loader.
+
+    PyBaseball/Savant will occasionally time out, return a partial response, or
+    fail on Streamlit Cloud. Returning an empty DataFrame lets the app show a
+    friendly warning instead of crashing the entire dashboard.
+    """
+    try:
+        data = statcast(
+            start_dt=start_date,
+            end_dt=end_date,
+            verbose=False,
+            parallel=False,
+        )
+        return data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+    except Exception as exc:
+        st.session_state["clean_hr_last_statcast_error"] = f"{type(exc).__name__}: {exc}"
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -253,7 +289,7 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
     zone_text = zone_numeric.round().astype("Int64").astype(str)
     zone_mask = zone_numeric.between(1, 9, inclusive="both").fillna(False).to_numpy(bool)
     df["zone_group"] = np.where(zone_mask, zone_text, "Chase")
-    return df
+    return optimize_dataframe_memory(df)
 
 
 def most_common(series: pd.Series, default: str = "") -> str:
@@ -1856,6 +1892,24 @@ def build_hr_board(
     return board, profile
 
 
+def build_hr_board_safe(*args, context: str = "HR board", **kwargs) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Crash guard around the matchup model.
+
+    A single missing lineup field, Savant schema change, or bad player row should
+    not bring down the entire app. The dashboard returns an empty board plus a
+    short warning that can be shown in the UI.
+    """
+    try:
+        board, profile = build_hr_board(*args, **kwargs)
+        if not isinstance(board, pd.DataFrame):
+            board = pd.DataFrame()
+        if not isinstance(profile, pd.DataFrame):
+            profile = pd.DataFrame()
+        return board, profile
+    except Exception as exc:
+        st.session_state["clean_hr_last_model_error"] = f"{context}: {type(exc).__name__}: {exc}"
+        st.session_state["clean_hr_last_model_traceback"] = traceback.format_exc(limit=6)
+        return pd.DataFrame(), pd.DataFrame()
 
 
 # -----------------------------------------------------------------------------
@@ -3371,8 +3425,9 @@ def build_entire_slate_hr_snapshot(
                 lineup_seed = infer_recent_lineup(df, batting_team)
                 lineup_status = "Recent lineup fallback"
             auto_park = fetch_savant_park_factors(game.get("venue", ""), int(pd.Timestamp(slate_date_text).year), "HR")
-            board, _ = build_hr_board(
+            board, _ = build_hr_board_safe(
                 df=df,
+                context=f"whole-slate {batting_code}",
                 pitcher_id=int(pitcher_row["pitcher"]),
                 team=batting_team,
                 min_pa=min_pa,
@@ -4587,6 +4642,8 @@ if refresh or "clean_hr_statcast_data" not in st.session_state:
 df = st.session_state.get("clean_hr_statcast_data", pd.DataFrame())
 if df.empty:
     st.warning("No Statcast data was returned. Use completed dates and try again.")
+    if st.session_state.get("clean_hr_last_statcast_error"):
+        st.caption(f"Last Statcast error: {st.session_state['clean_hr_last_statcast_error']}")
     st.stop()
 
 loaded_start, loaded_end = st.session_state["clean_hr_loaded_dates"]
@@ -4795,7 +4852,7 @@ with st.expander("Game, park and weather adjustments", expanded=True):
     with c4:
         use_auto_bat_tracking = st.checkbox(
             "Automatic Savant bat tracking",
-            value=True,
+            value=False,
             key="clean_hr_auto_bat_tracking",
             help="Downloads current-season Baseball Savant bat-tracking data and uses the previous season as a player-level fallback.",
         )
@@ -4977,8 +5034,9 @@ with st.expander("Confirm lineup", expanded=False):
         key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
     )
 
-rankings, pitch_mix = build_hr_board(
+rankings, pitch_mix = build_hr_board_safe(
     df=df,
+    context=f"selected matchup {selected_team}",
     pitcher_id=selected_pitcher,
     team=selected_team,
     min_pa=min_pa,
@@ -4999,7 +5057,11 @@ rankings, pitch_mix = build_hr_board(
 )
 
 if rankings.empty:
-    st.warning("No selected hitters remain after filtering.")
+    st.warning("No selected hitters remain after filtering or the matchup model hit a recoverable issue.")
+    if st.session_state.get("clean_hr_last_model_error"):
+        st.caption(st.session_state["clean_hr_last_model_error"])
+        with st.expander("Technical details", expanded=False):
+            st.code(st.session_state.get("clean_hr_last_model_traceback", ""))
     st.stop()
 
 rankings = apply_hr_probability_calibration(
