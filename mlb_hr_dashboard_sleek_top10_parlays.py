@@ -37,6 +37,16 @@ CONTACT_DESCRIPTIONS = {"hit_into_play", "foul", "foul_tip", "foul_bunt"}
 WHIFF_DESCRIPTIONS = {"swinging_strike", "swinging_strike_blocked", "missed_bunt"}
 
 
+def safe_text_series(series, default: str = "") -> pd.Series:
+    """Return a string Series without pandas Categorical fillna crashes."""
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    values = series.astype("object")
+    values = values.where(pd.notna(values), default)
+    values = values.astype(str)
+    return values.replace({"nan": default, "None": default, "<NA>": default, "NaT": default})
+
+
 def safe_divide(numerator, denominator, default=np.nan):
     result = np.divide(
         pd.to_numeric(numerator, errors="coerce"),
@@ -168,9 +178,9 @@ def lookup_names(player_ids: tuple[int, ...]) -> pd.DataFrame:
     if lookup.empty:
         return pd.DataFrame(columns=["player_id", "Player"])
     lookup["Player"] = (
-        lookup["name_first"].fillna("").str.title()
+        safe_text_series(lookup["name_first"], "").str.title()
         + " "
-        + lookup["name_last"].fillna("").str.title()
+        + safe_text_series(lookup["name_last"], "").str.title()
     ).str.strip()
     return lookup.rename(columns={"key_mlbam": "player_id"})[["player_id", "Player"]]
 
@@ -274,12 +284,23 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+
+    # Statcast/pybaseball can return string-like columns as pandas Categorical.
+    # Cast these columns to plain object before fillna/string operations so newer pandas
+    # does not crash with: Cannot setitem on a Categorical with a new category.
+    for _text_col in [
+        "inning_topbot", "away_team", "home_team", "description", "events", "bb_type",
+        "stand", "p_throws", "pitch_name", "player_name"
+    ]:
+        if _text_col in df.columns:
+            df[_text_col] = df[_text_col].astype("object")
+
     top_mask = df["inning_topbot"].eq("Top").fillna(False)
     df["batter_team"] = np.where(top_mask, df["away_team"], df["home_team"])
     df["pitcher_team"] = np.where(top_mask, df["home_team"], df["away_team"])
 
-    description = df["description"].fillna("").astype(str)
-    events = df["events"].fillna("").astype(str)
+    description = safe_text_series(df["description"], "")
+    events = safe_text_series(df["events"], "")
     zone_numeric = pd.to_numeric(df["zone"], errors="coerce")
 
     df["is_swing"] = description.isin(SWING_DESCRIPTIONS).fillna(False)
@@ -304,7 +325,7 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
 
     # Approximate pulled-air classification using Savant hit-coordinate orientation.
     # It is useful as a relative feature but should not be treated as an official Savant pull label.
-    stand = df["stand"].fillna("").astype(str)
+    stand = safe_text_series(df["stand"], "")
     df["is_pull"] = (
         (stand.eq("R") & df["hc_x"].lt(112.0))
         | (stand.eq("L") & df["hc_x"].gt(138.0))
@@ -3990,8 +4011,8 @@ def _prepare_hr_analysis_history(
         team_key = analysis.get("Team", pd.Series("", index=analysis.index)).astype(str)
         pitcher_key = pd.to_numeric(analysis.get("StartingPitcherID"), errors="coerce")
         fallback_key = (
-            slate_key.fillna("")
-            + "|" + team_key.fillna("")
+            safe_text_series(slate_key, "")
+            + "|" + safe_text_series(team_key, "")
             + "|" + pitcher_key.astype("Int64").astype(str)
             + "|" + player_key.astype("Int64").astype(str)
         )
