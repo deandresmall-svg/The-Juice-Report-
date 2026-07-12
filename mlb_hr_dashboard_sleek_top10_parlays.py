@@ -4,10 +4,17 @@ from datetime import date, timedelta
 from itertools import combinations
 from typing import Iterable
 import traceback
+import gc
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+try:
+    from streamlit.runtime.scriptrunner_utils.exceptions import StopException, RerunException
+except Exception:  # Streamlit internals moved across versions
+    class _NoStreamlitInternalException(Exception):
+        pass
+    StopException = RerunException = _NoStreamlitInternalException
 from pybaseball import cache, playerid_reverse_lookup, statcast
 
 
@@ -91,24 +98,62 @@ def optimize_dataframe_memory(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False, max_entries=3)
 def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
-    """Best-effort Statcast loader.
+    """Best-effort Statcast loader with small date chunks.
 
-    PyBaseball/Savant will occasionally time out, return a partial response, or
-    fail on Streamlit Cloud. Returning an empty DataFrame lets the app show a
-    friendly warning instead of crashing the entire dashboard.
+    Long single Statcast calls are the most common Streamlit Cloud failure
+    point for this app. Loading 7-day chunks makes failures recoverable, keeps
+    memory lower, and lets the dashboard render with the successful chunks
+    instead of throwing the generic Streamlit "Oh no" page.
     """
+    keep_columns = [
+        "batter", "pitcher", "game_pk", "at_bat_number", "game_date", "player_name",
+        "home_team", "away_team", "inning_topbot", "description", "events", "bb_type",
+        "launch_speed", "launch_angle", "launch_speed_angle",
+        "estimated_ba_using_speedangle", "estimated_slg_using_speedangle",
+        "zone", "plate_x", "plate_z", "pitch_name", "release_speed", "pfx_x", "pfx_z",
+        "release_extension", "stand", "p_throws", "hc_x", "hc_y",
+    ]
+    start_ts = pd.to_datetime(start_date, errors="coerce")
+    end_ts = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts < start_ts:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    current = start_ts
+    chunk_days = 7
+    while current <= end_ts:
+        chunk_end = min(current + pd.Timedelta(days=chunk_days - 1), end_ts)
+        try:
+            chunk = statcast(
+                start_dt=current.strftime("%Y-%m-%d"),
+                end_dt=chunk_end.strftime("%Y-%m-%d"),
+                verbose=False,
+                parallel=False,
+            )
+            if isinstance(chunk, pd.DataFrame) and not chunk.empty:
+                available = [column for column in keep_columns if column in chunk.columns]
+                chunk = chunk[available].copy()
+                chunk = optimize_dataframe_memory(chunk)
+                frames.append(chunk)
+        except Exception as exc:
+            errors.append(f"{current.date()}–{chunk_end.date()}: {type(exc).__name__}: {exc}")
+        finally:
+            gc.collect()
+        current = chunk_end + pd.Timedelta(days=1)
+
+    if errors:
+        st.session_state["clean_hr_last_statcast_error"] = " | ".join(errors[-3:])
+    if not frames:
+        return pd.DataFrame()
     try:
-        data = statcast(
-            start_dt=start_date,
-            end_dt=end_date,
-            verbose=False,
-            parallel=False,
-        )
-        return data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.drop_duplicates(subset=[c for c in ["game_pk", "at_bat_number", "pitcher", "batter", "description"] if c in combined.columns])
+        return optimize_dataframe_memory(combined)
     except Exception as exc:
-        st.session_state["clean_hr_last_statcast_error"] = f"{type(exc).__name__}: {exc}"
+        st.session_state["clean_hr_last_statcast_error"] = f"concat failure: {type(exc).__name__}: {exc}"
         return pd.DataFrame()
 
 
@@ -4594,824 +4639,834 @@ def render_edge_header() -> None:
         unsafe_allow_html=True,
     )
 
-inject_clean_css()
-inject_edge_theme()
-render_edge_header()
-st.caption('Sleek model dashboard for HR probability, HR score, launch angle fit, snapshots, and calibration.')
-MODEL_KEY = "clean_hr"
+try:
+    inject_clean_css()
+    inject_edge_theme()
+    render_edge_header()
+    st.caption('Sleek model dashboard for HR probability, HR score, launch angle fit, snapshots, and calibration.')
+    MODEL_KEY = "clean_hr"
 
-st.caption(
-    "A dedicated home-run model with barrels per PA, pulled air contact, xSLG/xISO, "
-    "upper-end exit velocity, pitch-shape fit, zone fit, pitcher vulnerability and environment."
-)
-
-with st.sidebar:
-    st.header("Statcast sample")
-    yesterday = date.today() - timedelta(days=1)
-    end_date_value = st.date_input(
-        "Stats through", value=yesterday, max_value=yesterday, key="clean_hr_end_date"
-    )
-    lookback_days = st.slider(
-        "Lookback days", 21, 120, 60, 7, key="clean_hr_lookback"
-    )
-    min_pa = st.slider(
-        "Minimum hitter PA", 10, 100, 30, 5, key="clean_hr_min_pa"
-    )
-    include_low_sample = st.checkbox(
-        "Include active-roster hitters below the PA threshold",
-        value=True,
-        key="clean_hr_include_low_sample",
-        help="Roster players with little or no Statcast history are included with league-average priors and Low confidence.",
-    )
-    refresh = st.button(
-        "Load / refresh Statcast", type="primary", key="clean_hr_refresh"
-    )
-
-start_date_value = end_date_value - timedelta(days=lookback_days - 1)
-if refresh or "clean_hr_statcast_data" not in st.session_state:
-    with st.spinner(
-        f"Loading Statcast from {start_date_value} through {end_date_value}..."
-    ):
-        raw = load_statcast(
-            start_date_value.strftime("%Y-%m-%d"),
-            end_date_value.strftime("%Y-%m-%d"),
-        )
-        st.session_state["clean_hr_statcast_data"] = prepare_data(raw)
-        st.session_state["clean_hr_loaded_dates"] = (start_date_value, end_date_value)
-
-df = st.session_state.get("clean_hr_statcast_data", pd.DataFrame())
-if df.empty:
-    st.warning("No Statcast data was returned. Use completed dates and try again.")
-    if st.session_state.get("clean_hr_last_statcast_error"):
-        st.caption(f"Last Statcast error: {st.session_state['clean_hr_last_statcast_error']}")
-    st.stop()
-
-loaded_start, loaded_end = st.session_state["clean_hr_loaded_dates"]
-st.caption(
-    f"Using {len(df):,} pitches from {loaded_start} through {loaded_end}. "
-    "The slate selector can use today's games while model statistics stop at the date above."
-)
-
-pitcher_summary = (
-    df.groupby("pitcher")
-    .agg(
-        Pitches=("pitcher", "size"),
-        Player_Name=("player_name", "first"),
-        Pitcher_Team=("pitcher_team", "last"),
-        Hand=("p_throws", lambda x: most_common(x, "?")),
-    )
-    .reset_index()
-)
-pitcher_summary = pitcher_summary[pitcher_summary["Pitches"].ge(80)].copy()
-pitcher_summary["pitcher"] = pd.to_numeric(
-    pitcher_summary["pitcher"], errors="coerce"
-).astype("Int64")
-pitcher_summary = pitcher_summary.dropna(subset=["pitcher"])
-# Categorical-safe display fields.
-# On Streamlit Cloud / newer pandas, fillna("?") on a Categorical column can crash
-# when "?" is not already an allowed category. Cast to object/string before filling.
-def _display_text(series: pd.Series, default: str) -> pd.Series:
-    values = series.astype("object")
-    values = values.where(pd.notna(values), default)
-    return values.astype(str).replace({"nan": default, "None": default, "<NA>": default, "NaT": default})
-
-pitcher_summary["Display"] = (
-    _display_text(pitcher_summary["Player_Name"], "Unknown pitcher")
-    + " — "
-    + _display_text(pitcher_summary["Pitcher_Team"], "?")
-    + " — "
-    + _display_text(pitcher_summary["Hand"], "?")
-    + " ("
-    + pd.to_numeric(pitcher_summary["Pitches"], errors="coerce").fillna(0).astype(int).astype(str)
-    + " pitches)"
-)
-pitcher_summary = pitcher_summary.sort_values("Display")
-if pitcher_summary.empty:
-    st.warning("No pitcher met the sample threshold. Increase the lookback period.")
-    st.stop()
-
-available_teams = sorted(df["batter_team"].dropna().astype(str).unique().tolist())
-matchup = matchup_selector(pitcher_summary, available_teams, key_prefix=MODEL_KEY)
-selected_pitcher = int(matchup["pitcher_id"])
-selected_display = str(matchup["pitcher_display"])
-selected_team = str(matchup["batting_team"])
-home_away = str(matchup["home_away"])
-
-active_roster, roster_error = fetch_active_roster(
-    matchup.get("batting_team_id"), matchup.get("slate_date")
-)
-if roster_error:
     st.caption(
-        f"Active roster could not be fully loaded ({roster_error}). "
-        "The app will fall back to hitters found in the Statcast sample."
+        "A dedicated home-run model with barrels per PA, pulled air contact, xSLG/xISO, "
+        "upper-end exit velocity, pitch-shape fit, zone fit, pitcher vulnerability and environment."
     )
 
-attack_profile = pitcher_attack_profile_hr(df, selected_pitcher)
-render_pitcher_attack_panel(attack_profile, matchup["pitcher_name"], "home runs")
+    with st.sidebar:
+        st.header("Statcast sample")
+        yesterday = date.today() - timedelta(days=1)
+        end_date_value = st.date_input(
+            "Stats through", value=yesterday, max_value=yesterday, key="clean_hr_end_date"
+        )
+        lookback_days = st.slider(
+            "Lookback days", 21, 90, 45, 7, key="clean_hr_lookback"
+        )
+        min_pa = st.slider(
+            "Minimum hitter PA", 10, 100, 30, 5, key="clean_hr_min_pa"
+        )
+        include_low_sample = st.checkbox(
+            "Include active-roster hitters below the PA threshold",
+            value=True,
+            key="clean_hr_include_low_sample",
+            help="Roster players with little or no Statcast history are included with league-average priors and Low confidence.",
+        )
+        refresh = st.button(
+            "Load / refresh Statcast", type="primary", key="clean_hr_refresh"
+        )
 
-park_year = pd.Timestamp(matchup.get("slate_date") or loaded_end).year
-auto_park = fetch_savant_park_factors(matchup.get("venue", ""), park_year, "HR")
+    start_date_value = end_date_value - timedelta(days=lookback_days - 1)
+    if refresh or "clean_hr_statcast_data" not in st.session_state:
+        with st.spinner(
+            f"Loading Statcast from {start_date_value} through {end_date_value}..."
+        ):
+            raw = load_statcast(
+                start_date_value.strftime("%Y-%m-%d"),
+                end_date_value.strftime("%Y-%m-%d"),
+            )
+            st.session_state["clean_hr_statcast_data"] = prepare_data(raw)
+            st.session_state["clean_hr_loaded_dates"] = (start_date_value, end_date_value)
 
-with st.expander("Game, park and weather adjustments", expanded=True):
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        team_runs = st.number_input(
-            "Team implied runs", 1.0, 9.0, 4.5, 0.1, key="clean_hr_runs"
+    df = st.session_state.get("clean_hr_statcast_data", pd.DataFrame())
+    if df.empty:
+        st.warning("No Statcast data was returned. Use completed dates and try again.")
+        if st.session_state.get("clean_hr_last_statcast_error"):
+            st.caption(f"Last Statcast error: {st.session_state['clean_hr_last_statcast_error']}")
+        st.stop()
+
+    loaded_start, loaded_end = st.session_state["clean_hr_loaded_dates"]
+    st.caption(
+        f"Using {len(df):,} pitches from {loaded_start} through {loaded_end}. "
+        "The slate selector can use today's games while model statistics stop at the date above."
+    )
+
+    pitcher_summary = (
+        df.groupby("pitcher")
+        .agg(
+            Pitches=("pitcher", "size"),
+            Player_Name=("player_name", "first"),
+            Pitcher_Team=("pitcher_team", "last"),
+            Hand=("p_throws", lambda x: most_common(x, "?")),
         )
-        starter_innings = st.number_input(
-            "Expected starter innings", 2.0, 8.0, 5.5, 0.5, key="clean_hr_ip"
+        .reset_index()
+    )
+    pitcher_summary = pitcher_summary[pitcher_summary["Pitches"].ge(80)].copy()
+    pitcher_summary["pitcher"] = pd.to_numeric(
+        pitcher_summary["pitcher"], errors="coerce"
+    ).astype("Int64")
+    pitcher_summary = pitcher_summary.dropna(subset=["pitcher"])
+    # Categorical-safe display fields.
+    # On Streamlit Cloud / newer pandas, fillna("?") on a Categorical column can crash
+    # when "?" is not already an allowed category. Cast to object/string before filling.
+    def _display_text(series: pd.Series, default: str) -> pd.Series:
+        values = series.astype("object")
+        values = values.where(pd.notna(values), default)
+        return values.astype(str).replace({"nan": default, "None": default, "<NA>": default, "NaT": default})
+
+    pitcher_summary["Display"] = (
+        _display_text(pitcher_summary["Player_Name"], "Unknown pitcher")
+        + " — "
+        + _display_text(pitcher_summary["Pitcher_Team"], "?")
+        + " — "
+        + _display_text(pitcher_summary["Hand"], "?")
+        + " ("
+        + pd.to_numeric(pitcher_summary["Pitches"], errors="coerce").fillna(0).astype(int).astype(str)
+        + " pitches)"
+    )
+    pitcher_summary = pitcher_summary.sort_values("Display")
+    if pitcher_summary.empty:
+        st.warning("No pitcher met the sample threshold. Increase the lookback period.")
+        st.stop()
+
+    available_teams = sorted(df["batter_team"].dropna().astype(str).unique().tolist())
+    matchup = matchup_selector(pitcher_summary, available_teams, key_prefix=MODEL_KEY)
+    selected_pitcher = int(matchup["pitcher_id"])
+    selected_display = str(matchup["pitcher_display"])
+    selected_team = str(matchup["batting_team"])
+    home_away = str(matchup["home_away"])
+
+    active_roster, roster_error = fetch_active_roster(
+        matchup.get("batting_team_id"), matchup.get("slate_date")
+    )
+    if roster_error:
+        st.caption(
+            f"Active roster could not be fully loaded ({roster_error}). "
+            "The app will fall back to hitters found in the Statcast sample."
         )
-        bullpen_multiplier = st.number_input(
-            "Bullpen HR multiplier",
-            0.65,
-            1.45,
-            1.00,
-            0.01,
-            key="clean_hr_bullpen",
-            help="Above 1.00 means a more home-run-prone bullpen.",
-        )
-    with c2:
-        manual_park_override = st.checkbox(
-            "Manual park-factor override",
-            value=False,
-            key=f"clean_hr_manual_park_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
-            help="Leave this off to use the local three-year park_factors.csv values.",
-        )
-        if manual_park_override:
-            park_hr_factor_lhb = st.number_input(
-                "Park HR factor — LHB", 60.0, 160.0, float(auto_park["L"]), 1.0,
-                key=f"clean_hr_park_l_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+
+    attack_profile = pitcher_attack_profile_hr(df, selected_pitcher)
+    render_pitcher_attack_panel(attack_profile, matchup["pitcher_name"], "home runs")
+
+    park_year = pd.Timestamp(matchup.get("slate_date") or loaded_end).year
+    auto_park = fetch_savant_park_factors(matchup.get("venue", ""), park_year, "HR")
+
+    with st.expander("Game, park and weather adjustments", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            team_runs = st.number_input(
+                "Team implied runs", 1.0, 9.0, 4.5, 0.1, key="clean_hr_runs"
             )
-            park_hr_factor_rhb = st.number_input(
-                "Park HR factor — RHB", 60.0, 160.0, float(auto_park["R"]), 1.0,
-                key=f"clean_hr_park_r_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            starter_innings = st.number_input(
+                "Expected starter innings", 2.0, 8.0, 5.5, 0.5, key="clean_hr_ip"
             )
-            park_source = "Manual override"
-        else:
-            park_hr_factor_lhb = float(auto_park["L"])
-            park_hr_factor_rhb = float(auto_park["R"])
-            park_source = str(auto_park["source"])
+            bullpen_multiplier = st.number_input(
+                "Bullpen HR multiplier",
+                0.65,
+                1.45,
+                1.00,
+                0.01,
+                key="clean_hr_bullpen",
+                help="Above 1.00 means a more home-run-prone bullpen.",
+            )
+        with c2:
+            manual_park_override = st.checkbox(
+                "Manual park-factor override",
+                value=False,
+                key=f"clean_hr_manual_park_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+                help="Leave this off to use the local three-year park_factors.csv values.",
+            )
+            if manual_park_override:
+                park_hr_factor_lhb = st.number_input(
+                    "Park HR factor — LHB", 60.0, 160.0, float(auto_park["L"]), 1.0,
+                    key=f"clean_hr_park_l_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+                )
+                park_hr_factor_rhb = st.number_input(
+                    "Park HR factor — RHB", 60.0, 160.0, float(auto_park["R"]), 1.0,
+                    key=f"clean_hr_park_r_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+                )
+                park_source = "Manual override"
+            else:
+                park_hr_factor_lhb = float(auto_park["L"])
+                park_hr_factor_rhb = float(auto_park["R"])
+                park_source = str(auto_park["source"])
+                st.markdown(
+                    f"""
+                    <div class="park-grid">
+                        <div class="park-chip"><div class="side">LHB HOME RUNS</div><div class="factor">{park_hr_factor_lhb:.0f}</div></div>
+                        <div class="park-chip"><div class="side">RHB HOME RUNS</div><div class="factor">{park_hr_factor_rhb:.0f}</div></div>
+                    </div>
+                    <div class="park-source">{escape(park_source)}</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if not auto_park["ok"]:
+                    st.warning("Local park_factors.csv was unavailable or could not be matched, so neutral 100 values are being used. Turn on the manual override to change them.")
+            if st.button("Refresh park factors", key=f"clean_hr_refresh_park_{matchup.get('game_pk')}"):
+                fetch_savant_park_factors.clear()
+                st.rerun()
+
+        with c3:
+            use_auto_weather = st.checkbox(
+                "Automatic game-time weather",
+                value=True,
+                key=f"clean_hr_auto_weather_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+                help="Uses the Open-Meteo hourly forecast nearest scheduled first pitch.",
+            )
+            weather_result = automatic_game_weather(matchup) if use_auto_weather else {"ok": False, "error": "Automatic weather disabled."}
+            metadata = weather_result.get("metadata") or load_stadium_weather_metadata(str(matchup.get("venue", "")))
+            roof_type = str(metadata.get("roof_type", "open")).lower()
+            if roof_type == "fixed":
+                roof_status = "Closed (fixed roof)"
+                roof_closed = True
+                st.info("Fixed roof: outdoor weather is neutralized.")
+            elif roof_type == "retractable":
+                roof_status = st.selectbox(
+                    "Roof status",
+                    ["Open / use forecast", "Closed / neutral weather"],
+                    key=f"clean_hr_roof_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+                )
+                roof_closed = roof_status.startswith("Closed")
+            else:
+                roof_status = "Open air"
+                roof_closed = False
+
+            if use_auto_weather and weather_result.get("ok"):
+                st.success(
+                    f"{weather_result.get('condition', 'Forecast')} · "
+                    f"{weather_result.get('forecast_time_utc', '')}"
+                )
+                default_temperature = float(np.clip(weather_result.get("temperature_f", 75.0), 20.0, 120.0))
+                default_humidity = float(np.clip(weather_result.get("humidity_pct", 50.0), 1.0, 100.0))
+                default_wind = float(np.clip(weather_result.get("wind_mph", 5.0), 0.0, 50.0))
+                default_pressure = float(np.clip(weather_result.get("pressure_hpa", 1013.25), 930.0, 1060.0))
+                default_wind_direction = str(weather_result.get("wind_direction", "Cross/Calm"))
+                precip_probability = float(weather_result.get("precip_probability", 0.0))
+                weather_source = str(weather_result.get("source", "Open-Meteo"))
+                st.caption(
+                    f"Rain chance {precip_probability:.0f}% · gusts {weather_result.get('wind_gust_mph', 0.0):.0f} mph · "
+                    f"wind from {weather_result.get('wind_from_degrees', 0.0):.0f}° classified {default_wind_direction}."
+                )
+            else:
+                default_temperature = 75.0
+                default_humidity = 50.0
+                default_wind = 5.0
+                default_pressure = 1013.25
+                default_wind_direction = "Cross/Calm"
+                precip_probability = np.nan
+                weather_source = "Manual fallback"
+                if use_auto_weather:
+                    st.warning("Automatic weather was unavailable; the editable manual defaults are being used.")
+                    if weather_result.get("error"):
+                        st.caption(str(weather_result["error"])[:300])
+
+            weather_key = f"{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}"
+            temperature_f = st.number_input(
+                "Temperature °F", 20.0, 120.0, default_temperature, 1.0,
+                key=f"clean_hr_temp_{weather_key}",
+            )
+            humidity_pct = st.number_input(
+                "Humidity %", 1.0, 100.0, default_humidity, 1.0,
+                key=f"clean_hr_humidity_{weather_key}",
+            )
+            wind_mph = st.number_input(
+                "Wind mph", 0.0, 50.0, default_wind, 1.0,
+                key=f"clean_hr_wind_{weather_key}",
+            )
+            wind_options = ["Cross/Calm", "Out", "In"]
+            wind_index = wind_options.index(default_wind_direction) if default_wind_direction in wind_options else 0
+            wind_direction = st.selectbox(
+                "Stadium wind effect", wind_options, index=wind_index,
+                key=f"clean_hr_wind_dir_{weather_key}",
+            )
+            pressure_hpa = st.number_input(
+                "Sea-level pressure (hPa)", 930.0, 1060.0, default_pressure, 0.5,
+                key=f"clean_hr_pressure_{weather_key}",
+            )
+            manual_weather = st.number_input(
+                "Extra manual weather multiplier",
+                0.80,
+                1.20,
+                1.00,
+                0.01,
+                key=f"clean_hr_weather_manual_{weather_key}",
+            )
+            if st.button("Refresh weather", key=f"clean_hr_refresh_weather_{weather_key}"):
+                fetch_open_meteo_game_weather.clear()
+                fetch_mlb_venue_coordinates.clear()
+                st.rerun()
+
+        with c4:
+            use_auto_bat_tracking = st.checkbox(
+                "Automatic Savant bat tracking",
+                value=False,
+                key="clean_hr_auto_bat_tracking",
+                help="Downloads current-season Baseball Savant bat-tracking data and uses the previous season as a player-level fallback.",
+            )
+            bat_tracking_result = {
+                "data": pd.DataFrame(), "ok": False, "source": "Disabled", "error": None, "columns": []
+            }
+            if use_auto_bat_tracking:
+                bat_tracking_result = fetch_savant_bat_tracking_dataset(int(pd.Timestamp(loaded_end).year))
+                if bat_tracking_result["ok"]:
+                    st.success(
+                        f"Bat tracking: {bat_tracking_result['source']} · "
+                        f"{len(bat_tracking_result['data']):,} players"
+                    )
+                else:
+                    st.warning(
+                        "Automatic bat tracking was unavailable. Players without a manual CSV "
+                        "will stay neutral internally and display as No data."
+                    )
+                    if bat_tracking_result.get("error"):
+                        st.caption(str(bat_tracking_result["error"])[:280])
+            bat_tracking_auto = bat_tracking_result["data"] if use_auto_bat_tracking else pd.DataFrame()
+            if st.button("Refresh bat tracking", key="clean_hr_refresh_bat_tracking"):
+                fetch_savant_bat_tracking_dataset.clear()
+                st.rerun()
+
+            bat_tracking_upload = st.file_uploader(
+                "Optional manual bat-tracking CSV override",
+                type=["csv"],
+                key="clean_hr_bat_upload",
+                help="Any nonblank uploaded values override the automatic Savant values for the matching player.",
+            )
             st.markdown(
                 f"""
-                <div class="park-grid">
-                    <div class="park-chip"><div class="side">LHB HOME RUNS</div><div class="factor">{park_hr_factor_lhb:.0f}</div></div>
-                    <div class="park-chip"><div class="side">RHB HOME RUNS</div><div class="factor">{park_hr_factor_rhb:.0f}</div></div>
+                <div class="context-note">
+                <b>{matchup['away_abbr']} @ {matchup['home_abbr']}</b><br>
+                {matchup['venue']}<br>
+                Batting team: {selected_team} ({home_away})<br>
+                Park LHB: ×{park_hr_factor_lhb / 100:.2f}<br>
+                Park RHB: ×{park_hr_factor_rhb / 100:.2f}<br>
+                Park source: {escape(park_source)}<br>
+                Weather: {escape(weather_source)} · {escape(roof_status)}<br>
+                Bat source: {escape(str(bat_tracking_result.get('source', 'Disabled')))}
                 </div>
-                <div class="park-source">{escape(park_source)}</div>
                 """,
                 unsafe_allow_html=True,
             )
-            if not auto_park["ok"]:
-                st.warning("Local park_factors.csv was unavailable or could not be matched, so neutral 100 values are being used. Turn on the manual override to change them.")
-        if st.button("Refresh park factors", key=f"clean_hr_refresh_park_{matchup.get('game_pk')}"):
-            fetch_savant_park_factors.clear()
-            st.rerun()
-
-    with c3:
-        use_auto_weather = st.checkbox(
-            "Automatic game-time weather",
-            value=True,
-            key=f"clean_hr_auto_weather_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
-            help="Uses the Open-Meteo hourly forecast nearest scheduled first pitch.",
-        )
-        weather_result = automatic_game_weather(matchup) if use_auto_weather else {"ok": False, "error": "Automatic weather disabled."}
-        metadata = weather_result.get("metadata") or load_stadium_weather_metadata(str(matchup.get("venue", "")))
-        roof_type = str(metadata.get("roof_type", "open")).lower()
-        if roof_type == "fixed":
-            roof_status = "Closed (fixed roof)"
-            roof_closed = True
-            st.info("Fixed roof: outdoor weather is neutralized.")
-        elif roof_type == "retractable":
-            roof_status = st.selectbox(
-                "Roof status",
-                ["Open / use forecast", "Closed / neutral weather"],
-                key=f"clean_hr_roof_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            template = (
+                "player_id,Player,avg_bat_speed,fast_swing_rate,blasts_per_bat_contact,"
+                "squared_up_per_bat_contact,avg_attack_angle,avg_attack_direction\n"
+                "660271,Shohei Ohtani,,,,,,\n"
             )
-            roof_closed = roof_status.startswith("Closed")
-        else:
-            roof_status = "Open air"
-            roof_closed = False
-
-        if use_auto_weather and weather_result.get("ok"):
-            st.success(
-                f"{weather_result.get('condition', 'Forecast')} · "
-                f"{weather_result.get('forecast_time_utc', '')}"
+            st.download_button(
+                "Bat-tracking CSV template",
+                template,
+                "bat_tracking_template.csv",
+                "text/csv",
+                key="clean_hr_bat_template",
             )
-            default_temperature = float(np.clip(weather_result.get("temperature_f", 75.0), 20.0, 120.0))
-            default_humidity = float(np.clip(weather_result.get("humidity_pct", 50.0), 1.0, 100.0))
-            default_wind = float(np.clip(weather_result.get("wind_mph", 5.0), 0.0, 50.0))
-            default_pressure = float(np.clip(weather_result.get("pressure_hpa", 1013.25), 930.0, 1060.0))
-            default_wind_direction = str(weather_result.get("wind_direction", "Cross/Calm"))
-            precip_probability = float(weather_result.get("precip_probability", 0.0))
-            weather_source = str(weather_result.get("source", "Open-Meteo"))
-            st.caption(
-                f"Rain chance {precip_probability:.0f}% · gusts {weather_result.get('wind_gust_mph', 0.0):.0f} mph · "
-                f"wind from {weather_result.get('wind_from_degrees', 0.0):.0f}° classified {default_wind_direction}."
-            )
-        else:
-            default_temperature = 75.0
-            default_humidity = 50.0
-            default_wind = 5.0
-            default_pressure = 1013.25
-            default_wind_direction = "Cross/Calm"
-            precip_probability = np.nan
-            weather_source = "Manual fallback"
-            if use_auto_weather:
-                st.warning("Automatic weather was unavailable; the editable manual defaults are being used.")
-                if weather_result.get("error"):
-                    st.caption(str(weather_result["error"])[:300])
 
-        weather_key = f"{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}"
-        temperature_f = st.number_input(
-            "Temperature °F", 20.0, 120.0, default_temperature, 1.0,
-            key=f"clean_hr_temp_{weather_key}",
-        )
-        humidity_pct = st.number_input(
-            "Humidity %", 1.0, 100.0, default_humidity, 1.0,
-            key=f"clean_hr_humidity_{weather_key}",
-        )
-        wind_mph = st.number_input(
-            "Wind mph", 0.0, 50.0, default_wind, 1.0,
-            key=f"clean_hr_wind_{weather_key}",
-        )
-        wind_options = ["Cross/Calm", "Out", "In"]
-        wind_index = wind_options.index(default_wind_direction) if default_wind_direction in wind_options else 0
-        wind_direction = st.selectbox(
-            "Stadium wind effect", wind_options, index=wind_index,
-            key=f"clean_hr_wind_dir_{weather_key}",
-        )
-        pressure_hpa = st.number_input(
-            "Sea-level pressure (hPa)", 930.0, 1060.0, default_pressure, 0.5,
-            key=f"clean_hr_pressure_{weather_key}",
-        )
-        manual_weather = st.number_input(
-            "Extra manual weather multiplier",
-            0.80,
-            1.20,
-            1.00,
-            0.01,
-            key=f"clean_hr_weather_manual_{weather_key}",
-        )
-        if st.button("Refresh weather", key=f"clean_hr_refresh_weather_{weather_key}"):
-            fetch_open_meteo_game_weather.clear()
-            fetch_mlb_venue_coordinates.clear()
-            st.rerun()
+    weather_multiplier = weather_carry_multiplier(
+        temperature_f,
+        humidity_pct,
+        wind_mph,
+        wind_direction,
+        pressure_hpa,
+        manual_weather,
+        enclosed=roof_closed,
+    )
+    st.caption(
+        f"Weather carry adjustment: ×{weather_multiplier:.3f}. "
+        "Automatic values are editable. This is a simple transparent adjustment, not an official ball-flight model."
+    )
 
-    with c4:
-        use_auto_bat_tracking = st.checkbox(
-            "Automatic Savant bat tracking",
-            value=False,
-            key="clean_hr_auto_bat_tracking",
-            help="Downloads current-season Baseball Savant bat-tracking data and uses the previous season as a player-level fallback.",
+    preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
+
+    preview_recent_lineup = infer_recent_lineup(df, selected_team)
+    lineup_seed = preview_recent_lineup.copy()
+    lineup_source_label = "Latest observed lineup from the loaded Statcast sample"
+    lineup_result = None
+    lineup_game_pk = matchup.get("game_pk")
+    lineup_side = "away" if home_away == "Away" else "home"
+
+    with st.expander("Automatic MLB lineup", expanded=True):
+        use_mlb_lineup = st.checkbox(
+            "Use the posted MLB lineup automatically",
+            value=bool(lineup_game_pk),
+            disabled=not bool(lineup_game_pk),
+            key=f"clean_hr_use_mlb_lineup_{lineup_game_pk}_{selected_team}",
+            help="When all nine hitters are posted, they replace the recent-lineup fallback and set batting order automatically.",
         )
-        bat_tracking_result = {
-            "data": pd.DataFrame(), "ok": False, "source": "Disabled", "error": None, "columns": []
-        }
-        if use_auto_bat_tracking:
-            bat_tracking_result = fetch_savant_bat_tracking_dataset(int(pd.Timestamp(loaded_end).year))
-            if bat_tracking_result["ok"]:
+
+        if lineup_game_pk and use_mlb_lineup:
+            lineup_result = fetch_mlb_confirmed_lineup(lineup_game_pk, lineup_side)
+            posted_lineup = _clean_lineup_seed(lineup_result.get("lineup"))
+            if lineup_result.get("ok") and len(posted_lineup) >= 9:
+                lineup_seed = posted_lineup
+                lineup_source_label = f"Confirmed MLB lineup · {lineup_result.get('source', '')}"
                 st.success(
-                    f"Bat tracking: {bat_tracking_result['source']} · "
-                    f"{len(bat_tracking_result['data']):,} players"
+                    f"Confirmed lineup loaded: {len(posted_lineup)} hitters · "
+                    f"{lineup_result.get('game_state') or matchup.get('status', '')}"
+                )
+                lineup_display = lineup_result["lineup"].copy()
+                lineup_display = lineup_display.rename(columns={
+                    "LineupSpot": "Order", "Player_MLB": "Player", "Position_MLB": "Pos",
+                    "LineupRole": "Role",
+                })
+                st.dataframe(
+                    lineup_display[[column for column in ["Order", "Player", "Pos", "Role"] if column in lineup_display.columns]],
+                    hide_index=True,
+                    use_container_width=True,
+                    height=360,
+                )
+            elif lineup_result.get("status") == "Partial":
+                st.warning(
+                    f"MLB currently shows only {len(posted_lineup)} lineup spots. "
+                    "The recent observed lineup remains the default until all nine are posted."
                 )
             else:
-                st.warning(
-                    "Automatic bat tracking was unavailable. Players without a manual CSV "
-                    "will stay neutral internally and display as No data."
+                st.info(
+                    "The confirmed lineup has not been posted yet. "
+                    "The most recent observed lineup remains the default."
                 )
-                if bat_tracking_result.get("error"):
-                    st.caption(str(bat_tracking_result["error"])[:280])
-        bat_tracking_auto = bat_tracking_result["data"] if use_auto_bat_tracking else pd.DataFrame()
-        if st.button("Refresh bat tracking", key="clean_hr_refresh_bat_tracking"):
-            fetch_savant_bat_tracking_dataset.clear()
-            st.rerun()
+                if lineup_result.get("error"):
+                    with st.expander("Lineup connection details"):
+                        st.code(str(lineup_result["error"]))
 
-        bat_tracking_upload = st.file_uploader(
-            "Optional manual bat-tracking CSV override",
-            type=["csv"],
-            key="clean_hr_bat_upload",
-            help="Any nonblank uploaded values override the automatic Savant values for the matching player.",
-        )
-        st.markdown(
-            f"""
-            <div class="context-note">
-            <b>{matchup['away_abbr']} @ {matchup['home_abbr']}</b><br>
-            {matchup['venue']}<br>
-            Batting team: {selected_team} ({home_away})<br>
-            Park LHB: ×{park_hr_factor_lhb / 100:.2f}<br>
-            Park RHB: ×{park_hr_factor_rhb / 100:.2f}<br>
-            Park source: {escape(park_source)}<br>
-            Weather: {escape(weather_source)} · {escape(roof_status)}<br>
-            Bat source: {escape(str(bat_tracking_result.get('source', 'Disabled')))}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        template = (
-            "player_id,Player,avg_bat_speed,fast_swing_rate,blasts_per_bat_contact,"
-            "squared_up_per_bat_contact,avg_attack_angle,avg_attack_direction\n"
-            "660271,Shohei Ohtani,,,,,,\n"
-        )
-        st.download_button(
-            "Bat-tracking CSV template",
-            template,
-            "bat_tracking_template.csv",
-            "text/csv",
-            key="clean_hr_bat_template",
-        )
+            if st.button(
+                "Refresh MLB lineup",
+                key=f"clean_hr_refresh_lineup_{lineup_game_pk}_{selected_team}",
+            ):
+                fetch_mlb_confirmed_lineup.clear()
+                st.rerun()
+        elif not lineup_game_pk:
+            st.caption("Automatic lineups require a game selected from the MLB slate. Manual matchups use the recent-lineup fallback.")
 
-weather_multiplier = weather_carry_multiplier(
-    temperature_f,
-    humidity_pct,
-    wind_mph,
-    wind_direction,
-    pressure_hpa,
-    manual_weather,
-    enclosed=roof_closed,
-)
-st.caption(
-    f"Weather carry adjustment: ×{weather_multiplier:.3f}. "
-    "Automatic values are editable. This is a simple transparent adjustment, not an official ball-flight model."
-)
-
-preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
-
-preview_recent_lineup = infer_recent_lineup(df, selected_team)
-lineup_seed = preview_recent_lineup.copy()
-lineup_source_label = "Latest observed lineup from the loaded Statcast sample"
-lineup_result = None
-lineup_game_pk = matchup.get("game_pk")
-lineup_side = "away" if home_away == "Away" else "home"
-
-with st.expander("Automatic MLB lineup", expanded=True):
-    use_mlb_lineup = st.checkbox(
-        "Use the posted MLB lineup automatically",
-        value=bool(lineup_game_pk),
-        disabled=not bool(lineup_game_pk),
-        key=f"clean_hr_use_mlb_lineup_{lineup_game_pk}_{selected_team}",
-        help="When all nine hitters are posted, they replace the recent-lineup fallback and set batting order automatically.",
+    st.caption(f"Lineup source: {lineup_source_label}")
+    preview_board = aggregate_hr_hitters(df, preview_hand, 0)
+    preview_board = add_roster_candidates(
+        preview_board, selected_team, active_roster, lineup_seed, min_pa, include_low_sample
     )
-
-    if lineup_game_pk and use_mlb_lineup:
-        lineup_result = fetch_mlb_confirmed_lineup(lineup_game_pk, lineup_side)
-        posted_lineup = _clean_lineup_seed(lineup_result.get("lineup"))
-        if lineup_result.get("ok") and len(posted_lineup) >= 9:
-            lineup_seed = posted_lineup
-            lineup_source_label = f"Confirmed MLB lineup · {lineup_result.get('source', '')}"
-            st.success(
-                f"Confirmed lineup loaded: {len(posted_lineup)} hitters · "
-                f"{lineup_result.get('game_state') or matchup.get('status', '')}"
-            )
-            lineup_display = lineup_result["lineup"].copy()
-            lineup_display = lineup_display.rename(columns={
-                "LineupSpot": "Order", "Player_MLB": "Player", "Position_MLB": "Pos",
-                "LineupRole": "Role",
-            })
-            st.dataframe(
-                lineup_display[[column for column in ["Order", "Player", "Pos", "Role"] if column in lineup_display.columns]],
-                hide_index=True,
-                use_container_width=True,
-                height=360,
-            )
-        elif lineup_result.get("status") == "Partial":
-            st.warning(
-                f"MLB currently shows only {len(posted_lineup)} lineup spots. "
-                "The recent observed lineup remains the default until all nine are posted."
-            )
-        else:
-            st.info(
-                "The confirmed lineup has not been posted yet. "
-                "The most recent observed lineup remains the default."
-            )
-            if lineup_result.get("error"):
-                with st.expander("Lineup connection details"):
-                    st.code(str(lineup_result["error"]))
-
-        if st.button(
-            "Refresh MLB lineup",
-            key=f"clean_hr_refresh_lineup_{lineup_game_pk}_{selected_team}",
-        ):
-            fetch_mlb_confirmed_lineup.clear()
-            st.rerun()
-    elif not lineup_game_pk:
-        st.caption("Automatic lineups require a game selected from the MLB slate. Manual matchups use the recent-lineup fallback.")
-
-st.caption(f"Lineup source: {lineup_source_label}")
-preview_board = aggregate_hr_hitters(df, preview_hand, 0)
-preview_board = add_roster_candidates(
-    preview_board, selected_team, active_roster, lineup_seed, min_pa, include_low_sample
-)
-if preview_board.empty:
-    st.warning(
-        "No roster or Statcast hitters were available. Increase the lookback or disable the PA filter."
-    )
-    st.stop()
-preview_names = lookup_names(
-    tuple(preview_board["player_id"].dropna().astype(int).unique().tolist())
-)
-preview_board = preview_board.merge(preview_names, on="player_id", how="left", suffixes=("", "_Lookup"))
-preview_board["Player"] = preview_board["Player"].replace("", np.nan).fillna(preview_board.get("Player_Lookup"))
-preview_board["Player"] = preview_board["Player"].fillna(
-    "MLB ID " + preview_board["player_id"].astype("Int64").astype(str)
-)
-preview_board = preview_board.drop(columns=["Player_Lookup"], errors="ignore")
-preview_board = preview_board.merge(lineup_seed, on="player_id", how="left")
-lineup_input = preview_board[["player_id", "Player", "Position", "Bats", "PA", "SampleStatus", "LineupSpot"]].copy()
-default_selected = lineup_input["LineupSpot"].notna()
-if not default_selected.any():
-    default_selected = pd.Series(True, index=lineup_input.index)
-lineup_input.insert(0, "Selected", default_selected)
-lineup_input = lineup_input.sort_values(["LineupSpot", "Player"], na_position="last")
-
-with st.expander("Confirm lineup", expanded=False):
-    st.caption(
-        f"Default order: {lineup_source_label}. "
-        "You can still edit the order or remove a late scratch below."
-    )
-    lineup_edits = st.data_editor(
-        lineup_input,
-        hide_index=True,
-        use_container_width=True,
-        disabled=["player_id", "Player", "Position", "Bats", "PA", "SampleStatus"],
-        column_config={
-            "Selected": st.column_config.CheckboxColumn("Use", default=True),
-            "LineupSpot": st.column_config.NumberColumn(
-                "Lineup spot", min_value=1, max_value=9, step=1
-            ),
-        },
-        key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
-    )
-
-rankings, pitch_mix = build_hr_board_safe(
-    df=df,
-    context=f"selected matchup {selected_team}",
-    pitcher_id=selected_pitcher,
-    team=selected_team,
-    min_pa=min_pa,
-    end_date=pd.Timestamp(loaded_end),
-    park_hr_factor_lhb=park_hr_factor_lhb,
-    park_hr_factor_rhb=park_hr_factor_rhb,
-    team_runs=team_runs,
-    is_away=home_away == "Away",
-    starter_innings=starter_innings,
-    bullpen_multiplier=bullpen_multiplier,
-    weather_multiplier=weather_multiplier,
-    lineup_override=lineup_seed,
-    lineup_edits=lineup_edits,
-    bat_tracking_upload=bat_tracking_upload,
-    bat_tracking_auto=bat_tracking_auto,
-    active_roster=active_roster,
-    include_low_sample=include_low_sample,
-)
-
-if rankings.empty:
-    st.warning("No selected hitters remain after filtering or the matchup model hit a recoverable issue.")
-    if st.session_state.get("clean_hr_last_model_error"):
-        st.caption(st.session_state["clean_hr_last_model_error"])
-        with st.expander("Technical details", expanded=False):
-            st.code(st.session_state.get("clean_hr_last_model_traceback", ""))
-    st.stop()
-
-rankings = apply_hr_probability_calibration(
-    rankings, st.session_state.get(f"{MODEL_KEY}_probability_calibration")
-)
-
-render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HOME RUN BOARD")
-render_leader_cards(rankings, "Model_1plus_HR", "HRScore", "model 1+ HR")
-
-quick_tab, power_tab, matchup_tab, pitch_type_tab, tracking_tab, pitcher_tab, slate_tab, backtest_tab, notes_tab = st.tabs(
-    [
-        "Quick board", "Power profile", "Matchup detail", "Batter vs pitch type",
-        "Bat tracking", "Pitcher profile", "Top 10 & 3-man", "Backtest & calibration", "Model notes"
-    ]
-)
-
-pitch_type_table = build_batter_pitch_type_table(
-    df,
-    rankings,
-    pitch_mix,
-    preview_hand,
-)
-
-with quick_tab:
-    quick_columns = [
-        "Rank", "Player", "LineupSpot", "Projected_PA", "Model_1plus_HR",
-        "HRScore", "Confidence_Level", "Adj_Brl_PA", "Barrel_Range_BIP",
-        "LA_Power_Score", "Adj_xISO_PA", "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
-        "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore", "ParkFactor",
-    ]
-    quick = rankings[[column for column in quick_columns if column in rankings.columns]].copy()
-    quick = quick.rename(columns={
-        "LineupSpot": "Order", "Projected_PA": "Proj PA", "Model_1plus_HR": "1+ HR",
-        "HRScore": "HR Score", "Confidence_Level": "Confidence",
-        "Adj_Brl_PA": "Adj Brl/PA", "Barrel_Range_BIP": "Barrel Range/BIP",
-        "LA_Power_Score": "LA Power", "Adj_xISO_PA": "Adj xISO/PA",
-        "EffectiveStand": "Bats vs SP", "PitcherSideRead": "Pitcher Read",
-        "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
-        "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
-        "PitcherPowerScore": "Pitcher Power", "ParkFactor": "Park Factor",
-    })
-    score_cols = ["HR Score", "LA Power", "Side Attack", "Pitch Match", "Zone Fit", "Pitcher Power"]
-    score_cols = [column for column in score_cols if column in quick.columns]
-    styler = quick.style.background_gradient(
-        cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100
-    ).format({
-        "Order": "{:.0f}", "Proj PA": "{:.2f}", "1+ HR": "{:.1%}",
-        "HR Score": "{:.1f}", "Adj Brl/PA": "{:.2%}", "Barrel Range/BIP": "{:.1%}",
-        "LA Power": "{:.1f}", "Adj xISO/PA": "{:.3f}",
-        "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}", "Pitcher Power": "{:.1f}",
-        "Park Factor": "{:.0f}",
-    })
-    st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
-
-with power_tab:
-    st.caption(
-        "Green cells are stronger home-run ingredients. Red cells in K% and Whiff% "
-        "show swing-and-miss risk. LA Power Fit rewards launch angles closest to the "
-        "typical power window rather than simply rewarding the highest angle."
-    )
-    columns = [
-        "Player", "PA", "HR", "HR_PA", "Brl_PA", "Brl_BIP", "PullAir_BIP",
-        "PullAir_Air", "xSLG_PA", "xISO_PA", "xSLG_Contact", "HH_Pct",
-        "SweetSpot_Pct", "Barrel_Range_BIP", "FB_Pct", "Avg_EV", "EV90", "Max_EV",
-        "Avg_LA", "LA_Power_Score", "LA_Optimization_Score", "K_Pct", "Whiff_Pct",
-    ]
-    power = rankings[[column for column in columns if column in rankings.columns]].copy()
-    if "LA_Power_Score" in power.columns:
-        power["LA_Power_Fit"] = pd.to_numeric(power["LA_Power_Score"], errors="coerce").fillna(50.0)
-    else:
-        power["LA_Power_Fit"] = (
-            100.0 - (pd.to_numeric(power.get("Avg_LA"), errors="coerce") - 27.0).abs() * 3.0
-        ).clip(0, 100).fillna(50.0)
-    power = power.rename(columns={
-        "HR_PA": "HR/PA", "Brl_PA": "Brl/PA", "Brl_BIP": "Brl/BIP",
-        "PullAir_BIP": "Pull Air/BIP", "PullAir_Air": "Pull Air/Air",
-        "xSLG_PA": "xSLG/PA", "xISO_PA": "xISO/PA", "xSLG_Contact": "xSLG Contact",
-        "HH_Pct": "Hard Hit%", "SweetSpot_Pct": "Sweet Spot%", "Barrel_Range_BIP": "Barrel Range/BIP",
-        "FB_Pct": "FB%", "Avg_EV": "Avg EV", "Max_EV": "Max EV", "Avg_LA": "Avg LA",
-        "LA_Power_Score": "Raw LA Power", "LA_Optimization_Score": "LA Optimization",
-        "LA_Power_Fit": "LA Power Fit", "K_Pct": "K%", "Whiff_Pct": "Whiff%",
-    })
-    positive_columns = [
-        "HR/PA", "Brl/PA", "Brl/BIP", "Pull Air/BIP", "Pull Air/Air",
-        "xSLG/PA", "xISO/PA", "xSLG Contact", "Hard Hit%", "Sweet Spot%",
-        "Barrel Range/BIP", "FB%", "Avg EV", "EV90", "Max EV", "LA Power Fit",
-        "Raw LA Power", "LA Optimization",
-    ]
-    positive_columns = [column for column in positive_columns if column in power.columns]
-    risk_columns = [column for column in ["K%", "Whiff%"] if column in power.columns]
-
-    power_style = power.style
-    if positive_columns:
-        power_style = power_style.background_gradient(
-            cmap="RdYlGn", subset=positive_columns, axis=0
+    if preview_board.empty:
+        st.warning(
+            "No roster or Statcast hitters were available. Increase the lookback or disable the PA filter."
         )
-    if risk_columns:
-        power_style = power_style.background_gradient(
-            cmap="RdYlGn_r", subset=risk_columns, axis=0
-        )
-    power_style = power_style.set_properties(
-        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
-    ).format({
-        "HR/PA": "{:.2%}", "Brl/PA": "{:.2%}", "Brl/BIP": "{:.1%}",
-        "Pull Air/BIP": "{:.1%}", "Pull Air/Air": "{:.1%}",
-        "xSLG/PA": "{:.3f}", "xISO/PA": "{:.3f}", "xSLG Contact": "{:.3f}",
-        "Hard Hit%": "{:.1%}", "Sweet Spot%": "{:.1%}", "Barrel Range/BIP": "{:.1%}",
-        "FB%": "{:.1%}", "Avg EV": "{:.1f}", "EV90": "{:.1f}", "Max EV": "{:.1f}",
-        "Avg LA": "{:.1f}", "LA Power Fit": "{:.0f}", "Raw LA Power": "{:.0f}",
-        "LA Optimization": "{:.0f}", "K%": "{:.1%}", "Whiff%": "{:.1%}",
-    })
-    st.dataframe(
-        power_style,
-        use_container_width=True,
-        hide_index=True,
-        height=560,
+        st.stop()
+    preview_names = lookup_names(
+        tuple(preview_board["player_id"].dropna().astype(int).unique().tolist())
     )
+    preview_board = preview_board.merge(preview_names, on="player_id", how="left", suffixes=("", "_Lookup"))
+    preview_board["Player"] = preview_board["Player"].replace("", np.nan).fillna(preview_board.get("Player_Lookup"))
+    preview_board["Player"] = preview_board["Player"].fillna(
+        "MLB ID " + preview_board["player_id"].astype("Int64").astype(str)
+    )
+    preview_board = preview_board.drop(columns=["Player_Lookup"], errors="ignore")
+    preview_board = preview_board.merge(lineup_seed, on="player_id", how="left")
+    lineup_input = preview_board[["player_id", "Player", "Position", "Bats", "PA", "SampleStatus", "LineupSpot"]].copy()
+    default_selected = lineup_input["LineupSpot"].notna()
+    if not default_selected.any():
+        default_selected = pd.Series(True, index=lineup_input.index)
+    lineup_input.insert(0, "Selected", default_selected)
+    lineup_input = lineup_input.sort_values(["LineupSpot", "Player"], na_position="last")
 
-    with st.expander("Launch Angle Distribution", expanded=False):
+    with st.expander("Confirm lineup", expanded=False):
         st.caption(
-            "Batted-ball launch-angle distribution for hitters currently on this board. "
-            "The shaded band marks the 20°–35° power window."
+            f"Default order: {lineup_source_label}. "
+            "You can still edit the order or remove a late scratch below."
         )
-        plot_ids = rankings["player_id"].dropna().astype(int).tolist()
-        plot_data = df[df["is_bbe"] & df["batter"].isin(plot_ids)].copy()
-        plot_data["launch_angle"] = pd.to_numeric(plot_data["launch_angle"], errors="coerce")
-        plot_data = plot_data.dropna(subset=["launch_angle"])
-        if plot_data.empty:
-            st.info("No batted-ball launch-angle data were available for the current board.")
+        lineup_edits = st.data_editor(
+            lineup_input,
+            hide_index=True,
+            use_container_width=True,
+            disabled=["player_id", "Player", "Position", "Bats", "PA", "SampleStatus"],
+            column_config={
+                "Selected": st.column_config.CheckboxColumn("Use", default=True),
+                "LineupSpot": st.column_config.NumberColumn(
+                    "Lineup spot", min_value=1, max_value=9, step=1
+                ),
+            },
+            key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
+        )
+
+    rankings, pitch_mix = build_hr_board_safe(
+        df=df,
+        context=f"selected matchup {selected_team}",
+        pitcher_id=selected_pitcher,
+        team=selected_team,
+        min_pa=min_pa,
+        end_date=pd.Timestamp(loaded_end),
+        park_hr_factor_lhb=park_hr_factor_lhb,
+        park_hr_factor_rhb=park_hr_factor_rhb,
+        team_runs=team_runs,
+        is_away=home_away == "Away",
+        starter_innings=starter_innings,
+        bullpen_multiplier=bullpen_multiplier,
+        weather_multiplier=weather_multiplier,
+        lineup_override=lineup_seed,
+        lineup_edits=lineup_edits,
+        bat_tracking_upload=bat_tracking_upload,
+        bat_tracking_auto=bat_tracking_auto,
+        active_roster=active_roster,
+        include_low_sample=include_low_sample,
+    )
+
+    if rankings.empty:
+        st.warning("No selected hitters remain after filtering or the matchup model hit a recoverable issue.")
+        if st.session_state.get("clean_hr_last_model_error"):
+            st.caption(st.session_state["clean_hr_last_model_error"])
+            with st.expander("Technical details", expanded=False):
+                st.code(st.session_state.get("clean_hr_last_model_traceback", ""))
+        st.stop()
+
+    rankings = apply_hr_probability_calibration(
+        rankings, st.session_state.get(f"{MODEL_KEY}_probability_calibration")
+    )
+
+    render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HOME RUN BOARD")
+    render_leader_cards(rankings, "Model_1plus_HR", "HRScore", "model 1+ HR")
+
+    quick_tab, power_tab, matchup_tab, pitch_type_tab, tracking_tab, pitcher_tab, slate_tab, backtest_tab, notes_tab = st.tabs(
+        [
+            "Quick board", "Power profile", "Matchup detail", "Batter vs pitch type",
+            "Bat tracking", "Pitcher profile", "Top 10 & 3-man", "Backtest & calibration", "Model notes"
+        ]
+    )
+
+    pitch_type_table = build_batter_pitch_type_table(
+        df,
+        rankings,
+        pitch_mix,
+        preview_hand,
+    )
+
+    with quick_tab:
+        quick_columns = [
+            "Rank", "Player", "LineupSpot", "Projected_PA", "Model_1plus_HR",
+            "HRScore", "Confidence_Level", "Adj_Brl_PA", "Barrel_Range_BIP",
+            "LA_Power_Score", "Adj_xISO_PA", "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
+            "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore", "ParkFactor",
+        ]
+        quick = rankings[[column for column in quick_columns if column in rankings.columns]].copy()
+        quick = quick.rename(columns={
+            "LineupSpot": "Order", "Projected_PA": "Proj PA", "Model_1plus_HR": "1+ HR",
+            "HRScore": "HR Score", "Confidence_Level": "Confidence",
+            "Adj_Brl_PA": "Adj Brl/PA", "Barrel_Range_BIP": "Barrel Range/BIP",
+            "LA_Power_Score": "LA Power", "Adj_xISO_PA": "Adj xISO/PA",
+            "EffectiveStand": "Bats vs SP", "PitcherSideRead": "Pitcher Read",
+            "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
+            "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
+            "PitcherPowerScore": "Pitcher Power", "ParkFactor": "Park Factor",
+        })
+        score_cols = ["HR Score", "LA Power", "Side Attack", "Pitch Match", "Zone Fit", "Pitcher Power"]
+        score_cols = [column for column in score_cols if column in quick.columns]
+        styler = quick.style.background_gradient(
+            cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100
+        ).format({
+            "Order": "{:.0f}", "Proj PA": "{:.2f}", "1+ HR": "{:.1%}",
+            "HR Score": "{:.1f}", "Adj Brl/PA": "{:.2%}", "Barrel Range/BIP": "{:.1%}",
+            "LA Power": "{:.1f}", "Adj xISO/PA": "{:.3f}",
+            "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}", "Pitcher Power": "{:.1f}",
+            "Park Factor": "{:.0f}",
+        })
+        st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
+
+    with power_tab:
+        st.caption(
+            "Green cells are stronger home-run ingredients. Red cells in K% and Whiff% "
+            "show swing-and-miss risk. LA Power Fit rewards launch angles closest to the "
+            "typical power window rather than simply rewarding the highest angle."
+        )
+        columns = [
+            "Player", "PA", "HR", "HR_PA", "Brl_PA", "Brl_BIP", "PullAir_BIP",
+            "PullAir_Air", "xSLG_PA", "xISO_PA", "xSLG_Contact", "HH_Pct",
+            "SweetSpot_Pct", "Barrel_Range_BIP", "FB_Pct", "Avg_EV", "EV90", "Max_EV",
+            "Avg_LA", "LA_Power_Score", "LA_Optimization_Score", "K_Pct", "Whiff_Pct",
+        ]
+        power = rankings[[column for column in columns if column in rankings.columns]].copy()
+        if "LA_Power_Score" in power.columns:
+            power["LA_Power_Fit"] = pd.to_numeric(power["LA_Power_Score"], errors="coerce").fillna(50.0)
         else:
-            try:
-                import matplotlib.pyplot as plt
-
-                non_hr = plot_data.loc[~plot_data["is_hr"].fillna(False), "launch_angle"]
-                hr = plot_data.loc[plot_data["is_hr"].fillna(False), "launch_angle"]
-                bins = np.arange(-90, 91, 4)
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.hist([non_hr, hr], bins=bins, label=["Non-HR BBE", "HR"], alpha=0.75)
-                ax.axvspan(20, 35, alpha=0.18, label="Optimal HR Range")
-                ax.set_title("Launch Angle Distribution")
-                ax.set_xlabel("Launch Angle")
-                ax.set_ylabel("Batted Balls")
-                ax.legend()
-                st.pyplot(fig, clear_figure=True)
-            except Exception as exc:
-                st.warning(f"Could not render launch-angle distribution: {exc}")
-
-with matchup_tab:
-    columns = [
-        "Player", "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore",
-        "RecentFormScore", "BvP_PA", "BvP_HR", "BvPScore", "MatchSample",
-        "Platoon_PA", "Pitcher_PA",
-    ]
-    detail = rankings[[column for column in columns if column in rankings.columns]].copy()
-    detail = detail.rename(columns={
-        "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
-        "PitcherPowerScore": "Pitcher Power", "RecentFormScore": "Recent Form",
-        "BvP_PA": "BvP PA", "BvP_HR": "BvP HR", "BvPScore": "BvP Score",
-        "MatchSample": "Matched Pitches", "Platoon_PA": "Platoon PA",
-        "Pitcher_PA": "Pitcher Split PA",
-    })
-    score_cols = ["Pitch Match", "Zone Fit", "Pitcher Power", "Recent Form", "BvP Score"]
-    st.dataframe(
-        detail.style.background_gradient(cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100).format(
-            {column: "{:.1f}" for column in score_cols}
-        ),
-        use_container_width=True,
-        hide_index=True,
-        height=520,
-    )
-
-
-with pitch_type_tab:
-    st.caption(
-        "Historical results against each pitch type used by the selected starter, filtered to "
-        "the starter's throwing hand. Rates are shrunk toward league pitch-type averages, so "
-        "small samples stay near neutral. Pitch Type Score is 0–100; 50 is neutral."
-    )
-    if pitch_type_table.empty:
-        st.info("No batter-versus-pitch-type data were available for this matchup.")
-    else:
-        hitter_options = rankings.sort_values("Rank")["Player"].tolist()
-        selected_pitch_hitter = st.selectbox(
-            "Hitter",
-            hitter_options,
-            key=f"clean_hr_pitch_type_hitter_{selected_pitcher}_{selected_team}",
-        )
-        pitch_view = pitch_type_table[pitch_type_table["Player"].eq(selected_pitch_hitter)].copy()
-        pitch_view = pitch_view.sort_values("Pitcher Usage", ascending=False)
-        display_columns = [
-            "Pitch Type", "Pitcher Usage", "Pitcher Velo", "Pitches Seen", "PA Ends", "BBE", "HR",
-            "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
-            "Pull Air/BIP", "Contact%", "Whiff%", "Pitch Type Score", "Sample",
+            power["LA_Power_Fit"] = (
+                100.0 - (pd.to_numeric(power.get("Avg_LA"), errors="coerce") - 27.0).abs() * 3.0
+            ).clip(0, 100).fillna(50.0)
+        power = power.rename(columns={
+            "HR_PA": "HR/PA", "Brl_PA": "Brl/PA", "Brl_BIP": "Brl/BIP",
+            "PullAir_BIP": "Pull Air/BIP", "PullAir_Air": "Pull Air/Air",
+            "xSLG_PA": "xSLG/PA", "xISO_PA": "xISO/PA", "xSLG_Contact": "xSLG Contact",
+            "HH_Pct": "Hard Hit%", "SweetSpot_Pct": "Sweet Spot%", "Barrel_Range_BIP": "Barrel Range/BIP",
+            "FB_Pct": "FB%", "Avg_EV": "Avg EV", "Max_EV": "Max EV", "Avg_LA": "Avg LA",
+            "LA_Power_Score": "Raw LA Power", "LA_Optimization_Score": "LA Optimization",
+            "LA_Power_Fit": "LA Power Fit", "K_Pct": "K%", "Whiff_Pct": "Whiff%",
+        })
+        positive_columns = [
+            "HR/PA", "Brl/PA", "Brl/BIP", "Pull Air/BIP", "Pull Air/Air",
+            "xSLG/PA", "xISO/PA", "xSLG Contact", "Hard Hit%", "Sweet Spot%",
+            "Barrel Range/BIP", "FB%", "Avg EV", "EV90", "Max EV", "LA Power Fit",
+            "Raw LA Power", "LA Optimization",
         ]
-        pitch_view = pitch_view[[column for column in display_columns if column in pitch_view.columns]]
-        positive = [
-            column for column in [
-                "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
-                "Pull Air/BIP", "Contact%", "Pitch Type Score"
-            ] if column in pitch_view.columns
-        ]
-        risk = [column for column in ["Whiff%"] if column in pitch_view.columns]
-        pitch_style = pitch_view.style
-        if positive:
-            pitch_style = pitch_style.background_gradient(cmap="RdYlGn", subset=positive, axis=0)
-        if risk:
-            pitch_style = pitch_style.background_gradient(cmap="RdYlGn_r", subset=risk, axis=0)
-        pitch_style = pitch_style.format({
-            "Pitcher Usage": "{:.1%}", "Pitcher Velo": "{:.1f}", "HR/PA": "{:.2%}",
-            "Brl/BIP": "{:.1%}", "xSLG Contact": "{:.3f}", "xBA Contact": "{:.3f}",
-            "Hard Hit%": "{:.1%}", "Pull Air/BIP": "{:.1%}", "Contact%": "{:.1%}",
-            "Whiff%": "{:.1%}", "Pitch Type Score": "{:.1f}",
+        positive_columns = [column for column in positive_columns if column in power.columns]
+        risk_columns = [column for column in ["K%", "Whiff%"] if column in power.columns]
+
+        power_style = power.style
+        if positive_columns:
+            power_style = power_style.background_gradient(
+                cmap="RdYlGn", subset=positive_columns, axis=0
+            )
+        if risk_columns:
+            power_style = power_style.background_gradient(
+                cmap="RdYlGn_r", subset=risk_columns, axis=0
+            )
+        power_style = power_style.set_properties(
+            subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+        ).format({
+            "HR/PA": "{:.2%}", "Brl/PA": "{:.2%}", "Brl/BIP": "{:.1%}",
+            "Pull Air/BIP": "{:.1%}", "Pull Air/Air": "{:.1%}",
+            "xSLG/PA": "{:.3f}", "xISO/PA": "{:.3f}", "xSLG Contact": "{:.3f}",
+            "Hard Hit%": "{:.1%}", "Sweet Spot%": "{:.1%}", "Barrel Range/BIP": "{:.1%}",
+            "FB%": "{:.1%}", "Avg EV": "{:.1f}", "EV90": "{:.1f}", "Max EV": "{:.1f}",
+            "Avg LA": "{:.1f}", "LA Power Fit": "{:.0f}", "Raw LA Power": "{:.0f}",
+            "LA Optimization": "{:.0f}", "K%": "{:.1%}", "Whiff%": "{:.1%}",
         })
         st.dataframe(
-            pitch_style,
+            power_style,
             use_container_width=True,
             hide_index=True,
-            height=470,
+            height=560,
         )
 
-with tracking_tab:
-    available_count = int(rankings.get("BatTrackingAvailable", pd.Series(False, index=rankings.index)).sum())
-    st.caption(
-        f"Actual bat-tracking data matched {available_count} of {len(rankings)} displayed hitters. "
-        "A missing player is shown as No data; the model uses a neutral 50 internally so missing "
-        "tracking does not punish or boost that hitter."
-    )
-    columns = [
-        "Player", "BatTrackingAvailable", "BatTrackingScore", "BatTrackingMetricCount",
-        "BatTrackingSeason", "BatTrackingSource", "Bat_Speed", "Fast_Swing_Rate",
-        "Blast_Contact_Rate", "Squared_Up_Contact_Rate", "Attack_Angle",
-        "Attack_Direction",
-    ]
-    tracking = rankings[[column for column in columns if column in rankings.columns]].copy()
-    tracking["Data Status"] = np.where(
-        tracking.get("BatTrackingAvailable", False), "Available", "No data"
-    )
-    tracking["Bat Tracking Display"] = pd.to_numeric(
-        tracking.get("BatTrackingScore"), errors="coerce"
-    ).where(tracking["Data Status"].eq("Available"))
-    tracking = tracking.rename(columns={
-        "Bat Tracking Display": "Bat Tracking", "BatTrackingMetricCount": "Metrics",
-        "BatTrackingSeason": "Season", "BatTrackingSource": "Source",
-        "Bat_Speed": "Bat Speed", "Fast_Swing_Rate": "Fast Swing%",
-        "Blast_Contact_Rate": "Blast/Contact",
-        "Squared_Up_Contact_Rate": "Squared Up/Contact",
-        "Attack_Angle": "Attack Angle", "Attack_Direction": "Attack Direction",
-    })
-    display_columns = [
-        "Player", "Data Status", "Bat Tracking", "Metrics", "Season", "Source",
-        "Bat Speed", "Fast Swing%", "Blast/Contact", "Squared Up/Contact",
-        "Attack Angle", "Attack Direction",
-    ]
-    tracking = tracking[[column for column in display_columns if column in tracking.columns]]
-    tracking_style = tracking.style
-    tracking_positive = [
-        column for column in [
-            "Bat Tracking", "Bat Speed", "Fast Swing%", "Blast/Contact",
-            "Squared Up/Contact"
-        ] if column in tracking.columns
-    ]
-    if tracking_positive:
-        tracking_style = tracking_style.background_gradient(
-            cmap="RdYlGn", subset=tracking_positive, axis=0
-        )
-    tracking_style = tracking_style.set_properties(
-        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
-    ).format({
-        "Bat Tracking": "{:.1f}", "Metrics": "{:.0f}", "Season": "{:.0f}",
-        "Bat Speed": "{:.1f}", "Fast Swing%": "{:.1%}",
-        "Blast/Contact": "{:.1%}", "Squared Up/Contact": "{:.1%}",
-        "Attack Angle": "{:.1f}", "Attack Direction": "{:.1f}",
-    }, na_rep="—")
-    st.dataframe(
-        tracking_style,
-        use_container_width=True,
-        hide_index=True,
-        height=520,
-    )
+        with st.expander("Launch Angle Distribution", expanded=False):
+            st.caption(
+                "Batted-ball launch-angle distribution for hitters currently on this board. "
+                "The shaded band marks the 20°–35° power window."
+            )
+            plot_ids = rankings["player_id"].dropna().astype(int).tolist()
+            plot_data = df[df["is_bbe"] & df["batter"].isin(plot_ids)].copy()
+            plot_data["launch_angle"] = pd.to_numeric(plot_data["launch_angle"], errors="coerce")
+            plot_data = plot_data.dropna(subset=["launch_angle"])
+            if plot_data.empty:
+                st.info("No batted-ball launch-angle data were available for the current board.")
+            else:
+                try:
+                    import matplotlib.pyplot as plt
 
-with pitcher_tab:
-    if pitch_mix.empty:
-        st.info("No pitch profile was available.")
-    else:
+                    non_hr = plot_data.loc[~plot_data["is_hr"].fillna(False), "launch_angle"]
+                    hr = plot_data.loc[plot_data["is_hr"].fillna(False), "launch_angle"]
+                    bins = np.arange(-90, 91, 4)
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    ax.hist([non_hr, hr], bins=bins, label=["Non-HR BBE", "HR"], alpha=0.75)
+                    ax.axvspan(20, 35, alpha=0.18, label="Optimal HR Range")
+                    ax.set_title("Launch Angle Distribution")
+                    ax.set_xlabel("Launch Angle")
+                    ax.set_ylabel("Batted Balls")
+                    ax.legend()
+                    st.pyplot(fig, clear_figure=True)
+                except Exception as exc:
+                    st.warning(f"Could not render launch-angle distribution: {exc}")
+
+    with matchup_tab:
+        columns = [
+            "Player", "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore",
+            "RecentFormScore", "BvP_PA", "BvP_HR", "BvPScore", "MatchSample",
+            "Platoon_PA", "Pitcher_PA",
+        ]
+        detail = rankings[[column for column in columns if column in rankings.columns]].copy()
+        detail = detail.rename(columns={
+            "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
+            "PitcherPowerScore": "Pitcher Power", "RecentFormScore": "Recent Form",
+            "BvP_PA": "BvP PA", "BvP_HR": "BvP HR", "BvPScore": "BvP Score",
+            "MatchSample": "Matched Pitches", "Platoon_PA": "Platoon PA",
+            "Pitcher_PA": "Pitcher Split PA",
+        })
+        score_cols = ["Pitch Match", "Zone Fit", "Pitcher Power", "Recent Form", "BvP Score"]
         st.dataframe(
-            pitch_mix.sort_values("Usage", ascending=False).style.format({
-                "Usage": "{:.1%}", "Avg_Speed": "{:.1f}", "Avg_PFX_X": "{:.2f}",
-                "Avg_PFX_Z": "{:.2f}", "Avg_Extension": "{:.2f}",
-                "Allowed_xSLG": "{:.3f}", "Allowed_Barrel": "{:.1%}",
-            }),
+            detail.style.background_gradient(cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100).format(
+                {column: "{:.1f}" for column in score_cols}
+            ),
             use_container_width=True,
             hide_index=True,
+            height=520,
         )
 
-with slate_tab:
-    render_hr_top10_parlay_tab(
-        df=df,
-        pitcher_summary=pitcher_summary,
-        matchup=matchup,
-        available_teams=available_teams,
-        lookback_days=lookback_days,
-        loaded_start=loaded_start,
-        loaded_end=loaded_end,
-        min_pa=min_pa,
-        include_low_sample=include_low_sample,
-        bat_tracking_auto=bat_tracking_auto,
-        calibration=st.session_state.get(f"{MODEL_KEY}_probability_calibration"),
-        widget_prefix=MODEL_KEY,
-    )
 
-with backtest_tab:
-    render_hr_backtest_calibration_tab(
-        rankings=rankings,
-        df=df,
-        matchup=matchup,
-        pitcher_summary=pitcher_summary,
-        available_teams=available_teams,
-        lookback_days=lookback_days,
-        loaded_start=loaded_start,
-        loaded_end=loaded_end,
-        lineup_status=lineup_source_label,
-        min_pa=min_pa,
-        include_low_sample=include_low_sample,
-        bat_tracking_auto=bat_tracking_auto,
-        widget_prefix=MODEL_KEY,
-    )
+    with pitch_type_tab:
+        st.caption(
+            "Historical results against each pitch type used by the selected starter, filtered to "
+            "the starter's throwing hand. Rates are shrunk toward league pitch-type averages, so "
+            "small samples stay near neutral. Pitch Type Score is 0–100; 50 is neutral."
+        )
+        if pitch_type_table.empty:
+            st.info("No batter-versus-pitch-type data were available for this matchup.")
+        else:
+            hitter_options = rankings.sort_values("Rank")["Player"].tolist()
+            selected_pitch_hitter = st.selectbox(
+                "Hitter",
+                hitter_options,
+                key=f"clean_hr_pitch_type_hitter_{selected_pitcher}_{selected_team}",
+            )
+            pitch_view = pitch_type_table[pitch_type_table["Player"].eq(selected_pitch_hitter)].copy()
+            pitch_view = pitch_view.sort_values("Pitcher Usage", ascending=False)
+            display_columns = [
+                "Pitch Type", "Pitcher Usage", "Pitcher Velo", "Pitches Seen", "PA Ends", "BBE", "HR",
+                "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
+                "Pull Air/BIP", "Contact%", "Whiff%", "Pitch Type Score", "Sample",
+            ]
+            pitch_view = pitch_view[[column for column in display_columns if column in pitch_view.columns]]
+            positive = [
+                column for column in [
+                    "HR/PA", "Brl/BIP", "xSLG Contact", "xBA Contact", "Hard Hit%",
+                    "Pull Air/BIP", "Contact%", "Pitch Type Score"
+                ] if column in pitch_view.columns
+            ]
+            risk = [column for column in ["Whiff%"] if column in pitch_view.columns]
+            pitch_style = pitch_view.style
+            if positive:
+                pitch_style = pitch_style.background_gradient(cmap="RdYlGn", subset=positive, axis=0)
+            if risk:
+                pitch_style = pitch_style.background_gradient(cmap="RdYlGn_r", subset=risk, axis=0)
+            pitch_style = pitch_style.format({
+                "Pitcher Usage": "{:.1%}", "Pitcher Velo": "{:.1f}", "HR/PA": "{:.2%}",
+                "Brl/BIP": "{:.1%}", "xSLG Contact": "{:.3f}", "xBA Contact": "{:.3f}",
+                "Hard Hit%": "{:.1%}", "Pull Air/BIP": "{:.1%}", "Contact%": "{:.1%}",
+                "Whiff%": "{:.1%}", "Pitch Type Score": "{:.1f}",
+            })
+            st.dataframe(
+                pitch_style,
+                use_container_width=True,
+                hide_index=True,
+                height=470,
+            )
 
-with notes_tab:
-    st.markdown(
-        """
-        ### Reading the board
-        - **1+ HR** combines the modeled home-run rate per plate appearance with projected plate appearances.
-        - **HR Score** is a 0–100 comparison score within the selected offense, not a literal probability.
-        - **Pitcher Read / Side Attack** grades whether the starter has been more attackable or avoidable for LHB or RHB, with small samples shrunk toward neutral.
-        - **Pitch Match** compares the hitter with the starter's pitch types, velocity, movement and extension.
-        - **Batter vs pitch type** surfaces the underlying historical split against the starter's pitch mix and throwing hand; it is already summarized by Pitch Match and is not added a second time.
-        - **Zone Fit** weights hitter power by the locations the starter uses.
-        - **Park Factor** is automatically matched to the selected venue from Baseball Savant when its live table is available; 110 means ×1.10 and 90 means ×0.90. A neutral/manual fallback remains available.
-        - The weather multiplier is applied after the park adjustment.
-        - **Sample** marks hitters below the selected PA threshold. Active-roster players with no history use league-average priors and remain Low confidence.
-        - **Confidence** reflects sample size and matchup-data depth, not certainty that the outcome will occur.
+    with tracking_tab:
+        available_count = int(rankings.get("BatTrackingAvailable", pd.Series(False, index=rankings.index)).sum())
+        st.caption(
+            f"Actual bat-tracking data matched {available_count} of {len(rankings)} displayed hitters. "
+            "A missing player is shown as No data; the model uses a neutral 50 internally so missing "
+            "tracking does not punish or boost that hitter."
+        )
+        columns = [
+            "Player", "BatTrackingAvailable", "BatTrackingScore", "BatTrackingMetricCount",
+            "BatTrackingSeason", "BatTrackingSource", "Bat_Speed", "Fast_Swing_Rate",
+            "Blast_Contact_Rate", "Squared_Up_Contact_Rate", "Attack_Angle",
+            "Attack_Direction",
+        ]
+        tracking = rankings[[column for column in columns if column in rankings.columns]].copy()
+        tracking["Data Status"] = np.where(
+            tracking.get("BatTrackingAvailable", False), "Available", "No data"
+        )
+        tracking["Bat Tracking Display"] = pd.to_numeric(
+            tracking.get("BatTrackingScore"), errors="coerce"
+        ).where(tracking["Data Status"].eq("Available"))
+        tracking = tracking.rename(columns={
+            "Bat Tracking Display": "Bat Tracking", "BatTrackingMetricCount": "Metrics",
+            "BatTrackingSeason": "Season", "BatTrackingSource": "Source",
+            "Bat_Speed": "Bat Speed", "Fast_Swing_Rate": "Fast Swing%",
+            "Blast_Contact_Rate": "Blast/Contact",
+            "Squared_Up_Contact_Rate": "Squared Up/Contact",
+            "Attack_Angle": "Attack Angle", "Attack_Direction": "Attack Direction",
+        })
+        display_columns = [
+            "Player", "Data Status", "Bat Tracking", "Metrics", "Season", "Source",
+            "Bat Speed", "Fast Swing%", "Blast/Contact", "Squared Up/Contact",
+            "Attack Angle", "Attack Direction",
+        ]
+        tracking = tracking[[column for column in display_columns if column in tracking.columns]]
+        tracking_style = tracking.style
+        tracking_positive = [
+            column for column in [
+                "Bat Tracking", "Bat Speed", "Fast Swing%", "Blast/Contact",
+                "Squared Up/Contact"
+            ] if column in tracking.columns
+        ]
+        if tracking_positive:
+            tracking_style = tracking_style.background_gradient(
+                cmap="RdYlGn", subset=tracking_positive, axis=0
+            )
+        tracking_style = tracking_style.set_properties(
+            subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+        ).format({
+            "Bat Tracking": "{:.1f}", "Metrics": "{:.0f}", "Season": "{:.0f}",
+            "Bat Speed": "{:.1f}", "Fast Swing%": "{:.1%}",
+            "Blast/Contact": "{:.1%}", "Squared Up/Contact": "{:.1%}",
+            "Attack Angle": "{:.1f}", "Attack Direction": "{:.1f}",
+        }, na_rep="—")
+        st.dataframe(
+            tracking_style,
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+        )
 
-        The probabilities remain heuristic until tested and calibrated on held-out historical games.
-        """
-    )
+    with pitcher_tab:
+        if pitch_mix.empty:
+            st.info("No pitch profile was available.")
+        else:
+            st.dataframe(
+                pitch_mix.sort_values("Usage", ascending=False).style.format({
+                    "Usage": "{:.1%}", "Avg_Speed": "{:.1f}", "Avg_PFX_X": "{:.2f}",
+                    "Avg_PFX_Z": "{:.2f}", "Avg_Extension": "{:.2f}",
+                    "Allowed_xSLG": "{:.3f}", "Allowed_Barrel": "{:.1%}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with slate_tab:
+        render_hr_top10_parlay_tab(
+            df=df,
+            pitcher_summary=pitcher_summary,
+            matchup=matchup,
+            available_teams=available_teams,
+            lookback_days=lookback_days,
+            loaded_start=loaded_start,
+            loaded_end=loaded_end,
+            min_pa=min_pa,
+            include_low_sample=include_low_sample,
+            bat_tracking_auto=bat_tracking_auto,
+            calibration=st.session_state.get(f"{MODEL_KEY}_probability_calibration"),
+            widget_prefix=MODEL_KEY,
+        )
+
+    with backtest_tab:
+        render_hr_backtest_calibration_tab(
+            rankings=rankings,
+            df=df,
+            matchup=matchup,
+            pitcher_summary=pitcher_summary,
+            available_teams=available_teams,
+            lookback_days=lookback_days,
+            loaded_start=loaded_start,
+            loaded_end=loaded_end,
+            lineup_status=lineup_source_label,
+            min_pa=min_pa,
+            include_low_sample=include_low_sample,
+            bat_tracking_auto=bat_tracking_auto,
+            widget_prefix=MODEL_KEY,
+        )
+
+    with notes_tab:
+        st.markdown(
+            """
+            ### Reading the board
+            - **1+ HR** combines the modeled home-run rate per plate appearance with projected plate appearances.
+            - **HR Score** is a 0–100 comparison score within the selected offense, not a literal probability.
+            - **Pitcher Read / Side Attack** grades whether the starter has been more attackable or avoidable for LHB or RHB, with small samples shrunk toward neutral.
+            - **Pitch Match** compares the hitter with the starter's pitch types, velocity, movement and extension.
+            - **Batter vs pitch type** surfaces the underlying historical split against the starter's pitch mix and throwing hand; it is already summarized by Pitch Match and is not added a second time.
+            - **Zone Fit** weights hitter power by the locations the starter uses.
+            - **Park Factor** is automatically matched to the selected venue from Baseball Savant when its live table is available; 110 means ×1.10 and 90 means ×0.90. A neutral/manual fallback remains available.
+            - The weather multiplier is applied after the park adjustment.
+            - **Sample** marks hitters below the selected PA threshold. Active-roster players with no history use league-average priors and remain Low confidence.
+            - **Confidence** reflects sample size and matchup-data depth, not certainty that the outcome will occur.
+
+            The probabilities remain heuristic until tested and calibrated on held-out historical games.
+            """
+        )
+
+except (StopException, RerunException):
+    raise
+except Exception as exc:
+    st.error("The HR dashboard hit a recoverable error instead of showing the generic Streamlit crash page.")
+    st.warning("Use the sidebar buttons to clear cached MLB data, then reload with a 30–45 day Statcast lookback. If this repeats, copy the technical details below.")
+    st.caption(f"Error: {type(exc).__name__}: {exc}")
+    with st.expander("Technical details for debugging", expanded=False):
+        st.code(traceback.format_exc())
