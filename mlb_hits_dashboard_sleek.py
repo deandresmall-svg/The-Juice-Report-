@@ -4,8 +4,11 @@ from datetime import date, timedelta
 from difflib import SequenceMatcher
 from itertools import combinations
 import math
+import os
 import re
+import sqlite3
 import unicodedata
+import json
 from io import StringIO
 from pathlib import Path
 from typing import Iterable
@@ -2426,6 +2429,605 @@ BINARY_EXPECTED_COUNT_COLUMN = "Projected_Hits"
 BINARY_EXPECTED_COUNT_LABEL = "Projected Hits"
 BINARY_PER_PA_COLUMN = "Model_Hit_Per_PA"
 BINARY_MIN_CALIBRATION_ROWS = 200
+
+# Persistent ML and forward-tracking storage. The location can be overridden on
+# hosted deployments with HIT_DASHBOARD_DATA_DIR.
+PERSISTENCE_VERSION = 1
+ML_FEATURES = [
+    "Hit_PA", "xHit_PA", "Contact_Pct", "K_Pct", "HH_Pct", "LD_Pct",
+    "Projected_PA",
+]
+ML_DEFAULTS = {
+    "Hit_PA": 0.225, "xHit_PA": 0.225, "Contact_Pct": 0.76,
+    "K_Pct": 0.23, "HH_Pct": 0.38, "LD_Pct": 0.24,
+    "Projected_PA": 4.2,
+}
+
+
+def persistence_paths() -> dict[str, Path]:
+    configured = str(os.getenv("HIT_DASHBOARD_DATA_DIR", "")).strip()
+    root = Path(configured).expanduser() if configured else Path(__file__).resolve().parent / ".hit_dashboard_data"
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        "root": root,
+        "database": root / "hits_dashboard.sqlite3",
+        "model": root / "hits_ml_model.json",
+        "calibration": root / "hits_ml_calibration.json",
+    }
+
+
+def hit_db_connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(persistence_paths()["database"], timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
+    return connection
+
+
+def initialize_hit_database() -> None:
+    with hit_db_connect() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS historical_games (
+                slate_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                player_name TEXT,
+                hit_pa REAL, xhit_pa REAL, contact_pct REAL, k_pct REAL,
+                hh_pct REAL, ld_pct REAL, projected_pa REAL,
+                actual_hit INTEGER NOT NULL, actual_hits INTEGER NOT NULL,
+                actual_pa INTEGER, source_start TEXT, source_end TEXT,
+                created_at_utc TEXT NOT NULL,
+                PRIMARY KEY (game_pk, player_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_historical_date ON historical_games(slate_date);
+
+            CREATE TABLE IF NOT EXISTS predictions (
+                slate_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                player_name TEXT,
+                batting_team TEXT,
+                opponent TEXT,
+                generated_at_utc TEXT NOT NULL,
+                game_datetime_utc TEXT,
+                lineup_status TEXT,
+                existing_probability REAL,
+                hit_score REAL,
+                raw_ml_probability REAL,
+                calibrated_ml_probability REAL,
+                ml_fair_odds REAL,
+                model_version TEXT NOT NULL,
+                training_date TEXT,
+                market_line REAL,
+                over_odds REAL,
+                market_probability REAL,
+                actual_hit INTEGER,
+                actual_hits INTEGER,
+                actual_pa INTEGER,
+                result_status TEXT DEFAULT 'Pending',
+                graded_at_utc TEXT,
+                PRIMARY KEY (slate_date, game_pk, player_id, model_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_predictions_pending
+                ON predictions(result_status, slate_date);
+
+            CREATE TABLE IF NOT EXISTS training_runs (
+                model_version TEXT PRIMARY KEY,
+                trained_at_utc TEXT NOT NULL,
+                training_end_date TEXT NOT NULL,
+                rows_total INTEGER NOT NULL,
+                rows_train INTEGER NOT NULL,
+                rows_calibration INTEGER NOT NULL,
+                rows_holdout INTEGER NOT NULL,
+                holdout_raw_brier REAL,
+                holdout_calibrated_brier REAL,
+                holdout_raw_logloss REAL,
+                holdout_calibrated_logloss REAL,
+                holdout_accuracy REAL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+
+
+def utc_now_text() -> str:
+    return pd.Timestamp.now(tz="UTC").isoformat()
+
+
+def _safe_float(value: object, default: float = np.nan) -> float:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) and np.isfinite(float(numeric)) else float(default)
+
+
+def _probability_to_american_numeric(probability: object) -> float:
+    p = _safe_float(probability)
+    if not np.isfinite(p) or not 0 < p < 1:
+        return np.nan
+    return float(-100.0 * p / (1.0 - p)) if p >= 0.5 else float(100.0 * (1.0 - p) / p)
+
+
+def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
+    columns = []
+    for feature in ML_FEATURES:
+        values = pd.to_numeric(frame.get(feature, ML_DEFAULTS[feature]), errors="coerce")
+        if not isinstance(values, pd.Series):
+            values = pd.Series(values, index=frame.index)
+        columns.append(values.fillna(ML_DEFAULTS[feature]).to_numpy(dtype=float))
+    return np.column_stack(columns)
+
+
+def _fit_logistic_numpy(x: np.ndarray, y: np.ndarray, iterations: int = 1800, learning_rate: float = 0.04, l2: float = 0.002) -> tuple[float, np.ndarray]:
+    intercept = 0.0
+    weights = np.zeros(x.shape[1], dtype=float)
+    count = max(len(y), 1)
+    for _ in range(iterations):
+        prediction = _sigmoid(intercept + x @ weights)
+        error = prediction - y
+        intercept -= learning_rate * float(np.mean(error))
+        weights -= learning_rate * ((x.T @ error) / count + l2 * weights)
+    return float(intercept), weights
+
+
+def _metric_bundle(probability: np.ndarray, outcome: np.ndarray) -> dict[str, float]:
+    p = _clip_probability(probability)
+    y = np.asarray(outcome, dtype=float)
+    return {
+        "brier": float(np.mean(np.square(p - y))),
+        "logloss": float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))),
+        "accuracy": float(np.mean((p >= 0.5) == y)),
+    }
+
+
+def _historical_game_rows(prepared: pd.DataFrame, source_start: str, source_end: str) -> pd.DataFrame:
+    if prepared is None or prepared.empty:
+        return pd.DataFrame()
+    work = prepared.copy()
+    work["player_id"] = pd.to_numeric(work.get("batter"), errors="coerce")
+    work["game_pk"] = pd.to_numeric(work.get("game_pk"), errors="coerce")
+    work["game_date"] = pd.to_datetime(work.get("game_date"), errors="coerce")
+    work = work.dropna(subset=["player_id", "game_pk", "game_date", "pa_key"])
+    if work.empty:
+        return pd.DataFrame()
+    names = lookup_names(tuple(work["player_id"].dropna().astype(int).unique().tolist()))
+    plate = work.sort_values(["game_date", "game_pk"]).groupby(
+        ["game_date", "game_pk", "player_id", "pa_key"], as_index=False
+    ).agg(
+        is_hit=("is_hit", "max"), is_k=("is_k", "max"),
+        xhit=("xba_value", "max"), swings=("is_swing", "sum"),
+        contacts=("is_contact", "sum"), bbe=("is_bbe", "max"),
+        hard_hit=("is_hard_hit", "max"), line_drive=("is_line_drive", "max"),
+    )
+    games = plate.groupby(["game_date", "game_pk", "player_id"], as_index=False).agg(
+        PA=("pa_key", "size"), Hits=("is_hit", "sum"), xHits=("xhit", "sum"),
+        K=("is_k", "sum"), Swings=("swings", "sum"), Contacts=("contacts", "sum"),
+        BBE=("bbe", "sum"), HardHits=("hard_hit", "sum"), LineDrives=("line_drive", "sum"),
+    ).sort_values(["player_id", "game_date", "game_pk"])
+    cumulative_columns = ["PA", "Hits", "xHits", "K", "Swings", "Contacts", "BBE", "HardHits", "LineDrives"]
+    for column in cumulative_columns:
+        games[f"Prior_{column}"] = games.groupby("player_id")[column].transform(lambda values: values.cumsum().shift(1)).fillna(0.0)
+    prior_pa = games["Prior_PA"]
+    games["Hit_PA"] = (games["Prior_Hits"] + 0.225 * 80.0) / (prior_pa + 80.0)
+    games["xHit_PA"] = (games["Prior_xHits"] + 0.225 * 80.0) / (prior_pa + 80.0)
+    games["Contact_Pct"] = (games["Prior_Contacts"] + 0.76 * 120.0) / (games["Prior_Swings"] + 120.0)
+    games["K_Pct"] = (games["Prior_K"] + 0.23 * 80.0) / (prior_pa + 80.0)
+    games["HH_Pct"] = (games["Prior_HardHits"] + 0.38 * 60.0) / (games["Prior_BBE"] + 60.0)
+    games["LD_Pct"] = (games["Prior_LineDrives"] + 0.24 * 60.0) / (games["Prior_BBE"] + 60.0)
+    games["Projected_PA"] = 4.2
+    games["actual_hit"] = games["Hits"].gt(0).astype(int)
+    games = games.merge(names, on="player_id", how="left")
+    games["source_start"] = source_start
+    games["source_end"] = source_end
+    return games
+
+
+def persist_historical_games(rows: pd.DataFrame) -> int:
+    if rows is None or rows.empty:
+        return 0
+    now = utc_now_text()
+    records = []
+    for row in rows.itertuples(index=False):
+        records.append((
+            str(pd.Timestamp(row.game_date).date()), int(row.game_pk), int(row.player_id),
+            str(getattr(row, "Player", "") or ""), float(row.Hit_PA), float(row.xHit_PA),
+            float(row.Contact_Pct), float(row.K_Pct), float(row.HH_Pct), float(row.LD_Pct),
+            float(row.Projected_PA), int(row.actual_hit), int(row.Hits), int(row.PA),
+            str(row.source_start), str(row.source_end), now,
+        ))
+    with hit_db_connect() as connection:
+        connection.executemany(
+            """INSERT INTO historical_games (
+                slate_date, game_pk, player_id, player_name, hit_pa, xhit_pa,
+                contact_pct, k_pct, hh_pct, ld_pct, projected_pa, actual_hit,
+                actual_hits, actual_pa, source_start, source_end, created_at_utc
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(game_pk, player_id) DO UPDATE SET
+                player_name=excluded.player_name, hit_pa=excluded.hit_pa,
+                xhit_pa=excluded.xhit_pa, contact_pct=excluded.contact_pct,
+                k_pct=excluded.k_pct, hh_pct=excluded.hh_pct, ld_pct=excluded.ld_pct,
+                projected_pa=excluded.projected_pa, actual_hit=excluded.actual_hit,
+                actual_hits=excluded.actual_hits, actual_pa=excluded.actual_pa,
+                source_start=excluded.source_start, source_end=excluded.source_end,
+                created_at_utc=excluded.created_at_utc""",
+            records,
+        )
+    return len(records)
+
+
+def run_historical_statcast_backfill(start_value: date, end_value: date, chunk_days: int = 14) -> dict:
+    if start_value > end_value:
+        raise ValueError("Backfill start date must be on or before the end date.")
+    cursor = start_value
+    summary = {"chunks": 0, "rows_written": 0, "errors": []}
+    prepared_chunks: list[pd.DataFrame] = []
+    while cursor <= end_value:
+        chunk_end = min(cursor + timedelta(days=max(int(chunk_days), 1) - 1), end_value)
+        try:
+            raw = load_statcast(cursor.isoformat(), chunk_end.isoformat())
+            prepared = prepare_data(raw)
+            if prepared is not None and not prepared.empty:
+                prepared_chunks.append(prepared)
+            summary["chunks"] += 1
+        except Exception as exc:
+            summary["errors"].append(f"{cursor} to {chunk_end}: {type(exc).__name__}: {exc}")
+        cursor = chunk_end + timedelta(days=1)
+    if prepared_chunks:
+        combined = pd.concat(prepared_chunks, ignore_index=True, sort=False)
+        historical = _historical_game_rows(combined, start_value.isoformat(), end_value.isoformat())
+        summary["rows_written"] = persist_historical_games(historical)
+    return summary
+
+
+def historical_training_frame() -> pd.DataFrame:
+    query = """SELECT slate_date AS SlateDate, game_pk AS GamePk, player_id AS PlayerID,
+        player_name AS Player, hit_pa AS Hit_PA, xhit_pa AS xHit_PA,
+        contact_pct AS Contact_Pct, k_pct AS K_Pct, hh_pct AS HH_Pct,
+        ld_pct AS LD_Pct, projected_pa AS Projected_PA, actual_hit AS ActualHit
+        FROM historical_games ORDER BY slate_date, game_pk, player_id"""
+    with hit_db_connect() as connection:
+        return pd.read_sql_query(query, connection)
+
+
+def train_chronological_hit_model(minimum_rows: int = 500) -> dict:
+    history = historical_training_frame()
+    if len(history) < minimum_rows or history["ActualHit"].nunique() < 2:
+        raise ValueError(f"At least {minimum_rows:,} historical player-games with both outcomes are required; found {len(history):,}.")
+    history["SlateDate"] = pd.to_datetime(history["SlateDate"], errors="coerce")
+    history = history.dropna(subset=["SlateDate"]).sort_values(["SlateDate", "GamePk", "PlayerID"]).reset_index(drop=True)
+    n = len(history)
+    train_end = max(int(n * 0.70), 1)
+    calibration_end = max(int(n * 0.80), train_end + 1)
+    train = history.iloc[:train_end]
+    calibration = history.iloc[train_end:calibration_end]
+    holdout = history.iloc[calibration_end:]
+    if calibration.empty or holdout.empty or train["ActualHit"].nunique() < 2:
+        raise ValueError("Chronological train/calibration/holdout split did not contain enough outcome variation.")
+    x_train_raw = _feature_matrix(train)
+    mean = x_train_raw.mean(axis=0)
+    scale = x_train_raw.std(axis=0)
+    scale[scale < 1e-8] = 1.0
+    x_train = (x_train_raw - mean) / scale
+    intercept, weights = _fit_logistic_numpy(x_train, train["ActualHit"].to_numpy(dtype=float))
+    def raw_probability(frame: pd.DataFrame) -> np.ndarray:
+        return _sigmoid(intercept + ((_feature_matrix(frame) - mean) / scale) @ weights)
+    calibration_raw = raw_probability(calibration)
+    calibration_x = _logit(calibration_raw).reshape(-1, 1)
+    calibration_intercept, calibration_weight = _fit_logistic_numpy(
+        calibration_x, calibration["ActualHit"].to_numpy(dtype=float),
+        iterations=1400, learning_rate=0.03, l2=0.001,
+    )
+    holdout_raw = raw_probability(holdout)
+    holdout_calibrated = _sigmoid(calibration_intercept + calibration_weight[0] * _logit(holdout_raw))
+    raw_metrics = _metric_bundle(holdout_raw, holdout["ActualHit"].to_numpy(dtype=float))
+    calibrated_metrics = _metric_bundle(holdout_calibrated, holdout["ActualHit"].to_numpy(dtype=float))
+    trained_at = utc_now_text()
+    training_end_date = str(train["SlateDate"].max().date())
+    model_version = f"hits-ml-{pd.Timestamp(trained_at).strftime('%Y%m%dT%H%M%SZ')}"
+    payload = {
+        "schema_version": PERSISTENCE_VERSION, "target": "1+ hit",
+        "model_version": model_version, "trained_at_utc": trained_at,
+        "training_end_date": training_end_date, "features": ML_FEATURES,
+        "feature_mean": mean.tolist(), "feature_scale": scale.tolist(),
+        "intercept": intercept, "weights": weights.tolist(),
+        "calibration_intercept": calibration_intercept,
+        "calibration_slope": float(calibration_weight[0]),
+        "rows_total": n, "rows_train": len(train),
+        "rows_calibration": len(calibration), "rows_holdout": len(holdout),
+        "holdout_raw_brier": raw_metrics["brier"],
+        "holdout_calibrated_brier": calibrated_metrics["brier"],
+        "holdout_raw_logloss": raw_metrics["logloss"],
+        "holdout_calibrated_logloss": calibrated_metrics["logloss"],
+        "holdout_accuracy": calibrated_metrics["accuracy"],
+    }
+    paths = persistence_paths()
+    paths["model"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    paths["calibration"].write_text(json.dumps({
+        "model_version": model_version, "trained_at_utc": trained_at,
+        "method": "chronological Platt scaling",
+        "intercept": calibration_intercept, "slope": float(calibration_weight[0]),
+        "calibration_rows": len(calibration),
+    }, indent=2), encoding="utf-8")
+    with hit_db_connect() as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO training_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (model_version, trained_at, training_end_date, n, len(train), len(calibration), len(holdout),
+             raw_metrics["brier"], calibrated_metrics["brier"], raw_metrics["logloss"],
+             calibrated_metrics["logloss"], calibrated_metrics["accuracy"], json.dumps(payload)),
+        )
+    return payload
+
+
+def load_saved_hit_model() -> dict | None:
+    path = persistence_paths()["model"]
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if payload.get("features") == ML_FEATURES else None
+    except Exception:
+        return None
+
+
+def add_ml_hit_predictions(board: pd.DataFrame, model: dict | None) -> pd.DataFrame:
+    output = board.copy()
+    output["Raw_ML_Hit_Probability"] = np.nan
+    output["Calibrated_ML_Hit_Probability"] = np.nan
+    output["ML_Fair_Odds"] = np.nan
+    output["ML_Model_Version"] = "Not trained"
+    output["ML_Training_Date"] = ""
+    if not model or output.empty:
+        return output
+    mean = np.asarray(model["feature_mean"], dtype=float)
+    scale = np.asarray(model["feature_scale"], dtype=float)
+    weights = np.asarray(model["weights"], dtype=float)
+    raw = _sigmoid(float(model["intercept"]) + ((_feature_matrix(output) - mean) / scale) @ weights)
+    calibrated = _sigmoid(float(model["calibration_intercept"]) + float(model["calibration_slope"]) * _logit(raw))
+    output["Raw_ML_Hit_Probability"] = raw
+    output["Calibrated_ML_Hit_Probability"] = calibrated
+    output["ML_Fair_Odds"] = pd.Series(calibrated, index=output.index).map(_probability_to_american_numeric)
+    output["ML_Model_Version"] = str(model.get("model_version", ""))
+    output["ML_Training_Date"] = str(model.get("trained_at_utc", ""))
+    return output
+
+
+def save_pregame_predictions(board: pd.DataFrame, matchup: dict, lineup_status: str) -> int:
+    if board is None or board.empty or not matchup.get("game_pk"):
+        return 0
+    game_pk = int(matchup["game_pk"])
+    slate_date = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    status = str(matchup.get("status") or "").lower()
+    if any(word in status for word in ["final", "completed", "game over", "in progress", "live", "delayed"]):
+        return 0
+    scheduled = pd.to_datetime(matchup.get("game_datetime_utc"), utc=True, errors="coerce")
+    if pd.notna(scheduled) and pd.Timestamp.now(tz="UTC") >= scheduled:
+        return 0
+    generated = utc_now_text()
+    opponent = str(matchup.get("pitcher_name") or "")
+    records = []
+    for _, row in board.iterrows():
+        player_id = pd.to_numeric(pd.Series([row.get("player_id")]), errors="coerce").iloc[0]
+        if pd.isna(player_id):
+            continue
+        version = str(row.get("ML_Model_Version") or "Not trained")
+        records.append((
+            slate_date, game_pk, int(player_id), str(row.get("Player") or ""),
+            str(matchup.get("batting_team") or ""), opponent, generated,
+            str(matchup.get("game_datetime_utc") or ""), lineup_status,
+            _safe_float(row.get("Model_1plus_Hit")), _safe_float(row.get("HitScore")),
+            _safe_float(row.get("Raw_ML_Hit_Probability")),
+            _safe_float(row.get("Calibrated_ML_Hit_Probability")),
+            _safe_float(row.get("ML_Fair_Odds")), version,
+            str(row.get("ML_Training_Date") or ""), _safe_float(row.get("Market_Line")),
+            _safe_float(row.get("Over_Odds")), _safe_float(row.get("Market_Over_Prob")),
+        ))
+    with hit_db_connect() as connection:
+        connection.executemany(
+            """INSERT INTO predictions (
+                slate_date, game_pk, player_id, player_name, batting_team, opponent,
+                generated_at_utc, game_datetime_utc, lineup_status,
+                existing_probability, hit_score, raw_ml_probability,
+                calibrated_ml_probability, ml_fair_odds, model_version,
+                training_date, market_line, over_odds, market_probability
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(slate_date, game_pk, player_id, model_version) DO UPDATE SET
+                player_name=excluded.player_name, batting_team=excluded.batting_team,
+                opponent=excluded.opponent, generated_at_utc=excluded.generated_at_utc,
+                game_datetime_utc=excluded.game_datetime_utc,
+                lineup_status=excluded.lineup_status,
+                existing_probability=excluded.existing_probability,
+                hit_score=excluded.hit_score,
+                raw_ml_probability=excluded.raw_ml_probability,
+                calibrated_ml_probability=excluded.calibrated_ml_probability,
+                ml_fair_odds=excluded.ml_fair_odds,
+                training_date=excluded.training_date, market_line=excluded.market_line,
+                over_odds=excluded.over_odds, market_probability=excluded.market_probability
+            """,
+            records,
+        )
+    return len(records)
+
+
+def grade_pending_predictions() -> dict[str, int]:
+    today_text = str(date.today())
+    with hit_db_connect() as connection:
+        games = connection.execute(
+            """SELECT DISTINCT game_pk FROM predictions
+               WHERE result_status='Pending' AND slate_date < ?""", (today_text,)
+        ).fetchall()
+    summary = {"games_checked": 0, "rows_graded": 0, "games_pending": 0, "errors": 0}
+    for game in games:
+        game_pk = int(game["game_pk"])
+        try:
+            result = fetch_completed_batter_results(game_pk)
+            summary["games_checked"] += 1
+            if not result.get("final"):
+                summary["games_pending"] += 1
+                continue
+            official = result.get("data", pd.DataFrame())
+            if official is None or official.empty:
+                official_by_player = {}
+            else:
+                official_by_player = {
+                    int(row.PlayerID): row
+                    for row in official.itertuples(index=False)
+                    if pd.notna(getattr(row, "PlayerID", np.nan))
+                }
+            graded_at = utc_now_text()
+            with hit_db_connect() as connection:
+                pending = connection.execute(
+                    "SELECT player_id FROM predictions WHERE game_pk=? AND result_status='Pending'", (game_pk,)
+                ).fetchall()
+                for row in pending:
+                    player = official_by_player.get(int(row["player_id"]))
+                    hits = int(getattr(player, "Actual_Hits", 0) or 0)
+                    pa = int(getattr(player, "Actual_PA", 0) or 0)
+                    if player is None or pa <= 0:
+                        connection.execute(
+                            """UPDATE predictions SET result_status='No PA', graded_at_utc=?
+                               WHERE game_pk=? AND player_id=? AND result_status='Pending'""",
+                            (graded_at, game_pk, int(row["player_id"])),
+                        )
+                        continue
+                    connection.execute(
+                        """UPDATE predictions SET actual_hit=?, actual_hits=?, actual_pa=?,
+                           result_status='Final', graded_at_utc=?
+                           WHERE game_pk=? AND player_id=? AND result_status='Pending'""",
+                        (int(hits > 0), hits, pa, graded_at, game_pk, int(row["player_id"])),
+                    )
+                    summary["rows_graded"] += 1
+        except Exception:
+            summary["errors"] += 1
+    return summary
+
+
+def forward_performance_frame() -> pd.DataFrame:
+    with hit_db_connect() as connection:
+        return pd.read_sql_query(
+            """SELECT * FROM predictions WHERE result_status='Final'
+               ORDER BY slate_date, game_pk, player_id""", connection
+        )
+
+
+def forward_performance_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    rows = []
+    for label, column in [
+        ("Existing dashboard probability", "existing_probability"),
+        ("Raw ML probability", "raw_ml_probability"),
+        ("Calibrated ML probability", "calibrated_ml_probability"),
+    ]:
+        valid = frame[[column, "actual_hit"]].apply(pd.to_numeric, errors="coerce").dropna()
+        if valid.empty:
+            continue
+        metrics = _metric_bundle(valid[column].to_numpy(), valid["actual_hit"].to_numpy())
+        rows.append({"Probability": label, "Rows": len(valid), "Brier": metrics["brier"], "Log Loss": metrics["logloss"], "Accuracy": metrics["accuracy"], "Actual Hit Rate": valid["actual_hit"].mean(), "Average Forecast": valid[column].mean()})
+    return pd.DataFrame(rows)
+
+
+def render_persistent_ml_section() -> None:
+    st.divider()
+    st.markdown("### Persistent database, ML model, and forward results")
+    st.caption(
+        "Pregame predictions save automatically to SQLite. Completed games are graded "
+        "from official MLB results, so a daily master CSV is no longer required."
+    )
+    paths = persistence_paths()
+    model = load_saved_hit_model()
+    with hit_db_connect() as connection:
+        historical_count = int(connection.execute("SELECT COUNT(*) FROM historical_games").fetchone()[0])
+        prediction_count = int(connection.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
+        pending_count = int(connection.execute("SELECT COUNT(*) FROM predictions WHERE result_status='Pending'").fetchone()[0])
+        final_count = int(connection.execute("SELECT COUNT(*) FROM predictions WHERE result_status='Final'").fetchone()[0])
+    status_columns = st.columns(4)
+    status_columns[0].metric("Historical player-games", f"{historical_count:,}")
+    status_columns[1].metric("Saved predictions", f"{prediction_count:,}")
+    status_columns[2].metric("Pending grades", f"{pending_count:,}")
+    status_columns[3].metric("Forward results", f"{final_count:,}")
+    if model:
+        st.success(
+            f"Saved hit model active · {model.get('model_version')} · trained "
+            f"{str(model.get('trained_at_utc', ''))[:10]} · holdout rows "
+            f"{int(model.get('rows_holdout', 0)):,}"
+        )
+        model_metrics = pd.DataFrame([{
+            "Training end": model.get("training_end_date"),
+            "Raw holdout Brier": model.get("holdout_raw_brier"),
+            "Calibrated holdout Brier": model.get("holdout_calibrated_brier"),
+            "Raw holdout log loss": model.get("holdout_raw_logloss"),
+            "Calibrated holdout log loss": model.get("holdout_calibrated_logloss"),
+            "Holdout accuracy": model.get("holdout_accuracy"),
+        }])
+        st.dataframe(model_metrics.style.format({
+            "Raw holdout Brier": "{:.4f}", "Calibrated holdout Brier": "{:.4f}",
+            "Raw holdout log loss": "{:.4f}", "Calibrated holdout log loss": "{:.4f}",
+            "Holdout accuracy": "{:.1%}",
+        }), hide_index=True, use_container_width=True)
+    else:
+        st.info("No saved ML hit model yet. Backfill historical Statcast rows, then train chronologically.")
+
+    backfill_tab, training_tab, forward_tab = st.tabs(["Historical backfill", "Train & holdout", "Forward performance"])
+    with backfill_tab:
+        default_end = date.today() - timedelta(days=1)
+        default_start = max(date(default_end.year - 1, 3, 20), default_end - timedelta(days=365))
+        date_columns = st.columns(2)
+        backfill_start = date_columns[0].date_input("Backfill start", value=default_start, max_value=default_end, key="hits_db_backfill_start")
+        backfill_end = date_columns[1].date_input("Backfill end", value=default_end, max_value=default_end, key="hits_db_backfill_end")
+        st.caption("Data is downloaded in 14-day chunks and upserted by game and player, so rerunning overlapping dates does not duplicate rows.")
+        if st.button("Run historical Statcast backfill", type="primary", key="hits_db_run_backfill"):
+            with st.spinner("Downloading and storing historical Statcast player-games..."):
+                result = run_historical_statcast_backfill(backfill_start, backfill_end)
+            if result["errors"]:
+                st.warning(f"Stored {result['rows_written']:,} rows across {result['chunks']:,} chunks with {len(result['errors'])} chunk error(s).")
+                with st.expander("Backfill errors"):
+                    st.code("\n".join(result["errors"]))
+            else:
+                st.success(f"Backfill complete: {result['rows_written']:,} player-games processed across {result['chunks']:,} chunks.")
+            st.rerun()
+    with training_tab:
+        minimum_rows = st.number_input("Minimum historical rows", min_value=200, max_value=100000, value=500, step=100, key="hits_db_min_training_rows")
+        st.caption("Split order is fixed chronologically: first 70% training, next 10% calibration, newest 20% untouched holdout.")
+        if st.button("Train and save chronological hit model", type="primary", key="hits_db_train_model"):
+            try:
+                with st.spinner("Training model, fitting calibration, and scoring the newest holdout..."):
+                    trained = train_chronological_hit_model(int(minimum_rows))
+                st.success(f"Saved {trained['model_version']} with {trained['rows_holdout']:,} untouched holdout rows.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Training failed: {type(exc).__name__}: {exc}")
+        if model:
+            st.download_button("Download saved hit model", paths["model"].read_bytes(), "hits_ml_model.json", "application/json", key="hits_download_ml_model")
+            st.download_button("Download saved ML calibration", paths["calibration"].read_bytes(), "hits_ml_calibration.json", "application/json", key="hits_download_ml_calibration")
+    with forward_tab:
+        if st.button("Fetch and grade completed results now", key="hits_db_grade_now"):
+            result = grade_pending_predictions()
+            st.success(f"Checked {result['games_checked']:,} games and graded {result['rows_graded']:,} prediction rows.")
+            st.rerun()
+        forward = forward_performance_frame()
+        summary = forward_performance_summary(forward)
+        if summary.empty:
+            st.info("Forward metrics appear after saved pregame predictions have completed and been graded.")
+        else:
+            st.dataframe(summary.style.format({
+                "Brier": "{:.4f}", "Log Loss": "{:.4f}", "Accuracy": "{:.1%}",
+                "Actual Hit Rate": "{:.1%}", "Average Forecast": "{:.1%}",
+            }), hide_index=True, use_container_width=True)
+            by_version = forward.groupby("model_version", dropna=False).agg(
+                Rows=("actual_hit", "size"), Actual_Hit_Rate=("actual_hit", "mean"),
+                Average_ML_Probability=("calibrated_ml_probability", "mean"),
+                First_Date=("slate_date", "min"), Last_Date=("slate_date", "max"),
+            ).reset_index().sort_values("Last_Date", ascending=False)
+            st.dataframe(by_version.style.format({"Actual_Hit_Rate": "{:.1%}", "Average_ML_Probability": "{:.1%}"}), hide_index=True, use_container_width=True)
+            st.download_button("Download forward results CSV", forward.to_csv(index=False).encode("utf-8"), "hits_forward_results.csv", "text/csv", key="hits_download_forward")
+    st.caption(f"Persistent data directory: {paths['root']}")
+
+
+initialize_hit_database()
 
 
 def american_odds_to_probability(value: object) -> float:
@@ -4993,9 +5595,30 @@ rankings = apply_binary_probability_calibration(
 rankings, loaded_odds_quotes, odds_source_mode = render_batter_odds_section(
     rankings, matchup, odds_api_key, "clean_hits"
 )
+saved_hit_model = load_saved_hit_model()
+rankings = add_ml_hit_predictions(rankings, saved_hit_model)
+lineup_status_for_persistence = (
+    str(lineup_result.get("status")) if isinstance(lineup_result, dict)
+    else ("Manual" if not lineup_game_pk else "Recent lineup fallback")
+)
+saved_prediction_rows = save_pregame_predictions(
+    rankings, matchup, lineup_status_for_persistence
+)
+automatic_grade_hour = pd.Timestamp.now(tz="UTC").floor("h").isoformat()
+if st.session_state.get("hits_automatic_grade_hour") != automatic_grade_hour:
+    st.session_state["hits_automatic_grade_summary"] = grade_pending_predictions()
+    st.session_state["hits_automatic_grade_hour"] = automatic_grade_hour
 
 render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HIT BOARD")
 render_leader_cards(rankings, "Model_1plus_Hit", "HitScore", "model 1+ hit")
+if saved_hit_model:
+    st.caption(
+        f"ML model {saved_hit_model.get('model_version')} · trained "
+        f"{str(saved_hit_model.get('trained_at_utc', ''))[:10]} · "
+        f"{saved_prediction_rows:,} pregame rows persisted for this matchup."
+    )
+else:
+    st.caption(f"{saved_prediction_rows:,} pregame rows persisted. Train the chronological ML model in Backtest & calibration to add ML probabilities.")
 
 quick_tab, contact_tab, matchup_tab, bvp_tab, pitcher_tab, slate_tab, backtest_tab, notes_tab = st.tabs(
     [
@@ -5007,7 +5630,8 @@ quick_tab, contact_tab, matchup_tab, bvp_tab, pitcher_tab, slate_tab, backtest_t
 with quick_tab:
     quick_columns = [
         "Rank", "Player", "LineupSpot", "Projected_PA", "Projected_Hits", "Model_1plus_Hit", "Model_2plus_Hit",
-        "Raw_Model_1plus_Hit", "HitScore", "Confidence_Level", "Adj_xHit_PA", "Contact_Pct", "K_Pct",
+        "Raw_Model_1plus_Hit", "Raw_ML_Hit_Probability", "Calibrated_ML_Hit_Probability", "ML_Fair_Odds",
+        "ML_Model_Version", "ML_Training_Date", "HitScore", "Confidence_Level", "Adj_xHit_PA", "Contact_Pct", "K_Pct",
         "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
         "PitchMatchScore", "ZoneFitScore", "ParkFactor", "Market_Line",
         "Over_Odds", "Under_Odds", "Market_Over_Prob", "Model_Market_Edge", "Line_Source",
@@ -5018,6 +5642,8 @@ with quick_tab:
     quick = quick.rename(columns={
         "LineupSpot": "Order", "Projected_PA": "Proj PA", "Projected_Hits": "Proj Hits", "Model_1plus_Hit": "1+ Hit",
         "Model_2plus_Hit": "2+ Hit", "Raw_Model_1plus_Hit": "Raw 1+ Hit", "HitScore": "Hit Score", "Confidence_Level": "Confidence",
+        "Raw_ML_Hit_Probability": "Raw ML Hit", "Calibrated_ML_Hit_Probability": "Calibrated ML Hit",
+        "ML_Fair_Odds": "ML Fair Odds", "ML_Model_Version": "Model Version", "ML_Training_Date": "Training Date",
         "Adj_xHit_PA": "Adj xHit/PA", "Contact_Pct": "Contact%", "K_Pct": "K%",
         "EffectiveStand": "Bats vs SP", "PitcherSideRead": "Pitcher Read",
         "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
@@ -5031,6 +5657,7 @@ with quick_tab:
         cmap="RdYlGn", subset=["Hit Score", "Side Attack", "Pitch Match", "Zone Fit"], vmin=0, vmax=100
     ).format({
         "Order": "{:.0f}", "Proj PA": "{:.2f}", "Proj Hits": "{:.2f}", "1+ Hit": "{:.1%}", "2+ Hit": "{:.1%}", "Raw 1+ Hit": "{:.1%}",
+        "Raw ML Hit": "{:.1%}", "Calibrated ML Hit": "{:.1%}", "ML Fair Odds": "{:+.0f}",
         "Hit Score": "{:.1f}", "Adj xHit/PA": "{:.1%}", "Contact%": "{:.1%}",
         "K%": "{:.1%}", "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}",
         "Park Factor": "{:.0f}", "Line": "{:.1f}", "Over Odds": "{:+.0f}",
@@ -5226,6 +5853,7 @@ with backtest_tab:
             f"clean_hits_slate_whole_slate_board_{str(pd.Timestamp(matchup.get('slate_date') or date.today()).date())}"
         ),
     )
+    render_persistent_ml_section()
 
 with notes_tab:
     st.markdown(
@@ -5245,8 +5873,8 @@ with notes_tab:
         - **Automatic odds** can populate current-game or whole-slate lines, no-vig probability and model edge from The Odds API.
         - **Slate Top 10 & pairings** builds both offenses across the slate, grades hitters from probability, model score and confidence, and creates multiple diversified three-person suggestions.
         - **Backtest & calibration** exports timestamped pregame snapshots, retrieves official results, checks Brier score/log loss, validates Hit Score buckets and creates a probability-calibration JSON.
-        - Download the updated master-history CSV after every result update because Streamlit temporary storage can reset.
+        - **Persistent SQLite + ML** automatically stores pregame predictions, grades completed MLB results, supports historical Statcast backfills, uses chronological train/calibration/holdout splits, saves the hit model and calibration, and tracks forward performance without a daily master CSV.
 
-        The probabilities remain heuristic until tested and calibrated on held-out historical games.
+        The original dashboard probability and Hit Score remain unchanged. Raw ML Hit and Calibrated ML Hit are separate learned signals, and the newest chronological holdout plus forward results should determine how much trust to place in them.
         """
     )
