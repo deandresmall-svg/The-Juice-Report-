@@ -1,16 +1,3 @@
-"""Memory-safe MLB pitcher strikeout backfill runner for Google Colab or local use.
-
-Colab quick start:
-    !pip -q install pybaseball pandas numpy
-    # Upload this file with the Colab Files panel, then run:
-    !python pitcher_k_backfill_colab.py --start 2025-03-27 --end 2025-09-28
-
-The script downloads Statcast in small date chunks, immediately reduces every
-chunk to one row per starter/game, checkpoints progress, and releases the raw
-pitch data before continuing. Re-running the same command resumes completed
-chunks. The final CSV is compatible with pitcher-lab two-stage K model v5.
-"""
-
 from __future__ import annotations
 
 import argparse
