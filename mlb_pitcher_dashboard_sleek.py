@@ -53,16 +53,18 @@ OUTS_BY_EVENT = {
     "sac_fly_double_play": 2,
 }
 
-MODEL_VERSION = "pitcher-lab-two-stage-k-v5"
-K_MODEL_VERSION = "two-stage-k-v5"
-K_BACKFILL_VERSION = "opponent-offense-k-v2"
+MODEL_VERSION = "pitcher-lab-two-stage-k-v6"
+K_MODEL_VERSION = "two-stage-k-v6"
+K_BACKFILL_VERSION = "historical-lineup-pitch-fit-v3"
+SUPPORTED_K_MODEL_VERSIONS = {"two-stage-k-v5", K_MODEL_VERSION}
 BF_MODEL_FEATURES = [
     "Season_BF", "Recent_BF", "Last_Start_Pitches", "Last3_Pitches",
     "Recent_Outs", "Outs_SD", "Short_Hook_Rate", "Prior_Starts",
 ]
 K_RATE_MODEL_FEATURES = [
     "Pitcher_K_Rate", "Recent_K_Rate", "Whiff_Pct", "CSW_Pct",
-    "Opponent_K_Rate", "Hand_L",
+    "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate",
+    "PitchMix_Opp_Whiff", "Hand_L",
 ]
 ODDS_API_SPORT = "baseball_mlb"
 ODDS_API_MARKETS = {
@@ -989,7 +991,10 @@ def build_chronological_k_backfill(df: pd.DataFrame, target_start: object, targe
         recent_outs = float(recent["Actual_Outs"].mean())
         short_hook = float(pitcher_prior["Actual_Outs"].lt(15).mean())
         rows.append({
-            "BackfillVersion": K_BACKFILL_VERSION,
+            # The in-app builder intentionally remains marked legacy because
+            # it does not retain the compact hitter/pitch histories required
+            # for the v3 lineup matchup. Use the Colab runner for v3 training.
+            "BackfillVersion": "streamlit-legacy-team-k-v2",
             "Date": str(current_date.date()), "GamePK": int(current.GamePK), "PitcherID": int(current.PitcherID),
             "Team": str(current.Team), "Opponent": str(current.Opponent), "Hand": str(current.Hand),
             "Season_BF": float(pitcher_prior["Actual_BF"].mean()),
@@ -1063,6 +1068,15 @@ def train_two_stage_k_model(backfill: pd.DataFrame, alpha: float = 8.0) -> tuple
                 f"Backfill version mismatch. Expected {K_BACKFILL_VERSION}; "
                 f"found {', '.join(sorted(versions)) or 'missing values'}."
             ),
+        }
+    missing_features = [
+        column for column in BF_MODEL_FEATURES + K_RATE_MODEL_FEATURES + ["Actual_BF", "Actual_K", "Actual_K_Rate"]
+        if column not in backfill.columns
+    ]
+    if missing_features:
+        return {}, {
+            "ok": False,
+            "message": "Backfill is missing required v3 fields: " + ", ".join(missing_features),
         }
     data = backfill.sort_values(["Date", "GamePK", "PitcherID"]).reset_index(drop=True)
     development_end = int(len(data) * 0.80)
@@ -1204,7 +1218,7 @@ def train_two_stage_k_model(backfill: pd.DataFrame, alpha: float = 8.0) -> tuple
 
 
 def parse_two_stage_k_model(payload: object) -> dict:
-    if not isinstance(payload, dict) or payload.get("version") != K_MODEL_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") not in SUPPORTED_K_MODEL_VERSIONS:
         return {}
     if not isinstance(payload.get("bf_model"), dict) or not isinstance(payload.get("rate_model"), dict):
         return {}
@@ -2150,7 +2164,11 @@ def build_pitcher_projection(
         "Short_Hook_Rate": log["Short_Hook_Rate"], "Prior_Starts": log["Starts"],
         "Pitcher_K_Rate": pitcher["K_PA"], "Recent_K_Rate": log["Recent_K_BF"],
         "Whiff_Pct": pitcher["Whiff_Pct"], "CSW_Pct": pitcher["CSW_Pct"],
-        "Opponent_K_Rate": opponent["Opp_K_PA"], "Hand_L": 1.0 if pitcher["Hand"] == "L" else 0.0,
+        "Opponent_K_Rate": opponent["Opp_K_PA"],
+        "Top6_K_Rate": opponent["Top6_K_Pct"],
+        "Bottom3_K_Rate": opponent["Bottom3_K_Pct"],
+        "PitchMix_Opp_Whiff": pitch_mix_whiff,
+        "Hand_L": 1.0 if pitcher["Hand"] == "L" else 0.0,
     }
     if model_payload:
         learned_bf = float(np.clip(_ridge_predict(model_payload["bf_model"], feature_values, rule_projected_bf), 12.0, 31.0))
@@ -3755,12 +3773,12 @@ if build_button and schedule:
 
 with st.expander("Historical K backfill & two-stage training", expanded=False):
     st.info(
-        f"Backfill schema: {K_BACKFILL_VERSION}. Legacy CSVs must be rebuilt because they measured "
-        "the opponent club's pitchers instead of the opposing hitters' K tendency."
+        f"Backfill schema: {K_BACKFILL_VERSION}. Build v3 backfills with pitcher_k_backfill_colab.py, "
+        "then upload the completed CSV here. Streamlit training remains available after upload."
     )
     st.markdown("### Chronological Statcast backfill")
     st.caption(
-        "Every training row uses only games played before that start. The first 60 days are warmup history, "
+        "Every training row uses only games played before that start. The Colab runner uses warmup history, "
         "not training targets. Download both the backfill CSV and trained JSON because Streamlit session storage is temporary."
     )
     default_backfill_end = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
@@ -3770,7 +3788,13 @@ with st.expander("Historical K backfill & two-stage training", expanded=False):
         backfill_start = st.date_input("Backfill target start", value=default_backfill_start.date(), key="k_backfill_start")
     with backfill_cols[1]:
         backfill_end = st.date_input("Backfill target end", value=default_backfill_end.date(), key="k_backfill_end")
-    build_backfill = st.button("Build chronological K backfill", type="primary", key="build_k_backfill", width="stretch")
+    build_backfill = st.button(
+        "Build chronological K backfill in Colab",
+        key="build_k_backfill",
+        width="stretch",
+        disabled=True,
+        help="The v3 hitter and pitch-history backfill is intentionally disabled in Streamlit to prevent memory crashes.",
+    )
     if build_backfill:
         target_start = pd.Timestamp(backfill_start)
         target_end = pd.Timestamp(backfill_end)
