@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import json
-import math
-import re
-import unicodedata
-from difflib import SequenceMatcher
 from datetime import date, timedelta
-from html import escape
+from difflib import SequenceMatcher
+from itertools import combinations
+import math
+import os
+import re
+import sqlite3
+import unicodedata
+import json
 from io import StringIO
 from pathlib import Path
 from typing import Iterable
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -20,9 +19,10 @@ import streamlit as st
 from pybaseball import cache, playerid_reverse_lookup, statcast
 
 
-st.set_page_config(page_title="MLB Pitcher Lab", page_icon="⚾", layout="wide")
+st.set_page_config(page_title="Advanced MLB Hit Dashboard", layout="wide")
 cache.enable()
 
+RECENT_DAYS = 14
 HIT_EVENTS = {"single", "double", "triple", "home_run"}
 STRIKEOUT_EVENTS = {"strikeout", "strikeout_double_play"}
 WALK_EVENTS = {"walk", "intent_walk"}
@@ -37,77 +37,1160 @@ SWING_DESCRIPTIONS = {
 }
 CONTACT_DESCRIPTIONS = {"hit_into_play", "foul", "foul_tip", "foul_bunt"}
 WHIFF_DESCRIPTIONS = {"swinging_strike", "swinging_strike_blocked", "missed_bunt"}
-CALLED_STRIKE_DESCRIPTIONS = {"called_strike"}
 
-OUTS_BY_EVENT = {
-    "strikeout": 1,
-    "strikeout_double_play": 2,
-    "field_out": 1,
-    "force_out": 1,
-    "fielders_choice_out": 1,
-    "grounded_into_double_play": 2,
-    "double_play": 2,
-    "triple_play": 3,
-    "sac_fly": 1,
-    "sac_bunt": 1,
-    "sac_fly_double_play": 2,
-}
 
-MODEL_VERSION = "pitcher-lab-backtest-odds-v2"
-ODDS_API_SPORT = "baseball_mlb"
-ODDS_API_MARKETS = {
-    "pitcher_strikeouts": {"prefix": "K", "label": "Strikeouts", "projection": "Proj_K"},
-    "pitcher_earned_runs": {"prefix": "ER", "label": "Earned runs", "projection": "Proj_ER"},
-    "pitcher_outs": {"prefix": "Outs", "label": "Outs", "projection": "Proj_Outs"},
-}
-ODDS_BOOKMAKERS = {
-    "hardrockbet_fl": "Hard Rock Bet FL",
-    "prizepicks": "PrizePicks",
-    "fanduel": "FanDuel",
-    "draftkings": "DraftKings",
-    "pinnacle": "Pinnacle",
-}
-ODDS_SOURCE_OPTIONS = [
-    "Hard Rock Bet FL",
-    "PrizePicks",
-    "FanDuel",
-    "DraftKings",
-    "Pinnacle",
-    "Consensus sportsbooks",
-    "Best sportsbook over line",
-    "Best sportsbook under line",
-]
-ODDS_SOURCE_TO_KEY = {title: key for key, title in ODDS_BOOKMAKERS.items()}
-SPORTSBOOK_KEYS = {"hardrockbet_fl", "fanduel", "draftkings", "pinnacle"}
+def safe_divide(numerator, denominator, default=np.nan):
+    """Divide while avoiding inf and zero-denominator errors."""
+    result = np.divide(
+        pd.to_numeric(numerator, errors="coerce"),
+        pd.to_numeric(denominator, errors="coerce"),
+    )
+    if isinstance(result, pd.Series):
+        return result.replace([np.inf, -np.inf], np.nan).fillna(default)
+    return default if not np.isfinite(result) else result
 
-TEAM_NAME_TO_ABBR = {
-    "losangelesangels": "LAA", "arizonadiamondbacks": "ARI", "athletics": "ATH",
-    "oaklandathletics": "ATH", "sacramentoathletics": "ATH", "atlantabraves": "ATL",
-    "baltimoreorioles": "BAL", "bostonredsox": "BOS", "chicagocubs": "CHC",
-    "chicagowhitesox": "CWS", "cincinnatireds": "CIN", "clevelandguardians": "CLE",
-    "coloradorockies": "COL", "detroittigers": "DET", "houstonastros": "HOU",
-    "kansascityroyals": "KC", "losangelesdodgers": "LAD", "miamimarlins": "MIA",
-    "milwaukeebrewers": "MIL", "minnesotatwins": "MIN", "newyorkmets": "NYM",
-    "newyorkyankees": "NYY", "philadelphiaphillies": "PHI", "pittsburghpirates": "PIT",
-    "sandiegopadres": "SD", "seattlemariners": "SEA", "sanfranciscogiants": "SF",
-    "stlouiscardinals": "STL", "tampabayrays": "TB", "texasrangers": "TEX",
-    "torontobluejays": "TOR", "washingtonnationals": "WSH",
-}
 
-BACKTEST_TARGETS = {
-    "Strikeouts": {
-        "projection": "Proj_K", "actual": "Actual_K", "baseline": "Baseline_K",
-        "score": "K_Score", "line": "K_Line", "lower_is_better": False,
-    },
-    "Earned runs": {
-        "projection": "Proj_ER", "actual": "Actual_ER", "baseline": "Baseline_ER",
-        "score": "Run_Prevention_Score", "line": "ER_Line", "lower_is_better": True,
-    },
-    "Outs": {
-        "projection": "Proj_Outs", "actual": "Actual_Outs", "baseline": "Baseline_Outs",
-        "score": "Outs_Score", "line": "Outs_Line", "lower_is_better": False,
-    },
-}
+def percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() <= 1 or numeric.nunique(dropna=True) <= 1:
+        return pd.Series(50.0, index=series.index)
+    ranked = numeric.rank(pct=True, method="average") * 100
+    if not higher_is_better:
+        ranked = 100 - ranked
+    return ranked.fillna(50.0)
+
+
+def shrink_rate(
+    numerator: pd.Series,
+    denominator: pd.Series,
+    league_rate: float,
+    prior_sample: float,
+) -> pd.Series:
+    num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
+    den = pd.to_numeric(denominator, errors="coerce").fillna(0.0)
+    return (num + league_rate * prior_sample) / (den + prior_sample)
+
+
+def normalize_name(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return "".join(character.lower() for character in str(value) if character.isalnum())
+
+
+def is_barrel(exit_velocity: float, launch_angle: float) -> int:
+    """Return 1 when a batted ball falls inside an approximate Statcast barrel window."""
+    ev = float(exit_velocity) if pd.notna(exit_velocity) else 0.0
+    la = float(launch_angle) if pd.notna(launch_angle) else 0.0
+
+    if ev < 98:
+        return 0
+
+    if ev >= 116:
+        min_la, max_la = 8.0, 50.0
+    else:
+        expansion = (ev - 98.0) * 2.5
+        min_la = 26.0 - expansion
+        max_la = 30.0 + expansion
+
+    return int(min_la <= la <= max_la)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
+    return statcast(
+        start_dt=start_date,
+        end_dt=end_date,
+        verbose=False,
+        parallel=False,
+    )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def lookup_names(player_ids: tuple[int, ...]) -> pd.DataFrame:
+    if not player_ids:
+        return pd.DataFrame(columns=["player_id", "Player"])
+    try:
+        lookup = playerid_reverse_lookup(list(player_ids), key_type="mlbam")
+    except Exception:
+        return pd.DataFrame(columns=["player_id", "Player"])
+    if lookup.empty:
+        return pd.DataFrame(columns=["player_id", "Player"])
+    lookup["Player"] = (
+        lookup["name_first"].fillna("").str.title()
+        + " "
+        + lookup["name_last"].fillna("").str.title()
+    ).str.strip()
+    return lookup.rename(columns={"key_mlbam": "player_id"})[["player_id", "Player"]]
+
+
+def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    df = raw.copy()
+    expected_columns = [
+        "batter",
+        "pitcher",
+        "game_pk",
+        "at_bat_number",
+        "game_date",
+        "player_name",
+        "home_team",
+        "away_team",
+        "inning_topbot",
+        "description",
+        "events",
+        "bb_type",
+        "launch_speed",
+        "launch_angle",
+        "launch_speed_angle",
+        "estimated_ba_using_speedangle",
+        "estimated_slg_using_speedangle",
+        "zone",
+        "plate_x",
+        "plate_z",
+        "pitch_name",
+        "release_speed",
+        "pfx_x",
+        "pfx_z",
+        "release_extension",
+        "stand",
+        "p_throws",
+        "hc_x",
+        "hc_y",
+    ]
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = np.nan
+
+    numeric_columns = [
+        "batter",
+        "pitcher",
+        "game_pk",
+        "at_bat_number",
+        "launch_speed",
+        "launch_angle",
+        "launch_speed_angle",
+        "estimated_ba_using_speedangle",
+        "estimated_slg_using_speedangle",
+        "zone",
+        "plate_x",
+        "plate_z",
+        "release_speed",
+        "pfx_x",
+        "pfx_z",
+        "release_extension",
+        "hc_x",
+        "hc_y",
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df["batter_team"] = np.where(
+        df["inning_topbot"].eq("Top").fillna(False),
+        df["away_team"],
+        df["home_team"],
+    )
+    df["pitcher_team"] = np.where(
+        df["inning_topbot"].eq("Top").fillna(False),
+        df["home_team"],
+        df["away_team"],
+    )
+
+    description = df["description"].fillna("").astype(str)
+    events = df["events"].fillna("").astype(str)
+    zone_numeric = pd.to_numeric(df["zone"], errors="coerce")
+
+    df["is_swing"] = description.isin(SWING_DESCRIPTIONS).fillna(False)
+    df["is_contact"] = description.isin(CONTACT_DESCRIPTIONS).fillna(False)
+    df["is_whiff"] = description.isin(WHIFF_DESCRIPTIONS).fillna(False)
+    df["is_zone"] = zone_numeric.between(1, 9, inclusive="both").fillna(False)
+    df["is_zone_swing"] = df["is_zone"] & df["is_swing"]
+    df["is_zone_contact"] = df["is_zone"] & df["is_contact"]
+    df["is_pa_end"] = events.ne("")
+    df["is_hit"] = events.isin(HIT_EVENTS)
+    df["is_hr"] = events.eq("home_run")
+    df["is_k"] = events.isin(STRIKEOUT_EVENTS)
+    df["is_walk"] = events.isin(WALK_EVENTS)
+    df["is_bbe"] = df["launch_speed"].notna() & df["launch_angle"].notna()
+    df["is_barrel"] = df["launch_speed_angle"].eq(6).fillna(False)
+    df["is_hard_hit"] = df["launch_speed"].ge(95).fillna(False)
+    df["is_sweet_spot"] = df["launch_angle"].between(8, 32, inclusive="both").fillna(False)
+
+    # Improved launch-angle features.  Missing launch angles are treated as non-matches
+    # so nullable Statcast rows do not crash when converting to integers.
+    df["Sweet_Spot"] = df["launch_angle"].between(8, 32, inclusive="both").fillna(False).astype(int)
+    df["Barrel_Range"] = (
+        (df["launch_speed"].ge(98))
+        & (
+            df["launch_angle"].between(26, 30, inclusive="both")
+            | (df["launch_speed"].ge(105) & df["launch_angle"].between(20, 35, inclusive="both"))
+        )
+    ).fillna(False).astype(int)
+
+    ev = pd.to_numeric(df["launch_speed"], errors="coerce").astype("float64")
+    la = pd.to_numeric(df["launch_angle"], errors="coerce").astype("float64")
+    barrel_expansion = (ev - 98.0) * 2.5
+    ev_ge_116 = ev.ge(116).fillna(False).to_numpy(dtype=bool)
+    barrel_min_la = np.where(ev_ge_116, 8.0, 26.0 - barrel_expansion.to_numpy(dtype=float))
+    barrel_max_la = np.where(ev_ge_116, 50.0, 30.0 + barrel_expansion.to_numpy(dtype=float))
+    dynamic_barrel_mask = (
+        ev.ge(98).fillna(False)
+        & la.ge(barrel_min_la).fillna(False)
+        & la.le(barrel_max_la).fillna(False)
+    )
+    df["Dynamic_Barrel"] = dynamic_barrel_mask.astype(int)
+
+    df["LA_Deviation_from_Optimal"] = (la - 27.0).abs()
+    df["LA_Optimization_Score"] = (100.0 - df["LA_Deviation_from_Optimal"] * 3.0).clip(0, 100).fillna(50.0)
+
+    df["is_line_drive"] = df["bb_type"].eq("line_drive").fillna(False)
+    df["is_fly_ball"] = df["bb_type"].eq("fly_ball").fillna(False)
+    df["is_ground_ball"] = df["bb_type"].eq("ground_ball").fillna(False)
+
+    df["pa_key"] = (
+        df["game_pk"].astype("Int64").astype(str)
+        + "-"
+        + df["at_bat_number"].astype("Int64").astype(str)
+    )
+
+    df["xba_value"] = df["estimated_ba_using_speedangle"].where(
+        df["is_bbe"], 0.0
+    )
+    missing_bbe_xba = df["is_bbe"] & df["xba_value"].isna()
+    df.loc[missing_bbe_xba, "xba_value"] = df.loc[
+        missing_bbe_xba, "is_hit"
+    ].astype(float)
+    df["xba_value"] = df["xba_value"].fillna(0.0)
+
+    zone_text = zone_numeric.round().astype("Int64").astype(str)
+    zone_mask = zone_numeric.between(1, 9, inclusive="both").fillna(False).to_numpy(bool)
+    df["zone_group"] = np.where(zone_mask, zone_text, "Chase")
+
+    df["speed_band"] = (df["release_speed"] / 2.0).round() * 2.0
+    df["mov_x_band"] = (df["pfx_x"] / 0.25).round() * 0.25
+    df["mov_z_band"] = (df["pfx_z"] / 0.25).round() * 0.25
+    return df
+
+
+def most_common(series: pd.Series, default: str = "") -> str:
+    mode = series.dropna().astype(str).mode()
+    return default if mode.empty else str(mode.iloc[0])
+
+
+def aggregate_hitters(df: pd.DataFrame, pitcher_hand: str, min_pa: int) -> pd.DataFrame:
+    pa = df[df["is_pa_end"]].copy()
+    pitch = df.copy()
+    bbe = df[df["is_bbe"]].copy()
+
+    pa_stats = (
+        pa.groupby(["batter", "batter_team"], dropna=False)
+        .agg(
+            PA=("pa_key", "nunique"),
+            Hits=("is_hit", "sum"),
+            HR=("is_hr", "sum"),
+            Strikeouts=("is_k", "sum"),
+            Walks=("is_walk", "sum"),
+            xHits=("xba_value", "sum"),
+            Stand=("stand", lambda x: most_common(x, "?")),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id", "batter_team": "Team"})
+    )
+
+    pitch_stats = (
+        pitch.groupby(["batter", "batter_team"], dropna=False)
+        .agg(
+            Pitches=("batter", "size"),
+            Swings=("is_swing", "sum"),
+            Contacts=("is_contact", "sum"),
+            Whiffs=("is_whiff", "sum"),
+            Zone_Swings=("is_zone_swing", "sum"),
+            Zone_Contacts=("is_zone_contact", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id", "batter_team": "Team"})
+    )
+
+    bbe_stats = (
+        bbe.groupby(["batter", "batter_team"], dropna=False)
+        .agg(
+            BBE=("is_bbe", "sum"),
+            Avg_xBA_Contact=("estimated_ba_using_speedangle", "mean"),
+            Line_Drives=("is_line_drive", "sum"),
+            Hard_Hits=("is_hard_hit", "sum"),
+            Sweet_Spots=("is_sweet_spot", "sum"),
+            Sweet_Spot=("Sweet_Spot", "sum"),
+            Barrel_Range=("Barrel_Range", "sum"),
+            Dynamic_Barrels=("Dynamic_Barrel", "sum"),
+            LA_Optimization_Score=("LA_Optimization_Score", "mean"),
+            Avg_EV=("launch_speed", "mean"),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id", "batter_team": "Team"})
+    )
+
+    board = pa_stats.merge(pitch_stats, on=["player_id", "Team"], how="left")
+    board = board.merge(bbe_stats, on=["player_id", "Team"], how="left")
+    board = board[board["PA"].ge(min_pa)].copy()
+    if board.empty:
+        return board
+
+    board["Hit_PA"] = safe_divide(board["Hits"], board["PA"])
+    board["xHit_PA"] = safe_divide(board["xHits"], board["PA"])
+    board["K_Pct"] = safe_divide(board["Strikeouts"], board["PA"])
+    board["BB_Pct"] = safe_divide(board["Walks"], board["PA"])
+    board["Contact_Pct"] = safe_divide(board["Contacts"], board["Swings"])
+    board["Whiff_Pct"] = safe_divide(board["Whiffs"], board["Swings"])
+    board["Zone_Contact_Pct"] = safe_divide(
+        board["Zone_Contacts"], board["Zone_Swings"]
+    )
+    board["LD_Pct"] = safe_divide(board["Line_Drives"], board["BBE"])
+    board["HH_Pct"] = safe_divide(board["Hard_Hits"], board["BBE"])
+    board["SweetSpot_Pct"] = safe_divide(board["Sweet_Spots"], board["BBE"])
+    board["Sweet_Spot_Pct"] = safe_divide(board.get("Sweet_Spot", 0), board["BBE"], 0.0)
+    board["Barrel_Range_Pct"] = safe_divide(board.get("Barrel_Range", 0), board["BBE"], 0.0)
+    board["Dynamic_Barrel_Pct"] = safe_divide(board.get("Dynamic_Barrels", 0), board["BBE"], 0.0)
+    board["LA_Optimization_Score"] = pd.to_numeric(
+        board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index)), errors="coerce"
+    ).fillna(50.0)
+
+    split_df = df[df["p_throws"].eq(pitcher_hand)].copy()
+    split_pa = split_df[split_df["is_pa_end"]]
+    split_stats = (
+        split_pa.groupby("batter")
+        .agg(
+            Platoon_PA=("pa_key", "nunique"),
+            Platoon_H=("is_hit", "sum"),
+            Platoon_xH=("xba_value", "sum"),
+            Platoon_K=("is_k", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id"})
+    )
+    board = board.merge(split_stats, on="player_id", how="left")
+    for column in ["Platoon_PA", "Platoon_H", "Platoon_xH", "Platoon_K"]:
+        board[column] = pd.to_numeric(board[column], errors="coerce").fillna(0)
+    return board
+
+
+def recent_hit_form(df: pd.DataFrame, player_ids: Iterable[int], end_date: pd.Timestamp) -> pd.DataFrame:
+    start = end_date - pd.Timedelta(days=RECENT_DAYS - 1)
+    recent = df[
+        df["batter"].isin(list(player_ids))
+        & df["game_date"].between(start, end_date)
+    ].copy()
+    pa = recent[recent["is_pa_end"]]
+    result = (
+        pa.groupby("batter")
+        .agg(
+            Recent_PA=("pa_key", "nunique"),
+            Recent_H=("is_hit", "sum"),
+            Recent_xH=("xba_value", "sum"),
+            Recent_K=("is_k", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id"})
+    )
+    return result
+
+
+def pitcher_hit_splits(df: pd.DataFrame, pitcher_id: int) -> pd.DataFrame:
+    rows = df[df["pitcher"].eq(pitcher_id) & df["is_pa_end"]].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=["Stand"])
+    return (
+        rows.groupby("stand")
+        .agg(
+            Pitcher_PA=("pa_key", "nunique"),
+            Pitcher_H=("is_hit", "sum"),
+            Pitcher_xH=("xba_value", "sum"),
+            Pitcher_K=("is_k", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"stand": "Stand"})
+    )
+
+
+def _attack_read(score: float) -> str:
+    if score >= 60:
+        return "ATTACK"
+    if score >= 54:
+        return "Lean attack"
+    if score > 46:
+        return "Neutral"
+    if score > 40:
+        return "Lean avoid"
+    return "AVOID"
+
+
+def pitcher_attack_profile_hits(df: pd.DataFrame, pitcher_id: int) -> pd.DataFrame:
+    """Grade how attackable the selected pitcher has been to LHB and RHB for hits."""
+    pa_all = df[df["is_pa_end"]].copy()
+    selected_pa = pa_all[pa_all["pitcher"].eq(pitcher_id)].copy()
+    bbe_all = df[df["is_bbe"]].copy()
+    selected_bbe = bbe_all[bbe_all["pitcher"].eq(pitcher_id)].copy()
+
+    rows = []
+    for side, label in [("L", "LHB"), ("R", "RHB")]:
+        league_pa = pa_all[pa_all["stand"].eq(side)]
+        pitcher_pa = selected_pa[selected_pa["stand"].eq(side)]
+        league_bbe = bbe_all[bbe_all["stand"].eq(side)]
+        pitcher_bbe = selected_bbe[selected_bbe["stand"].eq(side)]
+
+        lg_pa_n = max(int(league_pa["pa_key"].nunique()), 1)
+        p_pa_n = int(pitcher_pa["pa_key"].nunique())
+        lg_bbe_n = max(len(league_bbe), 1)
+        p_bbe_n = len(pitcher_bbe)
+
+        lg_hit = float(league_pa["is_hit"].sum() / lg_pa_n)
+        lg_xhit = float(league_pa["xba_value"].sum() / lg_pa_n)
+        lg_k = float(league_pa["is_k"].sum() / lg_pa_n)
+        lg_hh = float(league_bbe["is_hard_hit"].sum() / lg_bbe_n)
+
+        hit_rate = (float(pitcher_pa["is_hit"].sum()) + lg_hit * 140) / (p_pa_n + 140)
+        xhit_rate = (float(pitcher_pa["xba_value"].sum()) + lg_xhit * 140) / (p_pa_n + 140)
+        k_rate = (float(pitcher_pa["is_k"].sum()) + lg_k * 140) / (p_pa_n + 140)
+        hh_rate = (float(pitcher_bbe["is_hard_hit"].sum()) + lg_hh * 90) / (p_bbe_n + 90)
+
+        vulnerability_ratio = (
+            0.34 * (hit_rate / max(lg_hit, 0.0001))
+            + 0.34 * (xhit_rate / max(lg_xhit, 0.0001))
+            + 0.17 * (hh_rate / max(lg_hh, 0.0001))
+            + 0.15 * (lg_k / max(k_rate, 0.0001))
+        )
+        attack_score = float(np.clip(50 + 90 * (vulnerability_ratio - 1.0), 0, 100))
+        confidence_score = float(100 * (1 - np.exp(-p_pa_n / 150.0)))
+        confidence = "High" if confidence_score >= 70 else "Medium" if confidence_score >= 45 else "Low"
+
+        rows.append(
+            {
+                "Side": side,
+                "HitterSide": label,
+                "PitcherSideAttackScore": attack_score,
+                "PitcherSideRead": _attack_read(attack_score),
+                "PitcherSidePA": p_pa_n,
+                "Allowed_H_PA": hit_rate,
+                "Allowed_xH_PA": xhit_rate,
+                "Allowed_K_Pct": k_rate,
+                "Allowed_HH_Pct": hh_rate,
+                "AttackConfidence": confidence,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_pitcher_attack_panel(profile: pd.DataFrame, pitcher_name: str, event_label: str) -> None:
+    st.subheader("Pitcher attack / avoid map")
+    if profile.empty:
+        st.info("Not enough pitcher data was available to build the handedness map.")
+        return
+
+    best = profile.sort_values("PitcherSideAttackScore", ascending=False).iloc[0]
+    lhb = profile[profile["Side"].eq("L")].iloc[0]
+    rhb = profile[profile["Side"].eq("R")].iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Best side to target", best["HitterSide"], best["PitcherSideRead"])
+    c2.metric("LHB read", f"{lhb['PitcherSideRead']} · {lhb['PitcherSideAttackScore']:.0f}")
+    c3.metric("RHB read", f"{rhb['PitcherSideRead']} · {rhb['PitcherSideAttackScore']:.0f}")
+    st.caption(
+        f"The score compares {pitcher_name}'s handedness splits with league rates for {event_label}. "
+        "Low-sample splits are pulled strongly toward neutral."
+    )
+    with st.expander("Handedness split detail", expanded=False):
+        detail = profile[
+            [
+                "HitterSide", "PitcherSideRead", "PitcherSideAttackScore", "PitcherSidePA",
+                "Allowed_H_PA", "Allowed_xH_PA", "Allowed_K_Pct", "Allowed_HH_Pct",
+                "AttackConfidence",
+            ]
+        ].rename(
+            columns={
+                "HitterSide": "Batters", "PitcherSideRead": "Read",
+                "PitcherSideAttackScore": "Attack score", "PitcherSidePA": "PA",
+                "Allowed_H_PA": "H/PA allowed", "Allowed_xH_PA": "xHit/PA allowed",
+                "Allowed_K_Pct": "K%", "Allowed_HH_Pct": "Hard-hit%",
+                "AttackConfidence": "Confidence",
+            }
+        )
+        st.dataframe(
+            detail.style.background_gradient(cmap="RdYlGn", subset=["Attack score"], vmin=0, vmax=100).format(
+                {"Attack score": "{:.1f}", "H/PA allowed": "{:.1%}", "xHit/PA allowed": "{:.1%}", "K%": "{:.1%}", "Hard-hit%": "{:.1%}"}
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def selected_pitcher_profile(df: pd.DataFrame, pitcher_id: int) -> tuple[pd.DataFrame, str]:
+    rows = df[df["pitcher"].eq(pitcher_id) & df["pitch_name"].notna()].copy()
+    if rows.empty:
+        return pd.DataFrame(), ""
+    hand = most_common(rows["p_throws"], "")
+    profile = (
+        rows.groupby("pitch_name")
+        .agg(
+            Pitches=("pitch_name", "size"),
+            Avg_Speed=("release_speed", "mean"),
+            Avg_PFX_X=("pfx_x", "mean"),
+            Avg_PFX_Z=("pfx_z", "mean"),
+            Avg_Extension=("release_extension", "mean"),
+        )
+        .reset_index()
+    )
+    profile["Usage"] = profile["Pitches"] / profile["Pitches"].sum()
+    return profile[profile["Usage"].ge(0.03)].copy(), hand
+
+
+def _similarity_weights(rows: pd.DataFrame, profile_row: pd.Series) -> np.ndarray:
+    speed = pd.to_numeric(rows["release_speed"], errors="coerce")
+    pfx_x = pd.to_numeric(rows["pfx_x"], errors="coerce")
+    pfx_z = pd.to_numeric(rows["pfx_z"], errors="coerce")
+    extension = pd.to_numeric(rows["release_extension"], errors="coerce")
+
+    distance = np.zeros(len(rows), dtype=float)
+    count = np.zeros(len(rows), dtype=float)
+    comparisons = [
+        (speed, profile_row.get("Avg_Speed"), 3.0),
+        (pfx_x, profile_row.get("Avg_PFX_X"), 0.45),
+        (pfx_z, profile_row.get("Avg_PFX_Z"), 0.45),
+        (extension, profile_row.get("Avg_Extension"), 0.7),
+    ]
+    for series, center, scale in comparisons:
+        if pd.isna(center):
+            continue
+        valid = series.notna().to_numpy()
+        values = series.fillna(center).to_numpy(dtype=float)
+        distance += np.where(valid, ((values - float(center)) / scale) ** 2, 0.0)
+        count += valid.astype(float)
+    distance = np.divide(distance, np.maximum(count, 1.0))
+    return np.exp(-0.5 * distance)
+
+
+def hit_pitch_shape_match(
+    df: pd.DataFrame,
+    player_ids: Iterable[int],
+    profile: pd.DataFrame,
+    pitcher_hand: str,
+) -> pd.DataFrame:
+    player_ids = [int(value) for value in player_ids]
+    if profile.empty or not player_ids:
+        return pd.DataFrame(columns=["player_id", "PitchMatchRatio", "MatchSample"])
+
+    hand_rows = df[df["p_throws"].eq(pitcher_hand)].copy()
+    league_rows = hand_rows[hand_rows["pitch_name"].isin(profile["pitch_name"])]
+
+    league_baselines = {}
+    for _, pitch_row in profile.iterrows():
+        pitch_name = pitch_row["pitch_name"]
+        sample = league_rows[league_rows["pitch_name"].eq(pitch_name)].copy()
+        if sample.empty:
+            continue
+        weights = _similarity_weights(sample, pitch_row)
+        swing_den = np.sum(weights * sample["is_swing"].astype(float).to_numpy())
+        contact_num = np.sum(weights * sample["is_contact"].astype(float).to_numpy())
+        bbe_mask = sample["is_bbe"].astype(float).to_numpy()
+        bbe_den = np.sum(weights * bbe_mask)
+        xba_num = np.sum(weights * bbe_mask * sample["xba_value"].to_numpy(float))
+        league_baselines[pitch_name] = {
+            "contact": contact_num / swing_den if swing_den > 0 else np.nan,
+            "xba": xba_num / bbe_den if bbe_den > 0 else np.nan,
+        }
+
+    output = []
+    for player_id in player_ids:
+        player_rows = hand_rows[hand_rows["batter"].eq(player_id)]
+        weighted_ratios = []
+        usages = []
+        effective_sample = 0.0
+        for _, pitch_row in profile.iterrows():
+            pitch_name = pitch_row["pitch_name"]
+            sample = player_rows[player_rows["pitch_name"].eq(pitch_name)].copy()
+            baseline = league_baselines.get(pitch_name)
+            if sample.empty or not baseline:
+                continue
+            weights = _similarity_weights(sample, pitch_row)
+            swing_den = np.sum(weights * sample["is_swing"].astype(float).to_numpy())
+            contact_num = np.sum(weights * sample["is_contact"].astype(float).to_numpy())
+            bbe_mask = sample["is_bbe"].astype(float).to_numpy()
+            bbe_den = np.sum(weights * bbe_mask)
+            xba_num = np.sum(weights * bbe_mask * sample["xba_value"].to_numpy(float))
+            contact_rate = contact_num / swing_den if swing_den > 0 else np.nan
+            xba_rate = xba_num / bbe_den if bbe_den > 0 else np.nan
+            contact_ratio = (
+                contact_rate / baseline["contact"]
+                if pd.notna(contact_rate)
+                and pd.notna(baseline["contact"])
+                and baseline["contact"] != 0
+                else 1.0
+            )
+            xba_ratio = (
+                xba_rate / baseline["xba"]
+                if pd.notna(xba_rate)
+                and pd.notna(baseline["xba"])
+                and baseline["xba"] != 0
+                else 1.0
+            )
+            ratio = np.clip(0.45 * contact_ratio + 0.55 * xba_ratio, 0.65, 1.40)
+            reliability = min(1.0, (swing_den + bbe_den * 2) / 35.0)
+            ratio = 1.0 + reliability * (ratio - 1.0)
+            weighted_ratios.append(ratio)
+            usages.append(float(pitch_row["Usage"]))
+            effective_sample += swing_den + bbe_den * 2
+        if weighted_ratios:
+            matchup = float(np.average(weighted_ratios, weights=usages))
+        else:
+            matchup = 1.0
+        output.append(
+            {
+                "player_id": player_id,
+                "PitchMatchRatio": matchup,
+                "MatchSample": effective_sample,
+            }
+        )
+    return pd.DataFrame(output)
+
+
+def hit_zone_fit(
+    df: pd.DataFrame,
+    player_ids: Iterable[int],
+    pitcher_id: int,
+    pitcher_hand: str,
+) -> pd.DataFrame:
+    pitcher_rows = df[df["pitcher"].eq(pitcher_id)]
+    zone_usage = pitcher_rows.groupby("zone_group").size().rename("Pitches").reset_index()
+    if zone_usage.empty:
+        return pd.DataFrame(columns=["player_id", "ZoneFitRatio"])
+    zone_usage["Usage"] = zone_usage["Pitches"] / zone_usage["Pitches"].sum()
+
+    hand_rows = df[df["p_throws"].eq(pitcher_hand)]
+    league = (
+        hand_rows.groupby("zone_group")
+        .agg(
+            League_Swings=("is_swing", "sum"),
+            League_Contacts=("is_contact", "sum"),
+            League_BBE=("is_bbe", "sum"),
+            League_xH=("xba_value", "sum"),
+        )
+        .reset_index()
+    )
+    league["LeagueContact"] = safe_divide(league["League_Contacts"], league["League_Swings"], 0.75)
+    league["League_xBA"] = safe_divide(league["League_xH"], league["League_BBE"], 0.30)
+
+    output = []
+    for player_id in player_ids:
+        rows = hand_rows[hand_rows["batter"].eq(player_id)]
+        grouped = (
+            rows.groupby("zone_group")
+            .agg(
+                Swings=("is_swing", "sum"),
+                Contacts=("is_contact", "sum"),
+                BBE=("is_bbe", "sum"),
+                xH=("xba_value", "sum"),
+            )
+            .reset_index()
+            .merge(league, on="zone_group", how="outer")
+            .merge(zone_usage[["zone_group", "Usage"]], on="zone_group", how="inner")
+        )
+        if grouped.empty:
+            output.append({"player_id": player_id, "ZoneFitRatio": 1.0})
+            continue
+        grouped[["Swings", "Contacts", "BBE", "xH"]] = grouped[
+            ["Swings", "Contacts", "BBE", "xH"]
+        ].fillna(0)
+        contact = (grouped["Contacts"] + grouped["LeagueContact"] * 20) / (
+            grouped["Swings"] + 20
+        )
+        xba = (grouped["xH"] + grouped["League_xBA"] * 10) / (grouped["BBE"] + 10)
+        ratio = 0.4 * safe_divide(contact, grouped["LeagueContact"], 1.0) + 0.6 * safe_divide(
+            xba, grouped["League_xBA"], 1.0
+        )
+        ratio = ratio.clip(0.70, 1.35)
+        output.append(
+            {
+                "player_id": player_id,
+                "ZoneFitRatio": float(np.average(ratio, weights=grouped["Usage"])),
+            }
+        )
+    return pd.DataFrame(output)
+
+
+def bvp_hit_stats(df: pd.DataFrame, player_ids: Iterable[int], pitcher_id: int) -> pd.DataFrame:
+    ids = list(dict.fromkeys(int(player_id) for player_id in player_ids if pd.notna(player_id)))
+    base = pd.DataFrame({"player_id": ids})
+    defaults = {
+        "BvP_PA": 0,
+        "BvP_H": 0,
+        "BvP_xH": 0.0,
+        "BvP_K": 0,
+        "BvP_BBE": 0,
+        "BvP_Hard_Hits": 0,
+        "BvP_Avg_EV": np.nan,
+        "BvP_Hit_PA": 0.0,
+        "BvP_xHit_PA": 0.0,
+        "BvP_K_Pct": 0.0,
+        "BvP_HH_Pct": 0.0,
+        "BvPScore": 50.0,
+        "BvP_Last_Date": pd.NaT,
+    }
+    rows = df[df["pitcher"].eq(pitcher_id) & df["batter"].isin(ids)].copy()
+    if rows.empty:
+        for column, value in defaults.items():
+            base[column] = value
+        return base
+
+    pa = rows[rows["is_pa_end"]]
+    if pa.empty:
+        for column, value in defaults.items():
+            base[column] = value
+        return base
+
+    result = (
+        pa.groupby("batter")
+        .agg(
+            BvP_PA=("pa_key", "nunique"),
+            BvP_H=("is_hit", "sum"),
+            BvP_xH=("xba_value", "sum"),
+            BvP_K=("is_k", "sum"),
+            BvP_Last_Date=("game_date", "max"),
+        )
+        .reset_index()
+        .rename(columns={"batter": "player_id"})
+    )
+
+    bbe = rows[rows["is_bbe"]]
+    if not bbe.empty:
+        batted = (
+            bbe.groupby("batter")
+            .agg(
+                BvP_BBE=("is_bbe", "sum"),
+                BvP_Hard_Hits=("is_hard_hit", "sum"),
+                BvP_Avg_EV=("launch_speed", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"batter": "player_id"})
+        )
+        result = result.merge(batted, on="player_id", how="left")
+
+    for column in ["BvP_PA", "BvP_H", "BvP_xH", "BvP_K", "BvP_BBE", "BvP_Hard_Hits"]:
+        result[column] = pd.to_numeric(result.get(column, 0), errors="coerce").fillna(0)
+
+    result["BvP_Hit_PA"] = safe_divide(result["BvP_H"], result["BvP_PA"], 0.0)
+    result["BvP_xHit_PA"] = safe_divide(result["BvP_xH"], result["BvP_PA"], 0.0)
+    result["BvP_K_Pct"] = safe_divide(result["BvP_K"], result["BvP_PA"], 0.0)
+    result["BvP_HH_Pct"] = safe_divide(result["BvP_Hard_Hits"], result["BvP_BBE"], 0.0)
+
+    raw = 0.5 * result["BvP_Hit_PA"] + 0.5 * result["BvP_xHit_PA"]
+    performance = percentile(raw)
+    reliability = np.minimum(result["BvP_PA"] / 20.0, 1.0)
+    result["BvPScore"] = 50 + reliability * (performance - 50)
+
+    output = base.merge(result, on="player_id", how="left")
+    for column, value in defaults.items():
+        if column not in output.columns:
+            output[column] = value
+        elif column != "BvP_Last_Date":
+            output[column] = output[column].fillna(value)
+    return output
+
+
+def infer_recent_lineup(df: pd.DataFrame, team: str) -> pd.DataFrame:
+    team_rows = df[df["batter_team"].eq(team) & df["game_date"].notna()].copy()
+    if team_rows.empty:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    latest_date = team_rows["game_date"].max()
+    date_rows = team_rows[team_rows["game_date"].eq(latest_date)]
+    latest_game = pd.to_numeric(date_rows["game_pk"], errors="coerce").max()
+    game_rows = date_rows[date_rows["game_pk"].eq(latest_game)]
+    order = (
+        game_rows.groupby("batter")["at_bat_number"]
+        .min()
+        .sort_values()
+        .reset_index()
+        .rename(columns={"batter": "player_id"})
+    )
+    order["LineupSpot"] = np.arange(1, len(order) + 1)
+    order.loc[order["LineupSpot"].gt(9), "LineupSpot"] = np.nan
+    return order[["player_id", "LineupSpot"]]
+
+
+def add_roster_candidates(
+    stats_board: pd.DataFrame,
+    team: str,
+    active_roster: pd.DataFrame | None,
+    recent_lineup: pd.DataFrame,
+    min_pa: int,
+    include_low_sample: bool,
+) -> pd.DataFrame:
+    """Union the active roster with the latest observed lineup and Statcast stats."""
+    stats = stats_board[stats_board["Team"].eq(team)].copy()
+    stats["player_id"] = pd.to_numeric(stats["player_id"], errors="coerce").astype("Int64")
+    stats = stats.dropna(subset=["player_id"])
+    stats["player_id"] = stats["player_id"].astype(int)
+
+    lineup_ids = set(
+        pd.to_numeric(recent_lineup.get("player_id", pd.Series(dtype=float)), errors="coerce")
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+
+    roster = active_roster.copy() if active_roster is not None else pd.DataFrame()
+    if not roster.empty:
+        roster["player_id"] = pd.to_numeric(roster["player_id"], errors="coerce").astype("Int64")
+        roster = roster.dropna(subset=["player_id"]).copy()
+        roster["player_id"] = roster["player_id"].astype(int)
+        roster_ids = set(roster["player_id"].tolist())
+
+        # A same-day transaction can briefly appear in a lineup before the roster feed catches up.
+        missing_lineup_ids = sorted(lineup_ids - roster_ids)
+        if missing_lineup_ids:
+            roster = pd.concat(
+                [
+                    roster,
+                    pd.DataFrame(
+                        {
+                            "player_id": missing_lineup_ids,
+                            "Player": np.nan,
+                            "Bats": np.nan,
+                            "Position": "",
+                            "RosterStatus": "Latest observed lineup",
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        board = roster.merge(stats, on="player_id", how="left", suffixes=("", "_Stat"))
+        board["ActiveRoster"] = board["RosterStatus"].eq("Active") | board["RosterStatus"].str.contains(
+            "active", case=False, na=False
+        )
+        board["Team"] = team
+        if "Stand" not in board:
+            board["Stand"] = np.nan
+        roster_bats = board["Bats"].where(board["Bats"].isin(["L", "R", "S"]))
+        board["Stand"] = roster_bats.fillna(board["Stand"])
+    else:
+        board = stats.copy()
+        board["Player"] = np.nan
+        board["Bats"] = board.get("Stand", pd.Series(index=board.index, dtype=object))
+        board["Position"] = ""
+        board["RosterStatus"] = "Statcast sample"
+        board["ActiveRoster"] = False
+
+    board["PA"] = pd.to_numeric(board.get("PA", 0), errors="coerce").fillna(0)
+    board["SampleStatus"] = np.where(
+        board["PA"].ge(min_pa),
+        "Qualified",
+        "Low sample",
+    )
+    if not include_low_sample:
+        board = board[board["PA"].ge(min_pa)].copy()
+    return board
+
+
+def projected_pa(lineup_spot: pd.Series, team_runs: float, is_away: bool) -> pd.Series:
+    mapping = {1: 4.72, 2: 4.60, 3: 4.49, 4: 4.38, 5: 4.26, 6: 4.15, 7: 4.05, 8: 3.94, 9: 3.84}
+    base = pd.to_numeric(lineup_spot, errors="coerce").round().map(mapping).fillna(4.15)
+    base += 0.10 * (team_runs - 4.5)
+    base += 0.06 if is_away else -0.02
+    return base.clip(3.2, 5.4)
+
+
+def probability_two_plus_hits(per_pa: pd.Series, projected_pa_values: pd.Series) -> pd.Series:
+    """Estimate P(2+ hits) from per-PA hit probability and projected PA.
+
+    Projected plate appearances are fractional.  We calculate the exact binomial
+    probability at the floor and ceiling PA counts, then linearly interpolate
+    between them.  This preserves a discrete plate-appearance interpretation
+    without changing the dashboard's established 1+ hit model.
+    """
+    p = pd.to_numeric(per_pa, errors="coerce").clip(0.0, 0.999999)
+    pa = pd.to_numeric(projected_pa_values, errors="coerce").clip(lower=0.0)
+    q = 1.0 - p
+
+    low = np.floor(pa.fillna(0.0).to_numpy(float)).astype(int)
+    high = np.ceil(pa.fillna(0.0).to_numpy(float)).astype(int)
+    weight = pa.fillna(0.0).to_numpy(float) - low
+    p_arr = p.fillna(0.0).to_numpy(float)
+    q_arr = q.fillna(1.0).to_numpy(float)
+
+    def at_least_two(n_values: np.ndarray) -> np.ndarray:
+        p0 = np.power(q_arr, n_values)
+        p1 = np.zeros_like(p_arr, dtype=float)
+        mask = n_values >= 1
+        p1[mask] = (
+            n_values[mask]
+            * p_arr[mask]
+            * np.power(q_arr[mask], n_values[mask] - 1)
+        )
+        return np.clip(1.0 - p0 - p1, 0.0, 1.0)
+
+    low_probability = at_least_two(low)
+    high_probability = at_least_two(high)
+    result = (1.0 - weight) * low_probability + weight * high_probability
+    return pd.Series(np.clip(result, 0.0, 1.0), index=per_pa.index, dtype=float)
+
+
+def parse_sprint_upload(uploaded_file, board: pd.DataFrame) -> pd.DataFrame:
+    board = board.copy()
+    board["Sprint_Speed"] = np.nan
+    if uploaded_file is None:
+        return board
+    try:
+        supplemental = pd.read_csv(uploaded_file)
+    except Exception as error:
+        st.warning(f"Could not read sprint-speed CSV: {error}")
+        return board
+
+    lower = {str(column).lower().strip(): column for column in supplemental.columns}
+    speed_column = next(
+        (lower[key] for key in ["sprint_speed", "sprint speed", "sprint_speed_ft_s"] if key in lower),
+        None,
+    )
+    if speed_column is None:
+        st.warning("Sprint CSV needs a sprint_speed column.")
+        return board
+
+    id_column = next((lower[key] for key in ["player_id", "mlbam_id", "id"] if key in lower), None)
+    name_column = next((lower[key] for key in ["player", "player_name", "name"] if key in lower), None)
+    supplemental["_speed"] = pd.to_numeric(supplemental[speed_column], errors="coerce")
+
+    if id_column is not None:
+        supplemental["player_id"] = pd.to_numeric(supplemental[id_column], errors="coerce")
+        merged = board.drop(columns=["Sprint_Speed"]).merge(
+            supplemental[["player_id", "_speed"]].dropna(subset=["player_id"]).drop_duplicates("player_id"),
+            on="player_id",
+            how="left",
+        )
+    elif name_column is not None:
+        supplemental["_name_key"] = supplemental[name_column].map(normalize_name)
+        board["_name_key"] = board["Player"].map(normalize_name)
+        merged = board.drop(columns=["Sprint_Speed"]).merge(
+            supplemental[["_name_key", "_speed"]].drop_duplicates("_name_key"),
+            on="_name_key",
+            how="left",
+        ).drop(columns=["_name_key"])
+    else:
+        st.warning("Sprint CSV needs player_id or Player/player_name.")
+        return board
+    return merged.rename(columns={"_speed": "Sprint_Speed"})
+
+
+def build_hit_board(
+    df: pd.DataFrame,
+    pitcher_id: int,
+    team: str,
+    min_pa: int,
+    end_date: pd.Timestamp,
+    park_hit_factor_lhb: float,
+    park_hit_factor_rhb: float,
+    team_runs: float,
+    is_away: bool,
+    starter_innings: float,
+    bullpen_multiplier: float,
+    lineup_override: pd.DataFrame | None,
+    lineup_edits: pd.DataFrame | None,
+    sprint_upload,
+    active_roster: pd.DataFrame | None,
+    include_low_sample: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    profile, pitcher_hand = selected_pitcher_profile(df, pitcher_id)
+    if not pitcher_hand:
+        return pd.DataFrame(), profile
+
+    recent_lineup = _clean_lineup_seed(lineup_override)
+    if recent_lineup.empty:
+        recent_lineup = infer_recent_lineup(df, team)
+    board = aggregate_hitters(df, pitcher_hand, 0)
+    board = add_roster_candidates(
+        board, team, active_roster, recent_lineup, min_pa, include_low_sample
+    )
+    if board.empty:
+        return board, profile
+
+    names = lookup_names(tuple(board["player_id"].dropna().astype(int).unique().tolist()))
+    board = board.merge(names, on="player_id", how="left", suffixes=("", "_Lookup"))
+    board["Player"] = board["Player"].replace("", np.nan).fillna(board.get("Player_Lookup"))
+    board["Player"] = board["Player"].fillna("MLB ID " + board["player_id"].astype("Int64").astype(str))
+    board = board.drop(columns=["Player_Lookup"], errors="ignore")
+
+    zero_columns = [
+        "PA", "Hits", "HR", "Strikeouts", "Walks", "xHits", "Pitches", "Swings",
+        "Contacts", "Whiffs", "Zone_Swings", "Zone_Contacts", "BBE", "Line_Drives",
+        "Hard_Hits", "Sweet_Spots", "Sweet_Spot", "Barrel_Range", "Dynamic_Barrels",
+        "Platoon_PA", "Platoon_H", "Platoon_xH", "Platoon_K",
+    ]
+    for column in zero_columns:
+        board[column] = pd.to_numeric(board.get(column, 0), errors="coerce").fillna(0)
+
+    board["EffectiveStand"] = np.where(
+        board["Stand"].eq("S"),
+        "L" if pitcher_hand == "R" else "R",
+        board["Stand"],
+    )
+    board["EffectiveStand"] = board["EffectiveStand"].where(
+        board["EffectiveStand"].isin(["L", "R"]), "R"
+    )
+
+    recent = recent_hit_form(df, board["player_id"], end_date)
+    board = board.merge(recent, on="player_id", how="left")
+    for column in ["Recent_PA", "Recent_H", "Recent_xH", "Recent_K"]:
+        board[column] = pd.to_numeric(board[column], errors="coerce").fillna(0)
+
+    pitcher_splits = pitcher_hit_splits(df, pitcher_id)
+    board = board.merge(
+        pitcher_splits, left_on="EffectiveStand", right_on="Stand", how="left", suffixes=("", "_Pitcher")
+    )
+    for column in ["Pitcher_PA", "Pitcher_H", "Pitcher_xH", "Pitcher_K"]:
+        board[column] = pd.to_numeric(board[column], errors="coerce").fillna(0)
+
+    side_attack = pitcher_attack_profile_hits(df, pitcher_id)
+    board = board.merge(
+        side_attack[["Side", "PitcherSideAttackScore", "PitcherSideRead", "AttackConfidence"]],
+        left_on="EffectiveStand", right_on="Side", how="left"
+    )
+    board["PitcherSideAttackScore"] = board["PitcherSideAttackScore"].fillna(50.0)
+    board["PitcherSideRead"] = board["PitcherSideRead"].fillna("Neutral")
+
+    board = board.merge(
+        hit_pitch_shape_match(df, board["player_id"], profile, pitcher_hand),
+        on="player_id",
+        how="left",
+    )
+    board = board.merge(
+        hit_zone_fit(df, board["player_id"], pitcher_id, pitcher_hand),
+        on="player_id",
+        how="left",
+    )
+    board = board.merge(
+        bvp_hit_stats(df, board["player_id"], pitcher_id),
+        on="player_id",
+        how="left",
+    )
+
+    board["PitchMatchRatio"] = board["PitchMatchRatio"].fillna(1.0)
+    board["ZoneFitRatio"] = board["ZoneFitRatio"].fillna(1.0)
+    board["MatchSample"] = board["MatchSample"].fillna(0)
+
+    inferred = recent_lineup
+    board = board.merge(inferred, on="player_id", how="left")
+    if lineup_edits is not None and not lineup_edits.empty:
+        edits = lineup_edits[["player_id", "Selected", "LineupSpot"]].copy()
+        board = board.drop(columns=["LineupSpot"], errors="ignore").merge(edits, on="player_id", how="left")
+        board = board[board["Selected"].fillna(True)].copy()
+    else:
+        board["Selected"] = True
+
+    board = parse_sprint_upload(sprint_upload, board)
+
+    pa_all = df[df["is_pa_end"]]
+    league_pa = max(int(pa_all["pa_key"].nunique()), 1)
+    league_hit_rate = float(pa_all["is_hit"].sum() / league_pa)
+    league_xhit_rate = float(pa_all["xba_value"].sum() / league_pa)
+
+    board["Adj_Hit_PA"] = shrink_rate(board["Hits"], board["PA"], league_hit_rate, 100)
+    board["Adj_xHit_PA"] = shrink_rate(board["xHits"], board["PA"], league_xhit_rate, 100)
+    board["Adj_Platoon_Hit_PA"] = shrink_rate(
+        board["Platoon_H"], board["Platoon_PA"], league_hit_rate, 60
+    )
+    board["Adj_Platoon_xHit_PA"] = shrink_rate(
+        board["Platoon_xH"], board["Platoon_PA"], league_xhit_rate, 60
+    )
+    board["Pitcher_Allowed_Hit_PA"] = shrink_rate(
+        board["Pitcher_H"], board["Pitcher_PA"], league_hit_rate, 150
+    )
+    board["Pitcher_Allowed_xHit_PA"] = shrink_rate(
+        board["Pitcher_xH"], board["Pitcher_PA"], league_xhit_rate, 150
+    )
+    board["Recent_Hit_PA"] = shrink_rate(
+        board["Recent_H"], board["Recent_PA"], league_hit_rate, 35
+    )
+    board["Recent_xHit_PA"] = shrink_rate(
+        board["Recent_xH"], board["Recent_PA"], league_xhit_rate, 35
+    )
+
+    hitter_base = (
+        board["Adj_Hit_PA"] * 0.24
+        + board["Adj_xHit_PA"] * 0.24
+        + board["Adj_Platoon_Hit_PA"] * 0.11
+        + board["Adj_Platoon_xHit_PA"] * 0.11
+        + board["Pitcher_Allowed_Hit_PA"] * 0.10
+        + board["Pitcher_Allowed_xHit_PA"] * 0.10
+        + league_hit_rate * board["PitchMatchRatio"] * 0.05
+        + league_hit_rate * board["ZoneFitRatio"] * 0.05
+    )
+    recent_blend = 0.5 * board["Recent_Hit_PA"] + 0.5 * board["Recent_xHit_PA"]
+    starter_rate = 0.88 * hitter_base + 0.12 * recent_blend
+
+    starter_share = float(np.clip(starter_innings / 9.0, 0.35, 0.78))
+    bullpen_rate = league_hit_rate * float(bullpen_multiplier)
+    game_per_pa = starter_share * starter_rate + (1 - starter_share) * bullpen_rate
+    board["ParkFactor"] = np.where(
+        board["EffectiveStand"].eq("L"), float(park_hit_factor_lhb), float(park_hit_factor_rhb)
+    )
+    board["PrePark_Hit_Per_PA"] = game_per_pa
+    game_per_pa = game_per_pa * board["ParkFactor"] / 100.0
+    board["Model_Hit_Per_PA"] = game_per_pa.clip(0.04, 0.43)
+    board["Projected_PA"] = projected_pa(board["LineupSpot"], team_runs, is_away)
+    board["Model_1plus_Hit"] = 1 - (1 - board["Model_Hit_Per_PA"]) ** board["Projected_PA"]
+    board["Model_2plus_Hit"] = probability_two_plus_hits(
+        board["Model_Hit_Per_PA"], board["Projected_PA"]
+    )
+    board["Projected_Hits"] = board["Model_Hit_Per_PA"] * board["Projected_PA"]
+
+    board["Barrel_Range_Pct"] = safe_divide(board.get("Barrel_Range", 0), board["BBE"], 0.0)
+    board["Dynamic_Barrel_Pct"] = safe_divide(board.get("Dynamic_Barrels", 0), board["BBE"], 0.0)
+    board["LA_Optimization_Score"] = pd.to_numeric(
+        board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index)), errors="coerce"
+    ).fillna(50.0)
+
+    board["PitchMatchScore"] = percentile(board["PitchMatchRatio"])
+    board["ZoneFitScore"] = percentile(board["ZoneFitRatio"])
+    board["PitcherHitScore"] = percentile(
+        0.5 * board["Pitcher_Allowed_Hit_PA"] + 0.5 * board["Pitcher_Allowed_xHit_PA"]
+    )
+    board["RecentFormScore"] = percentile(recent_blend)
+    board["SprintScore"] = percentile(board["Sprint_Speed"]).where(board["Sprint_Speed"].notna(), 50.0)
+
+    board["HitScore"] = (
+        percentile(board["Model_1plus_Hit"]) * 0.25
+        + percentile(board.get("LA_Optimization_Score", pd.Series(50.0, index=board.index))) * 0.15
+        + percentile(board.get("Barrel_Range", pd.Series(0.0, index=board.index))) * 0.10
+        + percentile(board["PitchMatchScore"]) * 0.15
+        + percentile(board["ZoneFitScore"]) * 0.12
+        + percentile(board["PitcherSideAttackScore"]) * 0.10
+        + percentile(board["BvPScore"]) * 0.08
+        + percentile(board["RecentFormScore"]) * 0.05
+    ).clip(0, 100)
+
+    sample_conf = 100 * (1 - np.exp(-board["PA"] / 130.0))
+    bbe_conf = 100 * (1 - np.exp(-board["BBE"].fillna(0) / 80.0))
+    matchup_conf = 100 * (1 - np.exp(-board["MatchSample"] / 60.0))
+    board["Confidence"] = 0.55 * sample_conf + 0.25 * bbe_conf + 0.20 * matchup_conf
+    board["Confidence_Level"] = pd.cut(
+        board["Confidence"],
+        bins=[-np.inf, 48, 72, np.inf],
+        labels=["Low", "Medium", "High"],
+    ).astype(str)
+
+    board = board.sort_values(["Model_1plus_Hit", "HitScore"], ascending=False).reset_index(drop=True)
+    board.insert(0, "Rank", np.arange(1, len(board) + 1))
+    return board, profile
+
+
+
+
+# -----------------------------------------------------------------------------
+# Clean slate/matchup interface helpers
+# -----------------------------------------------------------------------------
+import json
+from html import escape
+from io import StringIO
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 MLB_TEAM_ABBR = {
     108: "LAA", 109: "ARI", 110: "BAL", 111: "BOS", 112: "CHC",
@@ -118,10 +1201,18 @@ MLB_TEAM_ABBR = {
     144: "ATL", 145: "CWS", 146: "MIA", 147: "NYY", 158: "MIL",
 }
 
-TEAM_ALIASES = {"OAK": "ATH", "ATH": "OAK"}
+TEAM_ALIASES = {
+    # Baseball Savant/Statcast can use AZ while the MLB Stats API uses ARI.
+    "ARI": "AZ",
+    "AZ": "ARI",
+    "OAK": "ATH",
+    "ATH": "OAK",
+}
 
+
+# Team presentation metadata used only for the dashboard UI.
 TEAM_COLORS = {
-    "ARI": ("#A71930", "#E3D4AD"), "ATH": ("#003831", "#EFB21E"),
+    "ARI": ("#A71930", "#E3D4AD"), "AZ": ("#A71930", "#E3D4AD"), "ATH": ("#003831", "#EFB21E"),
     "OAK": ("#003831", "#EFB21E"), "ATL": ("#CE1141", "#13274F"),
     "BAL": ("#DF4601", "#000000"), "BOS": ("#BD3039", "#0C2340"),
     "CHC": ("#0E3386", "#CC3433"), "CWS": ("#27251F", "#C4CED4"),
@@ -139,6 +1230,8 @@ TEAM_COLORS = {
     "WSH": ("#AB0003", "#14225A"),
 }
 
+# Renamed and temporary venues are grouped so a schedule name can still match
+# the name used by Baseball Savant's park-factor table.
 VENUE_ALIAS_GROUPS = [
     {"daikinpark", "minutemaidpark"},
     {"ratefield", "guaranteedratefield", "uscellularfield", "comiskeypark"},
@@ -149,84 +1242,7 @@ VENUE_ALIAS_GROUPS = [
     {"americanfamilyfield", "millerpark"},
     {"rogerscentre", "skydome"},
     {"georgemsteinbrennerfield", "tropicanafield"},
-    {"uniqlofieldatdodgerstadium", "dodgerstadium"},
 ]
-
-
-# -----------------------------------------------------------------------------
-# General utilities
-# -----------------------------------------------------------------------------
-
-def safe_divide(numerator, denominator, default=np.nan):
-    num = pd.to_numeric(numerator, errors="coerce")
-    den = pd.to_numeric(denominator, errors="coerce")
-    result = np.divide(num, den)
-    if isinstance(result, pd.Series):
-        return result.replace([np.inf, -np.inf], np.nan).fillna(default)
-    return default if not np.isfinite(result) else result
-
-
-def percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().sum() <= 1 or numeric.nunique(dropna=True) <= 1:
-        return pd.Series(50.0, index=series.index)
-    ranked = numeric.rank(pct=True, method="average") * 100.0
-    if not higher_is_better:
-        ranked = 100.0 - ranked
-    return ranked.fillna(50.0)
-
-
-def shrink_rate(numerator, denominator, league_rate: float, prior_sample: float):
-    num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
-    den = pd.to_numeric(denominator, errors="coerce").fillna(0.0)
-    return (num + float(league_rate) * float(prior_sample)) / (den + float(prior_sample))
-
-
-def normalize_name(value: object) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    return "".join(character.lower() for character in str(value) if character.isalnum())
-
-
-def weighted_recent_mean(series: pd.Series, count: int = 5, default: float = np.nan) -> float:
-    values = pd.to_numeric(series, errors="coerce").dropna().tail(count)
-    if values.empty:
-        return float(default)
-    weights = np.arange(1, len(values) + 1, dtype=float)
-    return float(np.average(values.to_numpy(dtype=float), weights=weights))
-
-
-def innings_to_outs(value: object) -> float:
-    if value is None or pd.isna(value):
-        return np.nan
-    text = str(value).strip()
-    try:
-        if "." in text:
-            whole_text, partial_text = text.split(".", 1)
-            whole = int(whole_text or 0)
-            partial = int((partial_text or "0")[0])
-            partial = partial if partial in {0, 1, 2} else 0
-            return float(whole * 3 + partial)
-        return float(int(float(text)) * 3)
-    except (TypeError, ValueError):
-        return np.nan
-
-
-def poisson_cdf(k: int, mean: float) -> float:
-    mean = max(float(mean), 0.0001)
-    k = max(int(k), 0)
-    return float(sum(math.exp(-mean) * mean ** i / math.factorial(i) for i in range(k + 1)))
-
-
-def probability_over_line(mean: float, line: float) -> float:
-    threshold = math.floor(float(line))
-    return float(np.clip(1.0 - poisson_cdf(threshold, mean), 0.0, 1.0))
-
-
-def normal_cdf(value: float, mean: float, sd: float) -> float:
-    sd = max(float(sd), 0.35)
-    z = (float(value) - float(mean)) / (sd * math.sqrt(2.0))
-    return 0.5 * (1.0 + math.erf(z))
 
 
 def team_logo_url(team_id: object) -> str:
@@ -237,7 +1253,8 @@ def team_logo_url(team_id: object) -> str:
 
 
 def team_palette(team_code: object) -> tuple[str, str]:
-    return TEAM_COLORS.get(str(team_code or "").upper().strip(), ("#2563EB", "#7C3AED"))
+    code = str(team_code or "").upper().strip()
+    return TEAM_COLORS.get(code, ("#2563EB", "#7C3AED"))
 
 
 def normalized_venue_variants(value: object) -> set[str]:
@@ -262,10 +1279,2999 @@ def venue_names_match(left: object, right: object) -> bool:
     return False
 
 
+def _flatten_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    table = frame.copy()
+    if isinstance(table.columns, pd.MultiIndex):
+        table.columns = [
+            " ".join(str(part) for part in column if str(part) != "nan").strip()
+            for column in table.columns
+        ]
+    else:
+        table.columns = [str(column).strip() for column in table.columns]
+    return table
+
+
+def _numeric_park_factor(value: object) -> float | None:
+    text = str(value).replace("%", "").replace(",", "").strip()
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return None
+    numeric = float(numeric)
+    if 0.5 <= numeric <= 1.8:
+        numeric *= 100.0
+    if 50.0 <= numeric <= 180.0:
+        return numeric
+    return None
+
+
+def _factor_from_html_tables(html_text: str, venue: str, metric: str) -> float | None:
+    try:
+        tables = pd.read_html(StringIO(html_text))
+    except Exception:
+        return None
+
+    metric_norm = normalize_name(metric)
+    exact_metric_names = {
+        "hits": {"hits", "indexhits", "hitfactor", "hitsfactor"},
+        "hr": {"hr", "indexhr", "homerun", "homeruns", "hrfactor"},
+    }.get(metric_norm, {metric_norm, f"index{metric_norm}"})
+
+    for raw_table in tables:
+        table = _flatten_columns(raw_table)
+        normalized_columns = {column: normalize_name(column) for column in table.columns}
+        venue_columns = [
+            column for column, normalized in normalized_columns.items()
+            if "venue" in normalized or "stadium" in normalized or normalized == "park"
+        ]
+        if not venue_columns:
+            continue
+
+        metric_columns = [
+            column for column, normalized in normalized_columns.items()
+            if normalized in exact_metric_names
+            or any(name and name in normalized for name in exact_metric_names)
+        ]
+        if not metric_columns:
+            metric_columns = [
+                column for column, normalized in normalized_columns.items()
+                if "parkfactor" in normalized or normalized in {"factor", "index"}
+            ]
+        if not metric_columns:
+            continue
+
+        for _, row in table.iterrows():
+            if not any(venue_names_match(row.get(column), venue) for column in venue_columns):
+                continue
+            for column in metric_columns:
+                factor = _numeric_park_factor(row.get(column))
+                if factor is not None:
+                    return factor
+    return None
+
+
+def _fetch_savant_side_factor(venue: str, year: int, side: str, metric: str) -> tuple[float | None, str | None]:
+    metric_key = "Hits" if normalize_name(metric) == "hits" else "HR"
+    attempts = [
+        (year, f"index_{metric_key}"),
+        (year, metric_key),
+        (year - 1, f"index_{metric_key}"),
+    ]
+    last_error = None
+    for query_year, stat_value in attempts:
+        params = {
+            "year": int(query_year),
+            "type": "year",
+            "batSide": side,
+            "stat": stat_value,
+            "condition": "All",
+            "rolling": 3,
+        }
+        url = "https://baseballsavant.mlb.com/leaderboard/statcast-park-factors?" + urlencode(params)
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MLB-Statcast-Dashboard/2.0",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        try:
+            with urlopen(request, timeout=6) as response:
+                html_text = response.read().decode("utf-8", errors="replace")
+            factor = _factor_from_html_tables(html_text, venue, metric_key)
+            if factor is not None:
+                return factor, f"Baseball Savant {query_year} · 3-year · All conditions"
+            last_error = "Savant loaded, but its park-factor table could not be parsed."
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            last_error = str(exc)
+    return None, last_error
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_savant_park_factors(venue: str, year: int, metric: str) -> dict:
+    """Read handed park factors from the repository's park_factors.csv file."""
+    if not venue or normalize_name(venue) in {"manualmatchup", "venuetbd"}:
+        return {
+            "L": 100.0,
+            "R": 100.0,
+            "ok": False,
+            "source": "Neutral fallback",
+            "error": "A real MLB venue was not available.",
+        }
+
+    candidate_paths = [
+        Path(__file__).resolve().parent / "park_factors.csv",
+        Path.cwd() / "park_factors.csv",
+    ]
+    csv_path = next((path for path in candidate_paths if path.exists()), None)
+    if csv_path is None:
+        return {
+            "L": 100.0,
+            "R": 100.0,
+            "ok": False,
+            "source": "Neutral fallback",
+            "error": "park_factors.csv was not found beside the dashboard file.",
+        }
+
+    try:
+        factors = pd.read_csv(csv_path)
+    except Exception as exc:
+        return {
+            "L": 100.0,
+            "R": 100.0,
+            "ok": False,
+            "source": "Neutral fallback",
+            "error": f"park_factors.csv could not be read: {type(exc).__name__}: {exc}",
+        }
+
+    required = {"venue", "hr_l", "hr_r", "hits_l", "hits_r"}
+    missing = sorted(required - set(factors.columns))
+    if missing:
+        return {
+            "L": 100.0,
+            "R": 100.0,
+            "ok": False,
+            "source": "Neutral fallback",
+            "error": "park_factors.csv is missing columns: " + ", ".join(missing),
+        }
+
+    matching_row = None
+    for _, row in factors.iterrows():
+        if venue_names_match(row.get("venue"), venue):
+            matching_row = row
+            break
+
+    if matching_row is None:
+        return {
+            "L": 100.0,
+            "R": 100.0,
+            "ok": False,
+            "source": "Neutral fallback",
+            "error": f"No park-factor row matched venue: {venue}",
+        }
+
+    metric_prefix = "hits" if normalize_name(metric) == "hits" else "hr"
+    left = _numeric_park_factor(matching_row.get(f"{metric_prefix}_l"))
+    right = _numeric_park_factor(matching_row.get(f"{metric_prefix}_r"))
+    if left is None or right is None:
+        return {
+            "L": float(left) if left is not None else 100.0,
+            "R": float(right) if right is not None else 100.0,
+            "ok": False,
+            "source": "Partial local park-factor data",
+            "error": f"Invalid {metric_prefix.upper()} factor for {venue}.",
+        }
+
+    season_value = matching_row.get("season", year)
+    rolling_value = matching_row.get("rolling_years", 3)
+    try:
+        season_text = str(int(float(season_value)))
+    except (TypeError, ValueError):
+        season_text = str(season_value)
+    try:
+        rolling_text = str(int(float(rolling_value)))
+    except (TypeError, ValueError):
+        rolling_text = str(rolling_value)
+
+    return {
+        "L": float(left),
+        "R": float(right),
+        "ok": True,
+        "source": f"Local park_factors.csv · {season_text} · {rolling_text}-year",
+        "error": None,
+    }
+
+
+
+def team_id_from_code(team_code: object) -> int | None:
+    """Translate a Statcast/scoreboard abbreviation to an MLB team ID."""
+    code = str(team_code or "").upper().strip()
+    if code == "AZ":
+        code = "ARI"
+    if code == "OAK":
+        code = "ATH"
+    for team_id, abbreviation in MLB_TEAM_ABBR.items():
+        if abbreviation == code:
+            return int(team_id)
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_active_roster(team_id: int | None, roster_date: str | None) -> tuple[pd.DataFrame, str | None]:
+    """Return active non-pitchers, including bat side, from the MLB Stats API."""
+    empty = pd.DataFrame(
+        columns=["player_id", "Player", "Bats", "Position", "RosterStatus"]
+    )
+    if team_id is None:
+        return empty, "No MLB team ID was available for this matchup."
+
+    base = f"https://statsapi.mlb.com/api/v1/teams/{int(team_id)}/roster?rosterType=active"
+    urls = [f"{base}&date={roster_date}"] if roster_date else []
+    urls.append(base)
+
+    payload = None
+    last_error = None
+    for url in urls:
+        request = Request(url, headers={"User-Agent": "MLB-Statcast-Dashboard/1.0"})
+        try:
+            with urlopen(request, timeout=12) as response:
+                payload = json.load(response)
+            if payload.get("roster"):
+                break
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            last_error = str(exc)
+            payload = None
+
+    if not payload or not payload.get("roster"):
+        return empty, last_error or "The active roster endpoint returned no players."
+
+    records = []
+    for item in payload.get("roster", []):
+        person = item.get("person", {}) or {}
+        position = item.get("position", {}) or {}
+        position_type = str(position.get("type", ""))
+        abbreviation = str(position.get("abbreviation", ""))
+
+        # Exclude traditional pitchers, but retain any two-way designation.
+        if position_type == "Pitcher" and abbreviation not in {"TWP", "Two-Way"}:
+            continue
+
+        player_id = person.get("id")
+        if player_id is None:
+            continue
+        records.append(
+            {
+                "player_id": int(player_id),
+                "Player": person.get("fullName", f"MLB ID {player_id}"),
+                "Position": abbreviation or position.get("name", ""),
+                "RosterStatus": (item.get("status", {}) or {}).get("description", "Active"),
+            }
+        )
+
+    roster = pd.DataFrame(records).drop_duplicates("player_id")
+    if roster.empty:
+        return empty, "The active roster contained no position players."
+
+    ids = ",".join(roster["player_id"].astype(str).tolist())
+    people_url = f"https://statsapi.mlb.com/api/v1/people?personIds={ids}"
+    request = Request(people_url, headers={"User-Agent": "MLB-Statcast-Dashboard/1.0"})
+    bat_map: dict[int, str] = {}
+    try:
+        with urlopen(request, timeout=12) as response:
+            people_payload = json.load(response)
+        for person in people_payload.get("people", []):
+            person_id = person.get("id")
+            bat_side = (person.get("batSide", {}) or {}).get("code")
+            if person_id is not None and bat_side:
+                bat_map[int(person_id)] = str(bat_side)
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        pass
+
+    roster["Bats"] = roster["player_id"].map(bat_map)
+    return roster[["player_id", "Player", "Bats", "Position", "RosterStatus"]], None
+
+
+
+def inject_clean_css() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ink: #0f172a;
+            --muted: #64748b;
+            --line: rgba(148, 163, 184, 0.28);
+            --glass: rgba(255, 255, 255, 0.88);
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at 7% 2%, rgba(59,130,246,.14), transparent 26rem),
+                radial-gradient(circle at 93% 5%, rgba(249,115,22,.13), transparent 25rem),
+                linear-gradient(180deg, #f8fbff 0%, #f2f6fc 48%, #f8fafc 100%);
+            color: var(--ink);
+        }
+        .block-container {
+            max-width: 1780px;
+            padding-top: 1.05rem;
+            padding-bottom: 2.5rem;
+        }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #0f172a 0%, #172554 58%, #312e81 100%);
+        }
+        [data-testid="stSidebar"] * { color: #f8fafc; }
+        [data-testid="stSidebar"] input { color: #0f172a !important; }
+        h1 { letter-spacing: -0.045em; font-weight: 900; }
+        h2, h3 { letter-spacing: -0.028em; }
+        .app-kicker {
+            display: inline-flex;
+            align-items: center;
+            gap: .45rem;
+            padding: .34rem .7rem;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #2563eb, #7c3aed);
+            color: white;
+            font-size: .72rem;
+            font-weight: 850;
+            letter-spacing: .11em;
+            text-transform: uppercase;
+            box-shadow: 0 8px 20px rgba(37, 99, 235, .24);
+            margin-bottom: .35rem;
+        }
+        div[data-testid="stMetric"] {
+            background: linear-gradient(145deg, rgba(255,255,255,.98), rgba(239,246,255,.92));
+            border: 1px solid rgba(96,165,250,.28);
+            border-radius: 18px;
+            padding: .9rem 1.05rem;
+            box-shadow: 0 10px 25px rgba(15,23,42,.07);
+        }
+        div[role="radiogroup"] { gap: .58rem; flex-wrap: wrap; }
+        div[role="radiogroup"] label {
+            background: rgba(255,255,255,.9);
+            border: 1px solid rgba(148,163,184,.32);
+            border-radius: 13px;
+            padding: .52rem .82rem;
+            min-height: 42px;
+            box-shadow: 0 4px 12px rgba(15,23,42,.04);
+        }
+        div[role="radiogroup"] label:hover {
+            border-color: #60a5fa;
+            transform: translateY(-1px);
+            box-shadow: 0 9px 20px rgba(37,99,235,.11);
+        }
+        .slate-card {
+            min-height: 118px;
+            background: linear-gradient(145deg, rgba(255,255,255,.98), rgba(248,250,252,.92));
+            border: 1px solid rgba(148,163,184,.28);
+            border-radius: 17px;
+            padding: .72rem .72rem .62rem;
+            text-align: center;
+            box-shadow: 0 8px 22px rgba(15,23,42,.06);
+            transition: .16s ease;
+        }
+        .slate-card.selected {
+            border: 2px solid #f97316;
+            background: linear-gradient(145deg, #fff7ed, #ffffff);
+            box-shadow: 0 12px 28px rgba(249,115,22,.20);
+        }
+        .slate-logos {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: .55rem;
+            min-height: 40px;
+        }
+        .slate-logos img { width: 34px; height: 34px; object-fit: contain; }
+        .slate-at { color: #64748b; font-weight: 900; }
+        .slate-game { font-weight: 900; color: #0f172a; margin-top: .25rem; }
+        .slate-time { color: #475569; font-weight: 750; font-size: .82rem; }
+        .slate-venue {
+            color: #64748b;
+            font-size: .72rem;
+            line-height: 1.15;
+            margin-top: .18rem;
+            min-height: 1.7rem;
+        }
+        .matchup-hero {
+            display: grid;
+            grid-template-columns: 130px minmax(0, 1fr) 130px;
+            align-items: center;
+            gap: 1rem;
+            padding: 1.2rem 1.4rem;
+            margin: .85rem 0 1rem;
+            border-radius: 22px;
+            background:
+                linear-gradient(105deg, color-mix(in srgb, var(--away) 18%, white), rgba(255,255,255,.96) 40%, rgba(255,255,255,.96) 60%, color-mix(in srgb, var(--home) 18%, white));
+            border: 1px solid rgba(148,163,184,.30);
+            box-shadow: 0 16px 38px rgba(15,23,42,.10);
+            overflow: hidden;
+        }
+        .hero-team { text-align: center; }
+        .hero-team img { width: 76px; height: 76px; object-fit: contain; filter: drop-shadow(0 8px 10px rgba(15,23,42,.16)); }
+        .hero-abbr { font-weight: 950; color: #0f172a; font-size: 1.05rem; }
+        .hero-center { text-align: center; min-width: 0; }
+        .hero-title { font-size: 2rem; font-weight: 950; letter-spacing: -.045em; color: #0f172a; }
+        .hero-meta { color: #475569; font-weight: 700; margin-top: .18rem; }
+        .hero-probables { color: #64748b; font-size: .88rem; margin-top: .35rem; }
+        .hero-badge {
+            display: inline-flex;
+            padding: .28rem .62rem;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #f97316, #ef4444);
+            color: white;
+            font-size: .69rem;
+            font-weight: 900;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            margin-bottom: .36rem;
+        }
+        .offense-choice {
+            text-align: center;
+            padding: .55rem;
+            border-radius: 15px;
+            background: rgba(255,255,255,.78);
+            border: 1px solid rgba(148,163,184,.25);
+        }
+        .offense-choice img { width: 48px; height: 48px; object-fit: contain; }
+        .board-heading {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            background: linear-gradient(110deg, rgba(15,23,42,.98), rgba(30,64,175,.94), rgba(124,58,237,.88));
+            color: white;
+            border-radius: 19px;
+            padding: .95rem 1.2rem;
+            margin: 1rem 0 .75rem;
+            box-shadow: 0 13px 30px rgba(30,64,175,.20);
+        }
+        .board-heading img { width: 58px; height: 58px; object-fit: contain; }
+        .board-heading h2 { color: white; margin: 0; font-size: 1.55rem; }
+        .board-heading p { color: #dbeafe; margin: .12rem 0 0; font-size: .86rem; }
+        .leader-card {
+            background: linear-gradient(145deg, #ffffff, #eff6ff);
+            border: 1px solid rgba(96,165,250,.28);
+            border-radius: 18px;
+            padding: 1rem 1.05rem;
+            min-height: 138px;
+            box-shadow: 0 12px 27px rgba(15,23,42,.075);
+            position: relative;
+            overflow: hidden;
+        }
+        .leader-card:after {
+            content: "";
+            position: absolute;
+            width: 90px;
+            height: 90px;
+            border-radius: 50%;
+            right: -35px;
+            top: -35px;
+            background: linear-gradient(135deg, rgba(37,99,235,.18), rgba(249,115,22,.15));
+        }
+        .leader-rank { color: #64748b; font-size: .75rem; font-weight: 850; letter-spacing: .08em; }
+        .leader-name { color: #0f172a; font-size: 1.08rem; font-weight: 900; margin: .18rem 0; }
+        .leader-prob { color: #15803d; font-size: 1.55rem; font-weight: 950; }
+        .leader-sub { color: #64748b; font-size: .81rem; }
+        .context-note {
+            background: linear-gradient(145deg, #eff6ff, #ffffff);
+            border-left: 5px solid #2563eb;
+            border-radius: 12px;
+            padding: .78rem .92rem;
+            color: #334155;
+            margin: .35rem 0 .8rem;
+            box-shadow: 0 7px 18px rgba(37,99,235,.08);
+        }
+        .park-grid { display:grid; grid-template-columns:1fr 1fr; gap:.55rem; margin:.25rem 0 .55rem; }
+        .park-chip {
+            border-radius: 14px;
+            padding: .72rem .78rem;
+            background: linear-gradient(145deg, #ecfeff, #ffffff);
+            border: 1px solid rgba(6,182,212,.25);
+        }
+        .park-chip .side { color:#64748b; font-size:.72rem; font-weight:800; }
+        .park-chip .factor { color:#0f172a; font-size:1.35rem; font-weight:950; }
+        .park-source { color:#64748b; font-size:.76rem; line-height:1.25; }
+        [data-testid="stDataFrame"] {
+            border: 1px solid rgba(148,163,184,.30);
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 8px 22px rgba(15,23,42,.055);
+        }
+        button[kind="primary"] {
+            background: linear-gradient(90deg, #2563eb, #7c3aed) !important;
+            border: 0 !important;
+            box-shadow: 0 8px 18px rgba(37,99,235,.22) !important;
+        }
+        [data-baseweb="tab-list"] { gap: .35rem; }
+        [data-baseweb="tab"] {
+            background: rgba(255,255,255,.78);
+            border-radius: 10px 10px 0 0;
+            padding-left: .85rem;
+            padding-right: .85rem;
+        }
+        @media (max-width: 900px) {
+            .matchup-hero { grid-template-columns: 82px minmax(0,1fr) 82px; padding: .9rem; }
+            .hero-team img { width: 54px; height: 54px; }
+            .hero-title { font-size: 1.45rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
+    """Load an MLB slate. Gracefully falls back to manual selection on failure."""
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&date={slate_date}&hydrate=probablePitcher,venue"
+    )
+    request = Request(url, headers={"User-Agent": "MLB-Statcast-Dashboard/1.0"})
+    try:
+        with urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        return [], str(exc)
+
+    games: list[dict] = []
+    for date_block in payload.get("dates", []):
+        for game in date_block.get("games", []):
+            away_info = game.get("teams", {}).get("away", {})
+            home_info = game.get("teams", {}).get("home", {})
+            away_team = away_info.get("team", {})
+            home_team = home_info.get("team", {})
+            away_probable = away_info.get("probablePitcher", {}) or {}
+            home_probable = home_info.get("probablePitcher", {}) or {}
+
+            game_time = "TBD"
+            raw_time = game.get("gameDate")
+            if raw_time:
+                parsed = pd.to_datetime(raw_time, utc=True, errors="coerce")
+                if not pd.isna(parsed):
+                    try:
+                        eastern = parsed.tz_convert("America/New_York")
+                        game_time = eastern.strftime("%I:%M %p ET").lstrip("0")
+                    except Exception:
+                        game_time = parsed.strftime("%I:%M %p UTC").lstrip("0")
+
+            away_id = away_team.get("id")
+            home_id = home_team.get("id")
+            games.append(
+                {
+                    "game_pk": game.get("gamePk"),
+                    "game_datetime_utc": raw_time,
+                    "away_id": away_id,
+                    "home_id": home_id,
+                    "slate_date": slate_date,
+                    "away_abbr": MLB_TEAM_ABBR.get(away_id, away_team.get("name", "AWAY")[:3].upper()),
+                    "home_abbr": MLB_TEAM_ABBR.get(home_id, home_team.get("name", "HOME")[:3].upper()),
+                    "away_name": away_team.get("name", "Away"),
+                    "home_name": home_team.get("name", "Home"),
+                    "away_pitcher_id": away_probable.get("id"),
+                    "away_pitcher_name": away_probable.get("fullName", "TBD"),
+                    "home_pitcher_id": home_probable.get("id"),
+                    "home_pitcher_name": home_probable.get("fullName", "TBD"),
+                    "time_et": game_time,
+                    "venue": game.get("venue", {}).get("name", "Venue TBD"),
+                    "status": game.get("status", {}).get("detailedState", "Scheduled"),
+                }
+            )
+    return games, None
+
+
+def _parse_mlb_team_lineup(team_box: dict) -> pd.DataFrame:
+    """Extract the original 1-9 batting order from an MLB boxscore team block."""
+    columns = [
+        "player_id", "Player_MLB", "Position_MLB", "LineupSpot",
+        "LineupRole", "RawBattingOrder",
+    ]
+    if not isinstance(team_box, dict):
+        return pd.DataFrame(columns=columns)
+
+    players = team_box.get("players", {}) or {}
+    candidates: list[dict] = []
+
+    for player_key, record in players.items():
+        if not isinstance(record, dict):
+            continue
+        person = record.get("person", {}) or {}
+        player_id = person.get("id")
+        if player_id is None:
+            digits = "".join(character for character in str(player_key) if character.isdigit())
+            player_id = int(digits) if digits else None
+        numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+        if pd.isna(numeric_id):
+            continue
+
+        raw_order = record.get("battingOrder")
+        numeric_order = pd.to_numeric(pd.Series([raw_order]), errors="coerce").iloc[0]
+        if pd.isna(numeric_order):
+            continue
+        numeric_order = int(numeric_order)
+        lineup_spot = numeric_order // 100 if numeric_order >= 100 else numeric_order
+        if lineup_spot < 1 or lineup_spot > 9:
+            continue
+
+        game_status = record.get("gameStatus", {}) or {}
+        is_substitute = bool(game_status.get("isSubstitute", False))
+        is_on_bench = bool(game_status.get("isOnBench", False))
+        position = record.get("position", {}) or {}
+        candidates.append(
+            {
+                "player_id": int(numeric_id),
+                "Player_MLB": person.get("fullName") or person.get("fullNameLastFirst") or f"MLB ID {int(numeric_id)}",
+                "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                "LineupSpot": int(lineup_spot),
+                "LineupRole": "Substitute" if is_substitute else "Starter",
+                "RawBattingOrder": int(numeric_order),
+                "_substitute": is_substitute,
+                "_bench": is_on_bench,
+            }
+        )
+
+    # Some versions of the game feed expose the ordered player IDs separately.
+    # Use that list only to fill missing lineup spots.
+    ordered_ids = team_box.get("battingOrder") or []
+    if not isinstance(ordered_ids, list) or len(ordered_ids) < 9:
+        ordered_ids = team_box.get("batters") or []
+    if isinstance(ordered_ids, list) and len(ordered_ids) >= 9:
+        existing_spots = {int(row["LineupSpot"]) for row in candidates}
+        player_lookup = {}
+        for player_key, record in players.items():
+            if not isinstance(record, dict):
+                continue
+            person = record.get("person", {}) or {}
+            pid = person.get("id")
+            if pid is None:
+                digits = "".join(character for character in str(player_key) if character.isdigit())
+                pid = int(digits) if digits else None
+            if pid is not None:
+                player_lookup[int(pid)] = record
+
+        for spot, player_id in enumerate(ordered_ids[:9], start=1):
+            if spot in existing_spots:
+                continue
+            numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
+            if pd.isna(numeric_id):
+                continue
+            numeric_id = int(numeric_id)
+            record = player_lookup.get(numeric_id, {})
+            person = record.get("person", {}) or {}
+            position = record.get("position", {}) or {}
+            candidates.append(
+                {
+                    "player_id": numeric_id,
+                    "Player_MLB": person.get("fullName") or f"MLB ID {numeric_id}",
+                    "Position_MLB": position.get("abbreviation") or position.get("name") or "",
+                    "LineupSpot": spot,
+                    "LineupRole": "Starter",
+                    "RawBattingOrder": spot * 100,
+                    "_substitute": False,
+                    "_bench": False,
+                }
+            )
+
+    if not candidates:
+        return pd.DataFrame(columns=columns)
+
+    lineup = pd.DataFrame(candidates)
+    lineup = lineup.sort_values(
+        ["LineupSpot", "_substitute", "_bench", "RawBattingOrder"],
+        ascending=[True, True, True, True],
+    )
+    lineup = lineup.drop_duplicates("LineupSpot", keep="first")
+    lineup = lineup[lineup["LineupSpot"].between(1, 9)].copy()
+    lineup = lineup.sort_values("LineupSpot").reset_index(drop=True)
+    return lineup[columns]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_mlb_confirmed_lineup(game_pk: object, team_side: str) -> dict:
+    """Fetch a posted lineup from MLB's game feed with a boxscore fallback."""
+    numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
+    side = str(team_side).lower().strip()
+    if pd.isna(numeric_game) or side not in {"away", "home"}:
+        return {
+            "ok": False,
+            "status": "Unavailable",
+            "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+            "source": "Manual/recent lineup",
+            "game_state": "",
+            "updated": "",
+            "error": "A valid MLB game and team side were not available.",
+        }
+
+    game_pk_int = int(numeric_game)
+    endpoints = [
+        ("MLB live game feed", f"https://statsapi.mlb.com/api/v1.1/game/{game_pk_int}/feed/live"),
+        ("MLB boxscore", f"https://statsapi.mlb.com/api/v1/game/{game_pk_int}/boxscore"),
+    ]
+    errors: list[str] = []
+
+    for source_name, url in endpoints:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 MLB-Statcast-Dashboard/3.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=12) as response:
+                payload = json.load(response)
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}: {exc}")
+            continue
+
+        if "liveData" in payload:
+            team_box = (
+                payload.get("liveData", {})
+                .get("boxscore", {})
+                .get("teams", {})
+                .get(side, {})
+            )
+            game_state = (
+                payload.get("gameData", {})
+                .get("status", {})
+                .get("detailedState", "")
+            )
+            feed_timestamp = payload.get("metaData", {}).get("timeStamp")
+        else:
+            team_box = payload.get("teams", {}).get(side, {})
+            game_state = ""
+            feed_timestamp = None
+
+        lineup = _parse_mlb_team_lineup(team_box)
+        unique_spots = int(lineup["LineupSpot"].nunique()) if not lineup.empty else 0
+        if unique_spots:
+            status = "Confirmed" if unique_spots >= 9 else "Partial"
+            updated = str(feed_timestamp or pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %I:%M %p ET"))
+            return {
+                "ok": unique_spots >= 9,
+                "status": status,
+                "lineup": lineup,
+                "source": source_name,
+                "game_state": game_state,
+                "updated": updated,
+                "error": None,
+            }
+
+    return {
+        "ok": False,
+        "status": "Not posted",
+        "lineup": pd.DataFrame(columns=["player_id", "LineupSpot"]),
+        "source": "Recent lineup fallback",
+        "game_state": "",
+        "updated": "",
+        "error": " | ".join(errors[-2:]) if errors else "No batting order was present in the MLB game feed yet.",
+    }
+
+
+def _clean_lineup_seed(lineup: pd.DataFrame | None) -> pd.DataFrame:
+    if lineup is None or lineup.empty:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean = lineup[[column for column in ["player_id", "LineupSpot"] if column in lineup.columns]].copy()
+    if set(clean.columns) != {"player_id", "LineupSpot"}:
+        return pd.DataFrame(columns=["player_id", "LineupSpot"])
+    clean["player_id"] = pd.to_numeric(clean["player_id"], errors="coerce")
+    clean["LineupSpot"] = pd.to_numeric(clean["LineupSpot"], errors="coerce")
+    clean = clean.dropna(subset=["player_id", "LineupSpot"])
+    clean = clean[clean["LineupSpot"].between(1, 9)]
+    clean["player_id"] = clean["player_id"].astype(int)
+    clean["LineupSpot"] = clean["LineupSpot"].astype(int)
+    return clean.drop_duplicates("LineupSpot").sort_values("LineupSpot").reset_index(drop=True)
+
+
+def _lineup_fingerprint(lineup: pd.DataFrame) -> str:
+    clean = _clean_lineup_seed(lineup)
+    if clean.empty:
+        return "fallback"
+    return "_".join(
+        f"{int(row.player_id)}-{int(row.LineupSpot)}"
+        for row in clean.itertuples(index=False)
+    )
+
+
+def match_statcast_team(team_code: str, available_teams: list[str]) -> str | None:
+    code = str(team_code or "").upper().strip()
+    available_lookup = {str(team).upper().strip(): str(team) for team in available_teams}
+    if code in available_lookup:
+        return available_lookup[code]
+    alias = TEAM_ALIASES.get(code)
+    if alias in available_lookup:
+        return available_lookup[alias]
+    return None
+
+
+def pitcher_row_from_id(pitcher_summary: pd.DataFrame, pitcher_id: object) -> pd.Series | None:
+    if pitcher_id is None:
+        return None
+    numeric_id = pd.to_numeric(pd.Series([pitcher_id]), errors="coerce").iloc[0]
+    if pd.isna(numeric_id):
+        return None
+    rows = pitcher_summary[pitcher_summary["pitcher"].astype("Int64").eq(int(numeric_id))]
+    if rows.empty:
+        return None
+    return rows.iloc[0]
+
+
+def manual_matchup_controls(
+    pitcher_summary: pd.DataFrame,
+    available_teams: list[str],
+    key_prefix: str,
+) -> dict:
+    c1, c2, c3 = st.columns([1.35, 1.0, 0.75])
+    with c1:
+        selected_display = st.selectbox(
+            "Starting pitcher",
+            pitcher_summary["Display"].tolist(),
+            key=f"{key_prefix}_manual_pitcher",
+        )
+        row = pitcher_summary.loc[pitcher_summary["Display"].eq(selected_display)].iloc[0]
+    with c2:
+        opponent_teams = [
+            team for team in available_teams if team != str(row["Pitcher_Team"])
+        ]
+        selected_team = st.selectbox(
+            "Batting team",
+            opponent_teams,
+            key=f"{key_prefix}_manual_team",
+        )
+    with c3:
+        side = st.radio(
+            "Side",
+            ["Away", "Home"],
+            horizontal=True,
+            key=f"{key_prefix}_manual_side",
+        )
+    return {
+        "pitcher_id": int(row["pitcher"]),
+        "pitcher_display": selected_display,
+        "pitcher_name": str(row["Player_Name"]),
+        "pitcher_team": str(row["Pitcher_Team"]),
+        "batting_team": selected_team,
+        "home_away": side,
+        "venue": "Manual matchup",
+        "time_et": "",
+        "status": "Manual",
+        "away_abbr": selected_team if side == "Away" else str(row["Pitcher_Team"]),
+        "home_abbr": selected_team if side == "Home" else str(row["Pitcher_Team"]),
+        "game_pk": None,
+        "game_datetime_utc": None,
+        "batting_team_id": team_id_from_code(selected_team),
+        "opponent_team_id": team_id_from_code(str(row["Pitcher_Team"])),
+        "slate_date": date.today().isoformat(),
+    }
+
+
+
+def render_slate_game_cards(games: list[dict], key_prefix: str) -> object:
+    state_key = f"{key_prefix}_selected_game_pk"
+    valid_ids = [game["game_pk"] for game in games]
+    if st.session_state.get(state_key) not in valid_ids:
+        st.session_state[state_key] = valid_ids[0]
+
+    cards_per_row = 6
+    for start in range(0, len(games), cards_per_row):
+        chunk = games[start : start + cards_per_row]
+        columns = st.columns(cards_per_row)
+        for index, column in enumerate(columns):
+            if index >= len(chunk):
+                continue
+            game = chunk[index]
+            selected = st.session_state[state_key] == game["game_pk"]
+            away_logo = team_logo_url(game.get("away_id"))
+            home_logo = team_logo_url(game.get("home_id"))
+            selected_class = " selected" if selected else ""
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="slate-card{selected_class}">
+                        <div class="slate-logos">
+                            <img src="{away_logo}" alt="{escape(str(game['away_abbr']))}">
+                            <span class="slate-at">@</span>
+                            <img src="{home_logo}" alt="{escape(str(game['home_abbr']))}">
+                        </div>
+                        <div class="slate-game">{escape(str(game['away_abbr']))} @ {escape(str(game['home_abbr']))}</div>
+                        <div class="slate-time">{escape(str(game['time_et']))}</div>
+                        <div class="slate-venue">{escape(str(game['venue']))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "Selected" if selected else "Select game",
+                    key=f"{key_prefix}_game_card_{game['game_pk']}",
+                    use_container_width=True,
+                    type="primary" if selected else "secondary",
+                ):
+                    if not selected:
+                        st.session_state[state_key] = game["game_pk"]
+                        st.rerun()
+    return st.session_state[state_key]
+
+
+def render_matchup_hero(matchup: dict, model_label: str) -> None:
+    away_abbr = str(matchup.get("away_abbr", "AWAY"))
+    home_abbr = str(matchup.get("home_abbr", "HOME"))
+    away_id = matchup.get("away_id") or team_id_from_code(away_abbr)
+    home_id = matchup.get("home_id") or team_id_from_code(home_abbr)
+    away_logo = team_logo_url(away_id)
+    home_logo = team_logo_url(home_id)
+    away_color, _ = team_palette(away_abbr)
+    home_color, _ = team_palette(home_abbr)
+    probable_text = matchup.get("probables") or ""
+    st.markdown(
+        f"""
+        <div class="matchup-hero" style="--away:{away_color}; --home:{home_color};">
+            <div class="hero-team">
+                <img src="{away_logo}" alt="{escape(away_abbr)}">
+                <div class="hero-abbr">{escape(away_abbr)}</div>
+            </div>
+            <div class="hero-center">
+                <div class="hero-badge">{escape(model_label)}</div>
+                <div class="hero-title">{escape(away_abbr)} @ {escape(home_abbr)}</div>
+                <div class="hero-meta">{escape(str(matchup.get('time_et', '')))} · {escape(str(matchup.get('venue', '')))} · {escape(str(matchup.get('status', '')))}</div>
+                <div class="hero-probables">{escape(str(probable_text))}</div>
+            </div>
+            <div class="hero-team">
+                <img src="{home_logo}" alt="{escape(home_abbr)}">
+                <div class="hero-abbr">{escape(home_abbr)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_board_header(matchup: dict, batting_team: str, pitcher_name: str, model_label: str) -> None:
+    batting_team_id = matchup.get("batting_team_id") or team_id_from_code(batting_team)
+    logo = team_logo_url(batting_team_id)
+    st.markdown(
+        f"""
+        <div class="board-heading">
+            <img src="{logo}" alt="{escape(str(batting_team))}">
+            <div>
+                <div style="font-size:.72rem;font-weight:900;letter-spacing:.11em;text-transform:uppercase;color:#bfdbfe;">{escape(model_label)}</div>
+                <h2>{escape(str(batting_team))} hitters vs {escape(str(pitcher_name))}</h2>
+                <p>{escape(str(matchup.get('away_abbr', '')))} @ {escape(str(matchup.get('home_abbr', '')))} · {escape(str(matchup.get('time_et', '')))} · {escape(str(matchup.get('venue', '')))}</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def matchup_selector(
+    pitcher_summary: pd.DataFrame,
+    available_teams: list[str],
+    key_prefix: str,
+) -> dict:
+    model_label = "ADVANCED HIT MODEL" if "hit" in key_prefix else "ADVANCED HR MODEL"
+    st.subheader("Choose a matchup")
+    source = st.radio(
+        "Matchup source",
+        ["MLB slate", "Manual matchup"],
+        horizontal=True,
+        key=f"{key_prefix}_source",
+    )
+
+    if source == "MLB slate":
+        slate_date = st.date_input(
+            "Slate date",
+            value=date.today(),
+            key=f"{key_prefix}_slate_date",
+        )
+        games, schedule_error = fetch_mlb_schedule(slate_date.isoformat())
+        if schedule_error:
+            st.warning(f"The MLB slate could not be loaded: {schedule_error}")
+        if games:
+            st.caption(f"{len(games)} games · select a matchup card")
+            selected_game_pk = render_slate_game_cards(games, key_prefix)
+            game = next(game for game in games if game["game_pk"] == selected_game_pk)
+
+            offense_key = f"{key_prefix}_offense_side_{selected_game_pk}"
+            if st.session_state.get(offense_key) not in {"away", "home"}:
+                st.session_state[offense_key] = "away"
+
+            st.markdown("#### Analyze offense")
+            offense_columns = st.columns(2)
+            for side_name, column, team_id, abbr, full_name in [
+                ("away", offense_columns[0], game["away_id"], game["away_abbr"], game["away_name"]),
+                ("home", offense_columns[1], game["home_id"], game["home_abbr"], game["home_name"]),
+            ]:
+                selected_offense = st.session_state[offense_key] == side_name
+                with column:
+                    st.markdown(
+                        f"""
+                        <div class="offense-choice">
+                            <img src="{team_logo_url(team_id)}" alt="{escape(str(abbr))}"><br>
+                            <b>{escape(str(full_name))}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        f"Analyze {abbr} hitters",
+                        key=f"{key_prefix}_offense_button_{selected_game_pk}_{side_name}",
+                        use_container_width=True,
+                        type="primary" if selected_offense else "secondary",
+                    ):
+                        if not selected_offense:
+                            st.session_state[offense_key] = side_name
+                            st.rerun()
+
+            away_offense = st.session_state[offense_key] == "away"
+            batting_code = game["away_abbr"] if away_offense else game["home_abbr"]
+            opponent_code = game["home_abbr"] if away_offense else game["away_abbr"]
+            batting_team_id = game["away_id"] if away_offense else game["home_id"]
+            opponent_team_id = game["home_id"] if away_offense else game["away_id"]
+            probable_id = game["home_pitcher_id"] if away_offense else game["away_pitcher_id"]
+            probable_name = game["home_pitcher_name"] if away_offense else game["away_pitcher_name"]
+            selected_team = match_statcast_team(batting_code, available_teams)
+            opponent_team = match_statcast_team(opponent_code, available_teams) or opponent_code
+
+            if selected_team is None:
+                st.warning(
+                    f"{batting_code} was not found in the loaded Statcast sample. "
+                    "Choose the matching team manually."
+                )
+                selected_team = st.selectbox(
+                    "Batting team in Statcast data",
+                    available_teams,
+                    key=f"{key_prefix}_team_fallback",
+                )
+                batting_team_id = team_id_from_code(selected_team) or batting_team_id
+
+            probable_row = pitcher_row_from_id(pitcher_summary, probable_id)
+            if probable_row is None:
+                st.info(
+                    f"{probable_name} is not available in the loaded pitcher sample, "
+                    "or the probable pitcher is still TBD. Select the starter below."
+                )
+                preferred = pitcher_summary[
+                    pitcher_summary["Pitcher_Team"].astype(str).eq(str(opponent_team))
+                ]
+                choices = preferred if not preferred.empty else pitcher_summary
+                selected_display = st.selectbox(
+                    "Starting pitcher override",
+                    choices["Display"].tolist(),
+                    key=f"{key_prefix}_pitcher_override_{selected_game_pk}_{batting_code}",
+                )
+                probable_row = choices.loc[choices["Display"].eq(selected_display)].iloc[0]
+            else:
+                selected_display = str(probable_row["Display"])
+                st.caption(f"Starter selected automatically: {selected_display}")
+
+            matchup = {
+                "pitcher_id": int(probable_row["pitcher"]),
+                "pitcher_display": selected_display,
+                "pitcher_name": str(probable_row["Player_Name"]),
+                "pitcher_team": str(probable_row["Pitcher_Team"]),
+                "batting_team": selected_team,
+                "home_away": "Away" if away_offense else "Home",
+                "venue": game["venue"],
+                "time_et": game["time_et"],
+                "status": game["status"],
+                "away_abbr": game["away_abbr"],
+                "home_abbr": game["home_abbr"],
+                "away_id": game["away_id"],
+                "home_id": game["home_id"],
+                "game_pk": game["game_pk"],
+                "game_datetime_utc": game.get("game_datetime_utc"),
+                "batting_team_id": batting_team_id,
+                "opponent_team_id": opponent_team_id,
+                "slate_date": slate_date.isoformat(),
+                "probables": f"Probables: {game['away_pitcher_name']} vs {game['home_pitcher_name']}",
+            }
+            render_matchup_hero(matchup, model_label)
+            return matchup
+
+        st.info("No MLB games were returned for that date. Use manual matchup mode below.")
+
+    matchup = manual_matchup_controls(pitcher_summary, available_teams, key_prefix)
+    matchup["away_id"] = team_id_from_code(matchup.get("away_abbr"))
+    matchup["home_id"] = team_id_from_code(matchup.get("home_abbr"))
+    matchup["probables"] = f"Selected starter: {matchup.get('pitcher_name', '')}"
+    render_matchup_hero(matchup, model_label)
+    return matchup
+
+
+def render_leader_cards(
+    rankings: pd.DataFrame,
+    probability_column: str,
+    score_column: str,
+    probability_label: str,
+) -> None:
+    leaders = rankings.head(3)
+    columns = st.columns(3)
+    for index, (_, row) in enumerate(leaders.iterrows()):
+        with columns[index]:
+            lineup_text = "—" if pd.isna(row.get("LineupSpot")) else f"#{int(row['LineupSpot'])} lineup"
+            confidence_text = row.get("Confidence_Level", "")
+            expected_count = pd.to_numeric(pd.Series([row.get(BINARY_EXPECTED_COUNT_COLUMN)]), errors="coerce").iloc[0]
+            expected_text = (
+                f"{BINARY_EXPECTED_COUNT_LABEL.lower()} {expected_count:.2f}"
+                if pd.notna(expected_count) else ""
+            )
+            two_plus_probability = pd.to_numeric(
+                pd.Series([row.get("Model_2plus_Hit")]), errors="coerce"
+            ).iloc[0]
+            two_plus_text = (
+                f"2+ hit {two_plus_probability:.1%}"
+                if pd.notna(two_plus_probability) else "2+ hit —"
+            )
+            detail_parts = [part for part in [two_plus_text, expected_text] if part]
+            detail_text = " · ".join(detail_parts)
+            st.markdown(
+                f"""
+                <div class="leader-card">
+                    <div class="leader-rank">RANK {int(row['Rank'])}</div>
+                    <div class="leader-name">{row['Player']}</div>
+                    <div class="leader-prob">{row[probability_column]:.1%}</div>
+                    <div class="leader-sub">{probability_label} · {detail_text}</div>
+                    <div class="leader-sub">{score_column.replace('Score', ' score')} {row[score_column]:.1f} · {lineup_text} · {confidence_text} confidence</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
 
 # -----------------------------------------------------------------------------
-# The Odds API: automatic pitcher prop lines
+# Binary outcome backtesting and probability calibration
 # -----------------------------------------------------------------------------
+BINARY_MODEL_VERSION = "hits-backtest-calibration-v1"
+BINARY_TARGET_LABEL = "1+ Hit"
+BINARY_TARGET_SLUG = "hits"
+BINARY_PROBABILITY_COLUMN = "Model_1plus_Hit"
+BINARY_RAW_PROBABILITY_COLUMN = "Raw_Model_1plus_Hit"
+BINARY_SCORE_COLUMN = "HitScore"
+BINARY_EVENT_KIND = "hit"
+BINARY_EXPECTED_COUNT_COLUMN = "Projected_Hits"
+BINARY_EXPECTED_COUNT_LABEL = "Projected Hits"
+BINARY_PER_PA_COLUMN = "Model_Hit_Per_PA"
+BINARY_MIN_CALIBRATION_ROWS = 200
+
+# Persistent ML and forward-tracking storage. The location can be overridden on
+# hosted deployments with HIT_DASHBOARD_DATA_DIR.
+PERSISTENCE_VERSION = 1
+ML_FEATURES = [
+    "Hit_PA", "xHit_PA", "Contact_Pct", "K_Pct", "HH_Pct", "LD_Pct",
+    "Projected_PA",
+]
+ML_DEFAULTS = {
+    "Hit_PA": 0.225, "xHit_PA": 0.225, "Contact_Pct": 0.76,
+    "K_Pct": 0.23, "HH_Pct": 0.38, "LD_Pct": 0.24,
+    "Projected_PA": 4.2,
+}
+
+
+def persistence_paths() -> dict[str, Path]:
+    configured = str(os.getenv("HIT_DASHBOARD_DATA_DIR", "")).strip()
+    root = Path(configured).expanduser() if configured else Path(__file__).resolve().parent / ".hit_dashboard_data"
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        "root": root,
+        "database": root / "hits_dashboard.sqlite3",
+        "model": root / "hits_ml_model.json",
+        "calibration": root / "hits_ml_calibration.json",
+    }
+
+
+def hit_db_connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(persistence_paths()["database"], timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
+    return connection
+
+
+def initialize_hit_database() -> None:
+    with hit_db_connect() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS historical_games (
+                slate_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                player_name TEXT,
+                hit_pa REAL, xhit_pa REAL, contact_pct REAL, k_pct REAL,
+                hh_pct REAL, ld_pct REAL, projected_pa REAL,
+                actual_hit INTEGER NOT NULL, actual_hits INTEGER NOT NULL,
+                actual_pa INTEGER, source_start TEXT, source_end TEXT,
+                created_at_utc TEXT NOT NULL,
+                PRIMARY KEY (game_pk, player_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_historical_date ON historical_games(slate_date);
+
+            CREATE TABLE IF NOT EXISTS predictions (
+                slate_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                player_name TEXT,
+                batting_team TEXT,
+                opponent TEXT,
+                generated_at_utc TEXT NOT NULL,
+                game_datetime_utc TEXT,
+                lineup_status TEXT,
+                existing_probability REAL,
+                hit_score REAL,
+                raw_ml_probability REAL,
+                calibrated_ml_probability REAL,
+                ml_fair_odds REAL,
+                model_version TEXT NOT NULL,
+                training_date TEXT,
+                market_line REAL,
+                over_odds REAL,
+                market_probability REAL,
+                actual_hit INTEGER,
+                actual_hits INTEGER,
+                actual_pa INTEGER,
+                result_status TEXT DEFAULT 'Pending',
+                graded_at_utc TEXT,
+                PRIMARY KEY (slate_date, game_pk, player_id, model_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_predictions_pending
+                ON predictions(result_status, slate_date);
+
+            CREATE TABLE IF NOT EXISTS training_runs (
+                model_version TEXT PRIMARY KEY,
+                trained_at_utc TEXT NOT NULL,
+                training_end_date TEXT NOT NULL,
+                rows_total INTEGER NOT NULL,
+                rows_train INTEGER NOT NULL,
+                rows_calibration INTEGER NOT NULL,
+                rows_holdout INTEGER NOT NULL,
+                holdout_raw_brier REAL,
+                holdout_calibrated_brier REAL,
+                holdout_raw_logloss REAL,
+                holdout_calibrated_logloss REAL,
+                holdout_accuracy REAL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            """
+        )
+
+
+def utc_now_text() -> str:
+    return pd.Timestamp.now(tz="UTC").isoformat()
+
+
+def _safe_float(value: object, default: float = np.nan) -> float:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) and np.isfinite(float(numeric)) else float(default)
+
+
+def _probability_to_american_numeric(probability: object) -> float:
+    p = _safe_float(probability)
+    if not np.isfinite(p) or not 0 < p < 1:
+        return np.nan
+    return float(-100.0 * p / (1.0 - p)) if p >= 0.5 else float(100.0 * (1.0 - p) / p)
+
+
+def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
+    columns = []
+    for feature in ML_FEATURES:
+        values = pd.to_numeric(frame.get(feature, ML_DEFAULTS[feature]), errors="coerce")
+        if not isinstance(values, pd.Series):
+            values = pd.Series(values, index=frame.index)
+        columns.append(values.fillna(ML_DEFAULTS[feature]).to_numpy(dtype=float))
+    return np.column_stack(columns)
+
+
+def _fit_logistic_numpy(x: np.ndarray, y: np.ndarray, iterations: int = 1800, learning_rate: float = 0.04, l2: float = 0.002) -> tuple[float, np.ndarray]:
+    intercept = 0.0
+    weights = np.zeros(x.shape[1], dtype=float)
+    count = max(len(y), 1)
+    for _ in range(iterations):
+        prediction = _sigmoid(intercept + x @ weights)
+        error = prediction - y
+        intercept -= learning_rate * float(np.mean(error))
+        weights -= learning_rate * ((x.T @ error) / count + l2 * weights)
+    return float(intercept), weights
+
+
+def _metric_bundle(probability: np.ndarray, outcome: np.ndarray) -> dict[str, float]:
+    p = _clip_probability(probability)
+    y = np.asarray(outcome, dtype=float)
+    return {
+        "brier": float(np.mean(np.square(p - y))),
+        "logloss": float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p))),
+        "accuracy": float(np.mean((p >= 0.5) == y)),
+    }
+
+
+def _historical_game_rows(prepared: pd.DataFrame, source_start: str, source_end: str) -> pd.DataFrame:
+    if prepared is None or prepared.empty:
+        return pd.DataFrame()
+    work = prepared.copy()
+    work["player_id"] = pd.to_numeric(work.get("batter"), errors="coerce")
+    work["game_pk"] = pd.to_numeric(work.get("game_pk"), errors="coerce")
+    work["game_date"] = pd.to_datetime(work.get("game_date"), errors="coerce")
+    work = work.dropna(subset=["player_id", "game_pk", "game_date", "pa_key"])
+    if work.empty:
+        return pd.DataFrame()
+    names = lookup_names(tuple(work["player_id"].dropna().astype(int).unique().tolist()))
+    plate = work.sort_values(["game_date", "game_pk"]).groupby(
+        ["game_date", "game_pk", "player_id", "pa_key"], as_index=False
+    ).agg(
+        is_hit=("is_hit", "max"), is_k=("is_k", "max"),
+        xhit=("xba_value", "max"), swings=("is_swing", "sum"),
+        contacts=("is_contact", "sum"), bbe=("is_bbe", "max"),
+        hard_hit=("is_hard_hit", "max"), line_drive=("is_line_drive", "max"),
+    )
+    games = plate.groupby(["game_date", "game_pk", "player_id"], as_index=False).agg(
+        PA=("pa_key", "size"), Hits=("is_hit", "sum"), xHits=("xhit", "sum"),
+        K=("is_k", "sum"), Swings=("swings", "sum"), Contacts=("contacts", "sum"),
+        BBE=("bbe", "sum"), HardHits=("hard_hit", "sum"), LineDrives=("line_drive", "sum"),
+    ).sort_values(["player_id", "game_date", "game_pk"])
+    cumulative_columns = ["PA", "Hits", "xHits", "K", "Swings", "Contacts", "BBE", "HardHits", "LineDrives"]
+    for column in cumulative_columns:
+        games[f"Prior_{column}"] = games.groupby("player_id")[column].transform(lambda values: values.cumsum().shift(1)).fillna(0.0)
+    prior_pa = games["Prior_PA"]
+    games["Hit_PA"] = (games["Prior_Hits"] + 0.225 * 80.0) / (prior_pa + 80.0)
+    games["xHit_PA"] = (games["Prior_xHits"] + 0.225 * 80.0) / (prior_pa + 80.0)
+    games["Contact_Pct"] = (games["Prior_Contacts"] + 0.76 * 120.0) / (games["Prior_Swings"] + 120.0)
+    games["K_Pct"] = (games["Prior_K"] + 0.23 * 80.0) / (prior_pa + 80.0)
+    games["HH_Pct"] = (games["Prior_HardHits"] + 0.38 * 60.0) / (games["Prior_BBE"] + 60.0)
+    games["LD_Pct"] = (games["Prior_LineDrives"] + 0.24 * 60.0) / (games["Prior_BBE"] + 60.0)
+    games["Projected_PA"] = 4.2
+    games["actual_hit"] = games["Hits"].gt(0).astype(int)
+    games = games.merge(names, on="player_id", how="left")
+    games["source_start"] = source_start
+    games["source_end"] = source_end
+    return games
+
+
+def persist_historical_games(rows: pd.DataFrame) -> int:
+    if rows is None or rows.empty:
+        return 0
+    now = utc_now_text()
+    records = []
+    for row in rows.itertuples(index=False):
+        records.append((
+            str(pd.Timestamp(row.game_date).date()), int(row.game_pk), int(row.player_id),
+            str(getattr(row, "Player", "") or ""), float(row.Hit_PA), float(row.xHit_PA),
+            float(row.Contact_Pct), float(row.K_Pct), float(row.HH_Pct), float(row.LD_Pct),
+            float(row.Projected_PA), int(row.actual_hit), int(row.Hits), int(row.PA),
+            str(row.source_start), str(row.source_end), now,
+        ))
+    with hit_db_connect() as connection:
+        connection.executemany(
+            """INSERT INTO historical_games (
+                slate_date, game_pk, player_id, player_name, hit_pa, xhit_pa,
+                contact_pct, k_pct, hh_pct, ld_pct, projected_pa, actual_hit,
+                actual_hits, actual_pa, source_start, source_end, created_at_utc
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(game_pk, player_id) DO UPDATE SET
+                player_name=excluded.player_name, hit_pa=excluded.hit_pa,
+                xhit_pa=excluded.xhit_pa, contact_pct=excluded.contact_pct,
+                k_pct=excluded.k_pct, hh_pct=excluded.hh_pct, ld_pct=excluded.ld_pct,
+                projected_pa=excluded.projected_pa, actual_hit=excluded.actual_hit,
+                actual_hits=excluded.actual_hits, actual_pa=excluded.actual_pa,
+                source_start=excluded.source_start, source_end=excluded.source_end,
+                created_at_utc=excluded.created_at_utc""",
+            records,
+        )
+    return len(records)
+
+
+def run_historical_statcast_backfill(start_value: date, end_value: date, chunk_days: int = 14) -> dict:
+    if start_value > end_value:
+        raise ValueError("Backfill start date must be on or before the end date.")
+    cursor = start_value
+    summary = {"chunks": 0, "rows_written": 0, "errors": []}
+    prepared_chunks: list[pd.DataFrame] = []
+    while cursor <= end_value:
+        chunk_end = min(cursor + timedelta(days=max(int(chunk_days), 1) - 1), end_value)
+        try:
+            raw = load_statcast(cursor.isoformat(), chunk_end.isoformat())
+            prepared = prepare_data(raw)
+            if prepared is not None and not prepared.empty:
+                prepared_chunks.append(prepared)
+            summary["chunks"] += 1
+        except Exception as exc:
+            summary["errors"].append(f"{cursor} to {chunk_end}: {type(exc).__name__}: {exc}")
+        cursor = chunk_end + timedelta(days=1)
+    if prepared_chunks:
+        combined = pd.concat(prepared_chunks, ignore_index=True, sort=False)
+        historical = _historical_game_rows(combined, start_value.isoformat(), end_value.isoformat())
+        summary["rows_written"] = persist_historical_games(historical)
+    return summary
+
+
+def historical_training_frame() -> pd.DataFrame:
+    query = """SELECT slate_date AS SlateDate, game_pk AS GamePk, player_id AS PlayerID,
+        player_name AS Player, hit_pa AS Hit_PA, xhit_pa AS xHit_PA,
+        contact_pct AS Contact_Pct, k_pct AS K_Pct, hh_pct AS HH_Pct,
+        ld_pct AS LD_Pct, projected_pa AS Projected_PA, actual_hit AS ActualHit
+        FROM historical_games ORDER BY slate_date, game_pk, player_id"""
+    with hit_db_connect() as connection:
+        return pd.read_sql_query(query, connection)
+
+
+def train_chronological_hit_model(minimum_rows: int = 500) -> dict:
+    history = historical_training_frame()
+    if len(history) < minimum_rows or history["ActualHit"].nunique() < 2:
+        raise ValueError(f"At least {minimum_rows:,} historical player-games with both outcomes are required; found {len(history):,}.")
+    history["SlateDate"] = pd.to_datetime(history["SlateDate"], errors="coerce")
+    history = history.dropna(subset=["SlateDate"]).sort_values(["SlateDate", "GamePk", "PlayerID"]).reset_index(drop=True)
+    n = len(history)
+    train_end = max(int(n * 0.70), 1)
+    calibration_end = max(int(n * 0.80), train_end + 1)
+    train = history.iloc[:train_end]
+    calibration = history.iloc[train_end:calibration_end]
+    holdout = history.iloc[calibration_end:]
+    if calibration.empty or holdout.empty or train["ActualHit"].nunique() < 2:
+        raise ValueError("Chronological train/calibration/holdout split did not contain enough outcome variation.")
+    x_train_raw = _feature_matrix(train)
+    mean = x_train_raw.mean(axis=0)
+    scale = x_train_raw.std(axis=0)
+    scale[scale < 1e-8] = 1.0
+    x_train = (x_train_raw - mean) / scale
+    intercept, weights = _fit_logistic_numpy(x_train, train["ActualHit"].to_numpy(dtype=float))
+    def raw_probability(frame: pd.DataFrame) -> np.ndarray:
+        return _sigmoid(intercept + ((_feature_matrix(frame) - mean) / scale) @ weights)
+    calibration_raw = raw_probability(calibration)
+    calibration_x = _logit(calibration_raw).reshape(-1, 1)
+    calibration_intercept, calibration_weight = _fit_logistic_numpy(
+        calibration_x, calibration["ActualHit"].to_numpy(dtype=float),
+        iterations=1400, learning_rate=0.03, l2=0.001,
+    )
+    holdout_raw = raw_probability(holdout)
+    holdout_calibrated = _sigmoid(calibration_intercept + calibration_weight[0] * _logit(holdout_raw))
+    raw_metrics = _metric_bundle(holdout_raw, holdout["ActualHit"].to_numpy(dtype=float))
+    calibrated_metrics = _metric_bundle(holdout_calibrated, holdout["ActualHit"].to_numpy(dtype=float))
+    trained_at = utc_now_text()
+    training_end_date = str(train["SlateDate"].max().date())
+    model_version = f"hits-ml-{pd.Timestamp(trained_at).strftime('%Y%m%dT%H%M%SZ')}"
+    payload = {
+        "schema_version": PERSISTENCE_VERSION, "target": "1+ hit",
+        "model_version": model_version, "trained_at_utc": trained_at,
+        "training_end_date": training_end_date, "features": ML_FEATURES,
+        "feature_mean": mean.tolist(), "feature_scale": scale.tolist(),
+        "intercept": intercept, "weights": weights.tolist(),
+        "calibration_intercept": calibration_intercept,
+        "calibration_slope": float(calibration_weight[0]),
+        "rows_total": n, "rows_train": len(train),
+        "rows_calibration": len(calibration), "rows_holdout": len(holdout),
+        "holdout_raw_brier": raw_metrics["brier"],
+        "holdout_calibrated_brier": calibrated_metrics["brier"],
+        "holdout_raw_logloss": raw_metrics["logloss"],
+        "holdout_calibrated_logloss": calibrated_metrics["logloss"],
+        "holdout_accuracy": calibrated_metrics["accuracy"],
+    }
+    paths = persistence_paths()
+    paths["model"].write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    paths["calibration"].write_text(json.dumps({
+        "model_version": model_version, "trained_at_utc": trained_at,
+        "method": "chronological Platt scaling",
+        "intercept": calibration_intercept, "slope": float(calibration_weight[0]),
+        "calibration_rows": len(calibration),
+    }, indent=2), encoding="utf-8")
+    with hit_db_connect() as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO training_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (model_version, trained_at, training_end_date, n, len(train), len(calibration), len(holdout),
+             raw_metrics["brier"], calibrated_metrics["brier"], raw_metrics["logloss"],
+             calibrated_metrics["logloss"], calibrated_metrics["accuracy"], json.dumps(payload)),
+        )
+    return payload
+
+
+def load_saved_hit_model() -> dict | None:
+    path = persistence_paths()["model"]
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if payload.get("features") == ML_FEATURES else None
+    except Exception:
+        return None
+
+
+def add_ml_hit_predictions(board: pd.DataFrame, model: dict | None) -> pd.DataFrame:
+    output = board.copy()
+    output["Raw_ML_Hit_Probability"] = np.nan
+    output["Calibrated_ML_Hit_Probability"] = np.nan
+    output["ML_Fair_Odds"] = np.nan
+    output["ML_Model_Version"] = "Not trained"
+    output["ML_Training_Date"] = ""
+    if not model or output.empty:
+        return output
+    mean = np.asarray(model["feature_mean"], dtype=float)
+    scale = np.asarray(model["feature_scale"], dtype=float)
+    weights = np.asarray(model["weights"], dtype=float)
+    raw = _sigmoid(float(model["intercept"]) + ((_feature_matrix(output) - mean) / scale) @ weights)
+    calibrated = _sigmoid(float(model["calibration_intercept"]) + float(model["calibration_slope"]) * _logit(raw))
+    output["Raw_ML_Hit_Probability"] = raw
+    output["Calibrated_ML_Hit_Probability"] = calibrated
+    output["ML_Fair_Odds"] = pd.Series(calibrated, index=output.index).map(_probability_to_american_numeric)
+    output["ML_Model_Version"] = str(model.get("model_version", ""))
+    output["ML_Training_Date"] = str(model.get("trained_at_utc", ""))
+    return output
+
+
+def save_pregame_predictions(board: pd.DataFrame, matchup: dict, lineup_status: str) -> int:
+    if board is None or board.empty or not matchup.get("game_pk"):
+        return 0
+    game_pk = int(matchup["game_pk"])
+    slate_date = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    status = str(matchup.get("status") or "").lower()
+    if any(word in status for word in ["final", "completed", "game over", "in progress", "live", "delayed"]):
+        return 0
+    scheduled = pd.to_datetime(matchup.get("game_datetime_utc"), utc=True, errors="coerce")
+    if pd.notna(scheduled) and pd.Timestamp.now(tz="UTC") >= scheduled:
+        return 0
+    generated = utc_now_text()
+    opponent = str(matchup.get("pitcher_name") or "")
+    records = []
+    for _, row in board.iterrows():
+        player_id = pd.to_numeric(pd.Series([row.get("player_id")]), errors="coerce").iloc[0]
+        if pd.isna(player_id):
+            continue
+        version = str(row.get("ML_Model_Version") or "Not trained")
+        records.append((
+            slate_date, game_pk, int(player_id), str(row.get("Player") or ""),
+            str(matchup.get("batting_team") or ""), opponent, generated,
+            str(matchup.get("game_datetime_utc") or ""), lineup_status,
+            _safe_float(row.get("Model_1plus_Hit")), _safe_float(row.get("HitScore")),
+            _safe_float(row.get("Raw_ML_Hit_Probability")),
+            _safe_float(row.get("Calibrated_ML_Hit_Probability")),
+            _safe_float(row.get("ML_Fair_Odds")), version,
+            str(row.get("ML_Training_Date") or ""), _safe_float(row.get("Market_Line")),
+            _safe_float(row.get("Over_Odds")), _safe_float(row.get("Market_Over_Prob")),
+        ))
+    with hit_db_connect() as connection:
+        connection.executemany(
+            """INSERT INTO predictions (
+                slate_date, game_pk, player_id, player_name, batting_team, opponent,
+                generated_at_utc, game_datetime_utc, lineup_status,
+                existing_probability, hit_score, raw_ml_probability,
+                calibrated_ml_probability, ml_fair_odds, model_version,
+                training_date, market_line, over_odds, market_probability
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(slate_date, game_pk, player_id, model_version) DO UPDATE SET
+                player_name=excluded.player_name, batting_team=excluded.batting_team,
+                opponent=excluded.opponent, generated_at_utc=excluded.generated_at_utc,
+                game_datetime_utc=excluded.game_datetime_utc,
+                lineup_status=excluded.lineup_status,
+                existing_probability=excluded.existing_probability,
+                hit_score=excluded.hit_score,
+                raw_ml_probability=excluded.raw_ml_probability,
+                calibrated_ml_probability=excluded.calibrated_ml_probability,
+                ml_fair_odds=excluded.ml_fair_odds,
+                training_date=excluded.training_date, market_line=excluded.market_line,
+                over_odds=excluded.over_odds, market_probability=excluded.market_probability
+            """,
+            records,
+        )
+    return len(records)
+
+
+def grade_pending_predictions() -> dict[str, int]:
+    today_text = str(date.today())
+    with hit_db_connect() as connection:
+        games = connection.execute(
+            """SELECT DISTINCT game_pk FROM predictions
+               WHERE result_status='Pending' AND slate_date < ?""", (today_text,)
+        ).fetchall()
+    summary = {"games_checked": 0, "rows_graded": 0, "games_pending": 0, "errors": 0}
+    for game in games:
+        game_pk = int(game["game_pk"])
+        try:
+            result = fetch_completed_batter_results(game_pk)
+            summary["games_checked"] += 1
+            if not result.get("final"):
+                summary["games_pending"] += 1
+                continue
+            official = result.get("data", pd.DataFrame())
+            if official is None or official.empty:
+                official_by_player = {}
+            else:
+                official_by_player = {
+                    int(row.PlayerID): row
+                    for row in official.itertuples(index=False)
+                    if pd.notna(getattr(row, "PlayerID", np.nan))
+                }
+            graded_at = utc_now_text()
+            with hit_db_connect() as connection:
+                pending = connection.execute(
+                    "SELECT player_id FROM predictions WHERE game_pk=? AND result_status='Pending'", (game_pk,)
+                ).fetchall()
+                for row in pending:
+                    player = official_by_player.get(int(row["player_id"]))
+                    hits = int(getattr(player, "Actual_Hits", 0) or 0)
+                    pa = int(getattr(player, "Actual_PA", 0) or 0)
+                    if player is None or pa <= 0:
+                        connection.execute(
+                            """UPDATE predictions SET result_status='No PA', graded_at_utc=?
+                               WHERE game_pk=? AND player_id=? AND result_status='Pending'""",
+                            (graded_at, game_pk, int(row["player_id"])),
+                        )
+                        continue
+                    connection.execute(
+                        """UPDATE predictions SET actual_hit=?, actual_hits=?, actual_pa=?,
+                           result_status='Final', graded_at_utc=?
+                           WHERE game_pk=? AND player_id=? AND result_status='Pending'""",
+                        (int(hits > 0), hits, pa, graded_at, game_pk, int(row["player_id"])),
+                    )
+                    summary["rows_graded"] += 1
+        except Exception:
+            summary["errors"] += 1
+    return summary
+
+
+def forward_performance_frame() -> pd.DataFrame:
+    with hit_db_connect() as connection:
+        return pd.read_sql_query(
+            """SELECT * FROM predictions WHERE result_status='Final'
+               ORDER BY slate_date, game_pk, player_id""", connection
+        )
+
+
+def forward_performance_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    rows = []
+    for label, column in [
+        ("Existing dashboard probability", "existing_probability"),
+        ("Raw ML probability", "raw_ml_probability"),
+        ("Calibrated ML probability", "calibrated_ml_probability"),
+    ]:
+        valid = frame[[column, "actual_hit"]].apply(pd.to_numeric, errors="coerce").dropna()
+        if valid.empty:
+            continue
+        metrics = _metric_bundle(valid[column].to_numpy(), valid["actual_hit"].to_numpy())
+        rows.append({"Probability": label, "Rows": len(valid), "Brier": metrics["brier"], "Log Loss": metrics["logloss"], "Accuracy": metrics["accuracy"], "Actual Hit Rate": valid["actual_hit"].mean(), "Average Forecast": valid[column].mean()})
+    return pd.DataFrame(rows)
+
+
+def render_persistent_ml_section() -> None:
+    st.divider()
+    st.markdown("### Persistent database, ML model, and forward results")
+    st.caption(
+        "Pregame predictions save automatically to SQLite. Completed games are graded "
+        "from official MLB results, so a daily master CSV is no longer required."
+    )
+    paths = persistence_paths()
+    model = load_saved_hit_model()
+    with hit_db_connect() as connection:
+        historical_count = int(connection.execute("SELECT COUNT(*) FROM historical_games").fetchone()[0])
+        prediction_count = int(connection.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
+        pending_count = int(connection.execute("SELECT COUNT(*) FROM predictions WHERE result_status='Pending'").fetchone()[0])
+        final_count = int(connection.execute("SELECT COUNT(*) FROM predictions WHERE result_status='Final'").fetchone()[0])
+    status_columns = st.columns(4)
+    status_columns[0].metric("Historical player-games", f"{historical_count:,}")
+    status_columns[1].metric("Saved predictions", f"{prediction_count:,}")
+    status_columns[2].metric("Pending grades", f"{pending_count:,}")
+    status_columns[3].metric("Forward results", f"{final_count:,}")
+    if model:
+        st.success(
+            f"Saved hit model active · {model.get('model_version')} · trained "
+            f"{str(model.get('trained_at_utc', ''))[:10]} · holdout rows "
+            f"{int(model.get('rows_holdout', 0)):,}"
+        )
+        model_metrics = pd.DataFrame([{
+            "Training end": model.get("training_end_date"),
+            "Raw holdout Brier": model.get("holdout_raw_brier"),
+            "Calibrated holdout Brier": model.get("holdout_calibrated_brier"),
+            "Raw holdout log loss": model.get("holdout_raw_logloss"),
+            "Calibrated holdout log loss": model.get("holdout_calibrated_logloss"),
+            "Holdout accuracy": model.get("holdout_accuracy"),
+        }])
+        st.dataframe(model_metrics.style.format({
+            "Raw holdout Brier": "{:.4f}", "Calibrated holdout Brier": "{:.4f}",
+            "Raw holdout log loss": "{:.4f}", "Calibrated holdout log loss": "{:.4f}",
+            "Holdout accuracy": "{:.1%}",
+        }), hide_index=True, use_container_width=True)
+    else:
+        st.info("No saved ML hit model yet. Backfill historical Statcast rows, then train chronologically.")
+
+    backfill_tab, training_tab, forward_tab = st.tabs(["Historical backfill", "Train & holdout", "Forward performance"])
+    with backfill_tab:
+        default_end = date.today() - timedelta(days=1)
+        default_start = max(date(default_end.year - 1, 3, 20), default_end - timedelta(days=365))
+        date_columns = st.columns(2)
+        backfill_start = date_columns[0].date_input("Backfill start", value=default_start, max_value=default_end, key="hits_db_backfill_start")
+        backfill_end = date_columns[1].date_input("Backfill end", value=default_end, max_value=default_end, key="hits_db_backfill_end")
+        st.caption("Data is downloaded in 14-day chunks and upserted by game and player, so rerunning overlapping dates does not duplicate rows.")
+        if st.button("Run historical Statcast backfill", type="primary", key="hits_db_run_backfill"):
+            with st.spinner("Downloading and storing historical Statcast player-games..."):
+                result = run_historical_statcast_backfill(backfill_start, backfill_end)
+            if result["errors"]:
+                st.warning(f"Stored {result['rows_written']:,} rows across {result['chunks']:,} chunks with {len(result['errors'])} chunk error(s).")
+                with st.expander("Backfill errors"):
+                    st.code("\n".join(result["errors"]))
+            else:
+                st.success(f"Backfill complete: {result['rows_written']:,} player-games processed across {result['chunks']:,} chunks.")
+            st.rerun()
+    with training_tab:
+        minimum_rows = st.number_input("Minimum historical rows", min_value=200, max_value=100000, value=500, step=100, key="hits_db_min_training_rows")
+        st.caption("Split order is fixed chronologically: first 70% training, next 10% calibration, newest 20% untouched holdout.")
+        if st.button("Train and save chronological hit model", type="primary", key="hits_db_train_model"):
+            try:
+                with st.spinner("Training model, fitting calibration, and scoring the newest holdout..."):
+                    trained = train_chronological_hit_model(int(minimum_rows))
+                st.success(f"Saved {trained['model_version']} with {trained['rows_holdout']:,} untouched holdout rows.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Training failed: {type(exc).__name__}: {exc}")
+        if model:
+            st.download_button("Download saved hit model", paths["model"].read_bytes(), "hits_ml_model.json", "application/json", key="hits_download_ml_model")
+            st.download_button("Download saved ML calibration", paths["calibration"].read_bytes(), "hits_ml_calibration.json", "application/json", key="hits_download_ml_calibration")
+    with forward_tab:
+        if st.button("Fetch and grade completed results now", key="hits_db_grade_now"):
+            result = grade_pending_predictions()
+            st.success(f"Checked {result['games_checked']:,} games and graded {result['rows_graded']:,} prediction rows.")
+            st.rerun()
+        forward = forward_performance_frame()
+        summary = forward_performance_summary(forward)
+        if summary.empty:
+            st.info("Forward metrics appear after saved pregame predictions have completed and been graded.")
+        else:
+            st.dataframe(summary.style.format({
+                "Brier": "{:.4f}", "Log Loss": "{:.4f}", "Accuracy": "{:.1%}",
+                "Actual Hit Rate": "{:.1%}", "Average Forecast": "{:.1%}",
+            }), hide_index=True, use_container_width=True)
+            by_version = forward.groupby("model_version", dropna=False).agg(
+                Rows=("actual_hit", "size"), Actual_Hit_Rate=("actual_hit", "mean"),
+                Average_ML_Probability=("calibrated_ml_probability", "mean"),
+                First_Date=("slate_date", "min"), Last_Date=("slate_date", "max"),
+            ).reset_index().sort_values("Last_Date", ascending=False)
+            st.dataframe(by_version.style.format({"Actual_Hit_Rate": "{:.1%}", "Average_ML_Probability": "{:.1%}"}), hide_index=True, use_container_width=True)
+            st.download_button("Download forward results CSV", forward.to_csv(index=False).encode("utf-8"), "hits_forward_results.csv", "text/csv", key="hits_download_forward")
+    st.caption(f"Persistent data directory: {paths['root']}")
+
+
+initialize_hit_database()
+
+
+def american_odds_to_probability(value: object) -> float:
+    odds = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(odds) or float(odds) == 0:
+        return np.nan
+    odds = float(odds)
+    if odds > 0:
+        return 100.0 / (odds + 100.0)
+    return (-odds) / ((-odds) + 100.0)
+
+
+def _clip_probability(values: object) -> np.ndarray:
+    return np.clip(np.asarray(values, dtype=float), 1e-6, 1 - 1e-6)
+
+
+def _sigmoid(values: object) -> np.ndarray:
+    x = np.clip(np.asarray(values, dtype=float), -35.0, 35.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _logit(values: object) -> np.ndarray:
+    p = _clip_probability(values)
+    return np.log(p / (1.0 - p))
+
+
+def parse_binary_calibration_upload(uploaded: object) -> tuple[dict | None, str | None]:
+    if uploaded is None:
+        return None, None
+    try:
+        content = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8-sig")
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            raise ValueError("Calibration file must contain a JSON object.")
+        if payload.get("target_slug") not in {None, BINARY_TARGET_SLUG}:
+            raise ValueError(
+                f"This file targets {payload.get('target_slug')}, not {BINARY_TARGET_SLUG}."
+            )
+        if not payload.get("ok", True):
+            raise ValueError("Calibration file does not contain a usable fitted model.")
+        for field in ["intercept", "slope"]:
+            if pd.isna(pd.to_numeric(pd.Series([payload.get(field)]), errors="coerce").iloc[0]):
+                raise ValueError(f"Calibration JSON is missing a numeric {field}.")
+        return payload, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def apply_binary_probability_calibration(
+    board: pd.DataFrame,
+    calibration: dict | None,
+) -> pd.DataFrame:
+    output = board.copy()
+    if BINARY_RAW_PROBABILITY_COLUMN not in output.columns:
+        output[BINARY_RAW_PROBABILITY_COLUMN] = pd.to_numeric(
+            output.get(BINARY_PROBABILITY_COLUMN), errors="coerce"
+        )
+    raw = pd.to_numeric(output[BINARY_RAW_PROBABILITY_COLUMN], errors="coerce")
+    output["Calibration_Applied"] = False
+    output["Calibration_Version"] = ""
+    if calibration:
+        intercept = pd.to_numeric(pd.Series([calibration.get("intercept")]), errors="coerce").iloc[0]
+        slope = pd.to_numeric(pd.Series([calibration.get("slope")]), errors="coerce").iloc[0]
+        if pd.notna(intercept) and pd.notna(slope):
+            calibrated = _sigmoid(float(intercept) + float(slope) * _logit(raw.fillna(0.5)))
+            output[BINARY_PROBABILITY_COLUMN] = np.clip(calibrated, 0.001, 0.999)
+            output["Calibration_Applied"] = True
+            output["Calibration_Version"] = str(
+                calibration.get("created_at_utc") or calibration.get("version") or "uploaded"
+            )
+    output = output.drop(columns=["Rank"], errors="ignore")
+    output = output.sort_values(
+        [BINARY_PROBABILITY_COLUMN, BINARY_SCORE_COLUMN], ascending=False
+    ).reset_index(drop=True)
+    output.insert(0, "Rank", np.arange(1, len(output) + 1))
+    return output
+
+
+def build_binary_projection_snapshot(
+    board: pd.DataFrame,
+    matchup: dict,
+    lookback_days: int,
+    loaded_start: object,
+    loaded_end: object,
+    lineup_status: str,
+    extra_context: dict | None = None,
+    generated_at_utc: str | None = None,
+) -> pd.DataFrame:
+    snapshot = board.copy()
+    if generated_at_utc is None:
+        generated_at_utc = pd.Timestamp.now(tz="UTC").isoformat()
+    default_slate_date = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    if "SlateDate" not in snapshot.columns:
+        snapshot["SlateDate"] = default_slate_date
+    else:
+        existing_slate_dates = snapshot["SlateDate"]
+        missing_slate_dates = existing_slate_dates.isna() | existing_slate_dates.astype(str).str.strip().eq("")
+        snapshot["SlateDate"] = existing_slate_dates.where(~missing_slate_dates, default_slate_date)
+    if "GameDateTimeUTC" not in snapshot.columns:
+        snapshot["GameDateTimeUTC"] = matchup.get("game_datetime_utc")
+    else:
+        existing_game_times = snapshot["GameDateTimeUTC"]
+        missing_game_times = existing_game_times.isna() | existing_game_times.astype(str).str.strip().eq("")
+        snapshot["GameDateTimeUTC"] = existing_game_times.where(~missing_game_times, matchup.get("game_datetime_utc"))
+    snapshot["GeneratedAtUTC"] = str(generated_at_utc)
+    snapshot["ModelVersion"] = BINARY_MODEL_VERSION
+    snapshot["Target"] = BINARY_TARGET_LABEL
+    snapshot["LookbackDays"] = int(lookback_days)
+    snapshot["StatcastStart"] = str(pd.Timestamp(loaded_start).date())
+    snapshot["StatcastEnd"] = str(pd.Timestamp(loaded_end).date())
+    def preserve_or_fill(column: str, fallback: object) -> None:
+        if column not in snapshot.columns:
+            snapshot[column] = fallback
+            return
+        existing = snapshot[column]
+        missing = existing.isna()
+        if existing.dtype == object:
+            missing = missing | existing.astype(str).str.strip().eq("")
+        snapshot[column] = existing.where(~missing, fallback)
+
+    preserve_or_fill("GamePK", matchup.get("game_pk"))
+    snapshot["PlayerID"] = pd.to_numeric(snapshot.get("player_id", snapshot.get("PlayerID")), errors="coerce")
+    preserve_or_fill("Team", str(matchup.get("batting_team") or ""))
+    preserve_or_fill("Opponent", str(matchup.get("pitcher_team") or ""))
+    preserve_or_fill("HomeAway", str(matchup.get("home_away") or ""))
+    preserve_or_fill("Venue", str(matchup.get("venue") or ""))
+    preserve_or_fill("StartingPitcherID", matchup.get("pitcher_id"))
+    preserve_or_fill("StartingPitcher", str(matchup.get("pitcher_name") or ""))
+    preserve_or_fill("LineupStatus", str(lineup_status or "Unknown"))
+    preserve_or_fill("GameDateTimeUTC", matchup.get("game_datetime_utc"))
+    snapshot["RawProbability"] = pd.to_numeric(
+        snapshot.get(BINARY_RAW_PROBABILITY_COLUMN, snapshot.get(BINARY_PROBABILITY_COLUMN)),
+        errors="coerce",
+    )
+    snapshot["ModelProbability"] = pd.to_numeric(
+        snapshot.get(BINARY_PROBABILITY_COLUMN), errors="coerce"
+    )
+    snapshot["TwoPlusProbability"] = pd.to_numeric(
+        snapshot.get("Model_2plus_Hit"), errors="coerce"
+    )
+    snapshot["ModelScore"] = pd.to_numeric(snapshot.get(BINARY_SCORE_COLUMN), errors="coerce")
+    snapshot["ExpectedCount"] = pd.to_numeric(snapshot.get(BINARY_EXPECTED_COUNT_COLUMN), errors="coerce")
+    snapshot["ModelPerPA"] = pd.to_numeric(snapshot.get(BINARY_PER_PA_COLUMN), errors="coerce")
+    snapshot["ModelOverProbability"] = pd.to_numeric(
+        snapshot["Model_Over_Prob"] if "Model_Over_Prob" in snapshot.columns else snapshot["ModelProbability"],
+        errors="coerce",
+    )
+    snapshot["ProjectionEdge"] = pd.to_numeric(
+        snapshot["Projection_Edge"] if "Projection_Edge" in snapshot.columns else pd.Series(np.nan, index=snapshot.index),
+        errors="coerce",
+    )
+    snapshot["SportsbookOdds"] = pd.to_numeric(
+        snapshot["Over_Odds"] if "Over_Odds" in snapshot.columns else pd.Series(np.nan, index=snapshot.index),
+        errors="coerce",
+    )
+    snapshot["MarketProbability"] = pd.to_numeric(
+        snapshot["Market_Over_Prob"] if "Market_Over_Prob" in snapshot.columns else pd.Series(np.nan, index=snapshot.index),
+        errors="coerce",
+    )
+    snapshot["MarketImpliedProbability"] = snapshot["SportsbookOdds"].map(american_odds_to_probability)
+    snapshot["ModelMarketEdge"] = pd.to_numeric(
+        snapshot["Model_Market_Edge"] if "Model_Market_Edge" in snapshot.columns else pd.Series(np.nan, index=snapshot.index),
+        errors="coerce",
+    )
+    snapshot["Actual_Event"] = np.nan
+    snapshot["Actual_2plus_Hit"] = np.nan
+    snapshot["Actual_Hits"] = np.nan
+    snapshot["Actual_HR"] = np.nan
+    snapshot["Actual_PA"] = np.nan
+    snapshot["Actual_AB"] = np.nan
+    snapshot["ResultStatus"] = ""
+    snapshot["Notes"] = ""
+    if extra_context:
+        for key, value in extra_context.items():
+            snapshot[key] = value
+    preferred = [
+        "SlateDate", "GameDateTimeUTC", "GeneratedAtUTC", "ModelVersion", "Target",
+        "LookbackDays", "StatcastStart", "StatcastEnd", "GamePK", "PlayerID", "Player",
+        "Team", "Opponent", "HomeAway", "Venue", "StartingPitcherID", "StartingPitcher",
+        "LineupStatus", "LineupSpot", "Projected_PA", "ModelPerPA", "ExpectedCount", "EffectiveStand", "SampleStatus",
+        "Confidence", "Confidence_Level", "ParkFactor", "WeatherMultiplier",
+        "RawProbability", "ModelProbability", "TwoPlusProbability", "ModelScore", "Calibration_Applied",
+        "Calibration_Version", "Market_Line", "Over_Odds", "Under_Odds", "Line_Source", "Line_Updated", "SportsbookOdds", "MarketProbability",
+        "ModelOverProbability", "ProjectionEdge",
+        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_2plus_Hit", "Actual_Hits",
+        "Actual_HR", "Actual_PA", "Actual_AB", "ResultStatus", "Notes",
+    ]
+    existing = [column for column in preferred if column in snapshot.columns]
+    extras = [
+        column for column in snapshot.columns
+        if column not in existing
+        and column not in {"Rank", "player_id", BINARY_PROBABILITY_COLUMN, BINARY_RAW_PROBABILITY_COLUMN, BINARY_SCORE_COLUMN}
+    ]
+    return snapshot[existing + extras].copy()
+
+
+def normalize_binary_history(history: pd.DataFrame) -> pd.DataFrame:
+    if history is None:
+        history = pd.DataFrame()
+    result = history.copy()
+    aliases = {
+        "Date": "SlateDate", "Game_ID": "GamePK", "Player_ID": "PlayerID",
+        "Probability": "ModelProbability", "Raw_Probability": "RawProbability",
+        "Score": "ModelScore", "Actual": "Actual_Event",
+    }
+    result = result.rename(
+        columns={key: value for key, value in aliases.items() if key in result.columns and value not in result.columns}
+    )
+    text_defaults = {
+        "Player": "", "Team": "", "Opponent": "", "LineupStatus": "Unknown",
+        "Confidence_Level": "Unknown", "ModelVersion": "unknown", "Target": BINARY_TARGET_LABEL,
+        "ResultStatus": "", "Notes": "",
+    }
+    for column, default in text_defaults.items():
+        if column not in result.columns:
+            result[column] = default
+    for column in ["SlateDate", "GameDateTimeUTC", "GeneratedAtUTC"]:
+        if column not in result.columns:
+            result[column] = pd.NaT if column != "SlateDate" else ""
+    result["SlateDate"] = pd.to_datetime(result["SlateDate"], errors="coerce").dt.date
+    result["GameDateTimeUTC"] = pd.to_datetime(result["GameDateTimeUTC"], utc=True, errors="coerce")
+    result["GeneratedAtUTC"] = pd.to_datetime(result["GeneratedAtUTC"], utc=True, errors="coerce")
+    numeric_columns = [
+        "GamePK", "PlayerID", "StartingPitcherID", "LookbackDays", "LineupSpot",
+        "Projected_PA", "ModelPerPA", "ExpectedCount", "Confidence", "ParkFactor", "WeatherMultiplier", "RawProbability",
+        "ModelProbability", "TwoPlusProbability", "ModelScore", "ModelOverProbability", "ProjectionEdge", "SportsbookOdds", "MarketProbability",
+        "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_2plus_Hit", "Actual_Hits",
+        "Actual_HR", "Actual_PA", "Actual_AB",
+    ]
+    for column in numeric_columns:
+        if column not in result.columns:
+            result[column] = np.nan
+        result[column] = pd.to_numeric(result[column], errors="coerce")
+    missing_two_plus = result["TwoPlusProbability"].isna()
+    if missing_two_plus.any():
+        derived_two_plus = probability_two_plus_hits(result["ModelPerPA"], result["Projected_PA"])
+        result.loc[missing_two_plus, "TwoPlusProbability"] = derived_two_plus.loc[missing_two_plus]
+    missing_two_plus_actual = result["Actual_2plus_Hit"].isna() & result["Actual_Hits"].notna()
+    result.loc[missing_two_plus_actual, "Actual_2plus_Hit"] = (
+        result.loc[missing_two_plus_actual, "Actual_Hits"] >= 2
+    ).astype(float)
+
+    odds_implied = result["SportsbookOdds"].map(american_odds_to_probability)
+    result["MarketImpliedProbability"] = result["MarketImpliedProbability"].fillna(odds_implied)
+    fair_market = result["MarketProbability"].where(
+        result["MarketProbability"].between(0, 1, inclusive="both"),
+        result["MarketImpliedProbability"],
+    )
+    result["ModelMarketEdge"] = result["ModelProbability"] - fair_market
+    result["SnapshotAfterStart"] = (
+        result["GeneratedAtUTC"].notna()
+        & result["GameDateTimeUTC"].notna()
+        & result["GeneratedAtUTC"].gt(result["GameDateTimeUTC"])
+    )
+    return result
+
+
+def combine_binary_history_uploads(uploaded_files: list[object]) -> tuple[pd.DataFrame, list[str]]:
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for uploaded in uploaded_files or []:
+        try:
+            content = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+            if isinstance(content, bytes):
+                content = content.decode("utf-8-sig")
+            frame = pd.read_csv(StringIO(content))
+            if not frame.empty:
+                frame["SourceFile"] = getattr(uploaded, "name", "uploaded.csv")
+                frames.append(frame)
+        except Exception as exc:
+            errors.append(f"{getattr(uploaded, 'name', 'file')}: {type(exc).__name__}: {exc}")
+    if not frames:
+        return pd.DataFrame(), errors
+    return normalize_binary_history(pd.concat(frames, ignore_index=True, sort=False)), errors
+
+
+def deduplicate_binary_history(
+    history: pd.DataFrame,
+    latest_only: bool = True,
+    exclude_after_start: bool = True,
+) -> pd.DataFrame:
+    result = normalize_binary_history(history)
+    if result.empty:
+        return result
+    if exclude_after_start:
+        result = result[~result["SnapshotAfterStart"].fillna(False)].copy()
+    if latest_only:
+        result = result.sort_values("GeneratedAtUTC", na_position="first")
+        game_key = result["GamePK"].where(
+            result["GamePK"].notna(),
+            result["SlateDate"].astype(str) + "-" + result["Team"].astype(str),
+        )
+        result["_GameKey"] = game_key.astype(str)
+        result = result.drop_duplicates(["_GameKey", "PlayerID"], keep="last")
+        result = result.drop(columns="_GameKey")
+    return result.reset_index(drop=True)
+
+
+@st.cache_data(ttl=1800, max_entries=120, show_spinner=False)
+def fetch_completed_batter_results(game_pk: int) -> dict:
+    game_pk = int(game_pk)
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    request = Request(url, headers={"User-Agent": "MLB-Hitter-Backtest/1.0", "Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except Exception as exc:
+        return {"ok": False, "final": False, "data": pd.DataFrame(), "error": f"{type(exc).__name__}: {exc}"}
+    game_data = payload.get("gameData", {}) or {}
+    status = game_data.get("status", {}) or {}
+    abstract_state = str(status.get("abstractGameState", ""))
+    detailed_state = str(status.get("detailedState", ""))
+    final = abstract_state.lower() == "final" or any(
+        token in detailed_state.lower() for token in ["final", "game over", "completed early"]
+    )
+    if not final:
+        return {
+            "ok": True, "final": False, "data": pd.DataFrame(),
+            "status": detailed_state or abstract_state or "Not final", "error": None,
+        }
+    rows: list[dict] = []
+    teams = ((payload.get("liveData", {}) or {}).get("boxscore", {}) or {}).get("teams", {}) or {}
+    for side in ["away", "home"]:
+        players = ((teams.get(side, {}) or {}).get("players", {}) or {})
+        for record in players.values():
+            if not isinstance(record, dict):
+                continue
+            person = record.get("person", {}) or {}
+            batting = ((record.get("stats", {}) or {}).get("batting", {}) or {})
+            player_id = pd.to_numeric(pd.Series([person.get("id")]), errors="coerce").iloc[0]
+            pa = pd.to_numeric(pd.Series([batting.get("plateAppearances")]), errors="coerce").iloc[0]
+            if pd.isna(player_id) or pd.isna(pa) or float(pa) <= 0:
+                continue
+            rows.append({
+                "PlayerID": int(player_id),
+                "Player_Official": str(person.get("fullName") or ""),
+                "Actual_Hits": pd.to_numeric(pd.Series([batting.get("hits")]), errors="coerce").fillna(0).iloc[0],
+                "Actual_HR": pd.to_numeric(pd.Series([batting.get("homeRuns")]), errors="coerce").fillna(0).iloc[0],
+                "Actual_PA": float(pa),
+                "Actual_AB": pd.to_numeric(pd.Series([batting.get("atBats")]), errors="coerce").fillna(0).iloc[0],
+            })
+    return {
+        "ok": True, "final": True, "data": pd.DataFrame(rows),
+        "status": detailed_state or "Final", "error": None,
+    }
+
+
+def fill_binary_actual_results(history: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    result = normalize_binary_history(history)
+    summary = {"matched": 0, "not_final": 0, "unmatched": 0, "errors": []}
+    if result.empty:
+        return result, summary
+    game_ids = pd.to_numeric(result.get("GamePK"), errors="coerce").dropna().astype(int).unique().tolist()
+    progress = st.progress(0.0, text="Fetching official hitter results...")
+    total = max(len(game_ids), 1)
+    for index, game_pk in enumerate(game_ids, start=1):
+        game_result = fetch_completed_batter_results(int(game_pk))
+        if not game_result.get("ok"):
+            summary["errors"].append(f"Game {game_pk}: {game_result.get('error')}")
+        elif not game_result.get("final"):
+            summary["not_final"] += 1
+        else:
+            official = game_result.get("data", pd.DataFrame())
+            if official is None or official.empty:
+                summary["unmatched"] += int(result["GamePK"].eq(game_pk).sum())
+            else:
+                official = official.set_index("PlayerID")
+                game_mask = result["GamePK"].eq(game_pk)
+                for row_index in result.index[game_mask]:
+                    player_id = result.at[row_index, "PlayerID"]
+                    if pd.isna(player_id) or int(player_id) not in official.index:
+                        summary["unmatched"] += 1
+                        continue
+                    actual = official.loc[int(player_id)]
+                    if isinstance(actual, pd.DataFrame):
+                        actual = actual.iloc[0]
+                    for column in ["Actual_Hits", "Actual_HR", "Actual_PA", "Actual_AB"]:
+                        result.at[row_index, column] = actual.get(column)
+                    result.at[row_index, "Actual_Event"] = float(
+                        actual.get("Actual_HR", 0) > 0
+                        if BINARY_EVENT_KIND == "hr"
+                        else actual.get("Actual_Hits", 0) > 0
+                    )
+                    result.at[row_index, "Actual_2plus_Hit"] = float(
+                        actual.get("Actual_Hits", 0) >= 2
+                    )
+                    result.at[row_index, "ResultStatus"] = str(game_result.get("status") or "Final")
+                    summary["matched"] += 1
+        progress.progress(index / total, text=f"Checked {index} of {total} games")
+    progress.empty()
+    return normalize_binary_history(result), summary
+
+
+def binary_probability_metrics(
+    history: pd.DataFrame,
+    probability_column: str = "ModelProbability",
+    event_column: str = "Actual_Event",
+) -> dict:
+    if (
+        history is None or history.empty
+        or probability_column not in history.columns
+        or event_column not in history.columns
+    ):
+        return {"N": 0, "Mean_Probability": np.nan, "Actual_Rate": np.nan, "Brier": np.nan, "Log_Loss": np.nan, "Bias": np.nan}
+    frame = history[[probability_column, event_column]].copy()
+    frame[probability_column] = pd.to_numeric(frame[probability_column], errors="coerce")
+    frame[event_column] = pd.to_numeric(frame[event_column], errors="coerce")
+    frame = frame.dropna()
+    frame = frame[frame[event_column].isin([0, 1])]
+    if frame.empty:
+        return {"N": 0, "Mean_Probability": np.nan, "Actual_Rate": np.nan, "Brier": np.nan, "Log_Loss": np.nan, "Bias": np.nan}
+    p = _clip_probability(frame[probability_column])
+    y = frame[event_column].to_numpy(float)
+    return {
+        "N": int(len(frame)),
+        "Mean_Probability": float(np.mean(p)),
+        "Actual_Rate": float(np.mean(y)),
+        "Brier": float(np.mean(np.square(p - y))),
+        "Log_Loss": float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))),
+        "Bias": float(np.mean(p - y)),
+    }
+
+
+def binary_probability_calibration_table(
+    history: pd.DataFrame,
+    probability_column: str = "ModelProbability",
+    event_column: str = "Actual_Event",
+    bins: list[float] | None = None,
+    labels: list[str] | None = None,
+) -> pd.DataFrame:
+    if probability_column not in history.columns or event_column not in history.columns:
+        return pd.DataFrame()
+    frame = history[[probability_column, event_column]].copy()
+    frame[probability_column] = pd.to_numeric(frame[probability_column], errors="coerce")
+    frame[event_column] = pd.to_numeric(frame[event_column], errors="coerce")
+    frame = frame.dropna()
+    if frame.empty:
+        return pd.DataFrame()
+    if bins is None or labels is None:
+        if BINARY_EVENT_KIND == "hr":
+            bins = [0, .05, .08, .11, .14, .17, .20, .25, .35, 1.001]
+            labels = ["<5%", "5–7%", "8–10%", "11–13%", "14–16%", "17–19%", "20–24%", "25–34%", "35%+"]
+        else:
+            bins = [0, .40, .45, .50, .55, .60, .65, .70, .75, .80, 1.001]
+            labels = ["<40%", "40–44%", "45–49%", "50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75–79%", "80%+"]
+    frame["Probability_Bucket"] = pd.cut(
+        frame[probability_column], bins=bins, labels=labels, right=False, include_lowest=True
+    )
+    grouped = frame.groupby("Probability_Bucket", observed=False).agg(
+        Sample=(event_column, "size"),
+        Average_Probability=(probability_column, "mean"),
+        Actual_Rate=(event_column, "mean"),
+    ).reset_index()
+    grouped["Calibration_Gap"] = grouped["Actual_Rate"] - grouped["Average_Probability"]
+    return grouped
+
+
+def binary_score_bucket_table(history: pd.DataFrame) -> pd.DataFrame:
+    frame = history[["ModelScore", "ModelProbability", "Actual_Event"]].copy()
+    for column in frame.columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["ModelScore", "Actual_Event"])
+    if frame.empty:
+        return pd.DataFrame()
+    bins = [-0.001, 30, 45, 55, 70, 85, 100.001]
+    labels = ["0–29", "30–44", "45–54", "55–69", "70–84", "85–100"]
+    frame["Score_Bucket"] = pd.cut(frame["ModelScore"], bins=bins, labels=labels, right=False, include_lowest=True)
+    return frame.groupby("Score_Bucket", observed=False).agg(
+        Sample=("Actual_Event", "size"),
+        Average_Score=("ModelScore", "mean"),
+        Average_Probability=("ModelProbability", "mean"),
+        Actual_Rate=("Actual_Event", "mean"),
+    ).reset_index()
+
+
+def binary_score_probability_joint_table(
+    history: pd.DataFrame,
+    calibration: dict | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Cross-check score buckets inside active probability buckets.
+
+    When an active calibration is available, it is reapplied to RawProbability
+    for every completed historical row. This keeps older and newer snapshots on
+    one comparable probability scale instead of mixing stored raw and calibrated
+    ModelProbability values.
+    """
+    required = {"ModelScore", "ModelProbability", "Actual_Event"}
+    if history is None or history.empty or not required.issubset(history.columns):
+        return pd.DataFrame(), pd.DataFrame(), "No usable completed history."
+
+    columns = ["ModelScore", "ModelProbability", "Actual_Event"]
+    if "RawProbability" in history.columns:
+        columns.append("RawProbability")
+    frame = history[columns].copy()
+    for column in columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame["Analysis_Probability"] = frame["ModelProbability"]
+    source_label = "Stored active/displayed ModelProbability"
+
+    if calibration and "RawProbability" in frame.columns:
+        intercept = pd.to_numeric(
+            pd.Series([calibration.get("intercept")]), errors="coerce"
+        ).iloc[0]
+        slope = pd.to_numeric(
+            pd.Series([calibration.get("slope")]), errors="coerce"
+        ).iloc[0]
+        usable_raw = frame["RawProbability"].notna()
+        if pd.notna(intercept) and pd.notna(slope) and usable_raw.any():
+            frame.loc[usable_raw, "Analysis_Probability"] = _sigmoid(
+                float(intercept)
+                + float(slope) * _logit(frame.loc[usable_raw, "RawProbability"])
+            )
+            fitted_n = pd.to_numeric(
+                pd.Series([calibration.get("n")]), errors="coerce"
+            ).iloc[0]
+            n_text = f", fitted n={int(fitted_n):,}" if pd.notna(fitted_n) else ""
+            source_label = (
+                "Active fitted calibration reapplied to RawProbability "
+                f"(intercept={float(intercept):+.4f}, slope={float(slope):.4f}{n_text})"
+            )
+
+    frame = frame.dropna(
+        subset=["ModelScore", "Analysis_Probability", "Actual_Event"]
+    )
+    frame = frame[frame["Actual_Event"].isin([0, 1])].copy()
+    if frame.empty:
+        return pd.DataFrame(), pd.DataFrame(), source_label
+
+    # Compact buckets keep the two-way cells useful with a few hundred outcomes.
+    score_bins = [-0.001, 45, 55, 70, 100.001]
+    score_labels = ["0–44", "45–54", "55–69", "70–100"]
+    if BINARY_EVENT_KIND == "hr":
+        probability_bins = [0, .08, .12, .16, .20, .25, 1.001]
+        probability_labels = ["<8%", "8–11%", "12–15%", "16–19%", "20–24%", "25%+"]
+    else:
+        probability_bins = [0, .55, .60, .65, .70, 1.001]
+        probability_labels = ["<55%", "55–59%", "60–64%", "65–69%", "70%+"]
+
+    frame["Score_Bucket"] = pd.cut(
+        frame["ModelScore"],
+        bins=score_bins,
+        labels=score_labels,
+        right=False,
+        include_lowest=True,
+    )
+    frame["Probability_Bucket"] = pd.cut(
+        frame["Analysis_Probability"],
+        bins=probability_bins,
+        labels=probability_labels,
+        right=False,
+        include_lowest=True,
+    )
+    frame = frame.dropna(subset=["Score_Bucket", "Probability_Bucket"])
+
+    grouped = frame.groupby(
+        ["Score_Bucket", "Probability_Bucket"], observed=False
+    ).agg(
+        Sample=("Actual_Event", "size"),
+        Wins=("Actual_Event", "sum"),
+        Average_Probability=("Analysis_Probability", "mean"),
+        Actual_Rate=("Actual_Event", "mean"),
+    ).reset_index()
+
+    probability_rates = frame.groupby(
+        "Probability_Bucket", observed=False
+    ).agg(Probability_Bucket_Rate=("Actual_Event", "mean")).reset_index()
+    grouped = grouped.merge(probability_rates, on="Probability_Bucket", how="left")
+    grouped["Calibration_Gap"] = grouped["Actual_Rate"] - grouped["Average_Probability"]
+    grouped["Score_Lift_Within_Probability"] = (
+        grouped["Actual_Rate"] - grouped["Probability_Bucket_Rate"]
+    )
+    grouped["Sample_Status"] = np.select(
+        [grouped["Sample"] >= 25, grouped["Sample"] >= 10, grouped["Sample"] > 0],
+        ["Usable", "Early", "Small"],
+        default="Empty",
+    )
+
+    populated = grouped[grouped["Sample"] > 0].copy()
+    display = grouped.copy()
+    display["Cell"] = display.apply(
+        lambda row: (
+            "—"
+            if int(row["Sample"]) == 0 or pd.isna(row["Actual_Rate"])
+            else f"{float(row['Actual_Rate']):.1%} (n={int(row['Sample'])})"
+        ),
+        axis=1,
+    )
+    matrix = display.pivot(
+        index="Score_Bucket", columns="Probability_Bucket", values="Cell"
+    )
+    matrix = matrix.reindex(index=score_labels, columns=probability_labels)
+    matrix.index.name = "Score bucket"
+    matrix.columns.name = "Calibrated probability bucket"
+
+    return matrix, populated, source_label
+
+
+def grouped_binary_metrics(history: pd.DataFrame, group_column: str) -> pd.DataFrame:
+    if group_column not in history.columns:
+        return pd.DataFrame()
+    rows: list[dict] = []
+    for group_value, group in history.groupby(group_column, dropna=False):
+        metrics = binary_probability_metrics(group)
+        if metrics["N"]:
+            rows.append({"Group": str(group_value), **metrics})
+    return pd.DataFrame(rows)
+
+
+def _fit_platt_coefficients(probabilities: np.ndarray, outcomes: np.ndarray) -> tuple[float, float]:
+    x = _logit(probabilities)
+    y = np.asarray(outcomes, dtype=float)
+    design = np.column_stack([np.ones(len(x)), x])
+    beta = np.array([0.0, 1.0], dtype=float)
+    regularization = np.diag([1e-6, 1e-3])
+    for _ in range(80):
+        predicted = _sigmoid(design @ beta)
+        weights = np.clip(predicted * (1 - predicted), 1e-6, None)
+        gradient = design.T @ (predicted - y) + regularization @ beta
+        hessian = design.T @ (design * weights[:, None]) + regularization
+        try:
+            step = np.linalg.solve(hessian, gradient)
+        except np.linalg.LinAlgError:
+            step = np.linalg.pinv(hessian) @ gradient
+        beta -= step
+        if np.max(np.abs(step)) < 1e-8:
+            break
+    intercept = float(np.clip(beta[0], -5.0, 5.0))
+    slope = float(np.clip(beta[1], 0.10, 3.0))
+    return intercept, slope
+
+
+def fit_binary_calibration(history: pd.DataFrame, min_rows: int) -> dict:
+    required = ["RawProbability", "Actual_Event", "SlateDate"]
+    if any(column not in history.columns for column in required):
+        return {"ok": False, "n": 0, "message": "Required probability and result columns are missing."}
+    frame = history[required].copy()
+    frame["RawProbability"] = pd.to_numeric(frame["RawProbability"], errors="coerce")
+    frame["Actual_Event"] = pd.to_numeric(frame["Actual_Event"], errors="coerce")
+    frame["SlateDate"] = pd.to_datetime(frame["SlateDate"], errors="coerce")
+    frame = frame.dropna(subset=["RawProbability", "Actual_Event"]).sort_values("SlateDate")
+    frame = frame[frame["Actual_Event"].isin([0, 1])]
+    if len(frame) < min_rows or frame["Actual_Event"].nunique() < 2 or frame["RawProbability"].nunique() < 3:
+        return {
+            "ok": False, "n": int(len(frame)),
+            "message": f"Need at least {min_rows} completed hitter-games with both outcomes and varied probabilities.",
+        }
+    p = _clip_probability(frame["RawProbability"])
+    y = frame["Actual_Event"].to_numpy(float)
+    intercept, slope = _fit_platt_coefficients(p, y)
+    calibrated = _sigmoid(intercept + slope * _logit(p))
+    raw_brier = float(np.mean(np.square(p - y)))
+    calibrated_brier = float(np.mean(np.square(calibrated - y)))
+    raw_logloss = float(-np.mean(y * np.log(p) + (1-y) * np.log(1-p)))
+    calibrated_logloss = float(-np.mean(y * np.log(_clip_probability(calibrated)) + (1-y) * np.log(1-_clip_probability(calibrated))))
+
+    split = max(int(len(frame) * 0.70), 1)
+    train, test = frame.iloc[:split], frame.iloc[split:]
+    holdout = {
+        "holdout_n": int(len(test)), "holdout_raw_brier": np.nan,
+        "holdout_calibrated_brier": np.nan, "holdout_raw_logloss": np.nan,
+        "holdout_calibrated_logloss": np.nan,
+    }
+    if len(train) >= max(30, min_rows // 2) and len(test) >= 20 and train["Actual_Event"].nunique() >= 2:
+        train_p = _clip_probability(train["RawProbability"])
+        train_y = train["Actual_Event"].to_numpy(float)
+        test_p = _clip_probability(test["RawProbability"])
+        test_y = test["Actual_Event"].to_numpy(float)
+        h_intercept, h_slope = _fit_platt_coefficients(train_p, train_y)
+        test_cal = _sigmoid(h_intercept + h_slope * _logit(test_p))
+        holdout = {
+            "holdout_n": int(len(test)),
+            "holdout_raw_brier": float(np.mean(np.square(test_p - test_y))),
+            "holdout_calibrated_brier": float(np.mean(np.square(test_cal - test_y))),
+            "holdout_raw_logloss": float(-np.mean(test_y*np.log(test_p) + (1-test_y)*np.log(1-test_p))),
+            "holdout_calibrated_logloss": float(-np.mean(test_y*np.log(_clip_probability(test_cal)) + (1-test_y)*np.log(1-_clip_probability(test_cal)))),
+        }
+    return {
+        "ok": True,
+        "version": BINARY_MODEL_VERSION,
+        "target": BINARY_TARGET_LABEL,
+        "target_slug": BINARY_TARGET_SLUG,
+        "method": "platt_scaling_on_logit_probability",
+        "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "n": int(len(frame)),
+        "intercept": intercept,
+        "slope": slope,
+        "raw_brier": raw_brier,
+        "calibrated_brier": calibrated_brier,
+        "raw_logloss": raw_logloss,
+        "calibrated_logloss": calibrated_logloss,
+        **holdout,
+    }
+
+
+def render_binary_backtest_tab(
+    rankings: pd.DataFrame,
+    matchup: dict,
+    lookback_days: int,
+    loaded_start: object,
+    loaded_end: object,
+    lineup_status: str,
+    calibration_state_key: str,
+    widget_prefix: str,
+    extra_context: dict | None = None,
+    whole_slate_board: pd.DataFrame | None = None,
+    odds_api_key: str = "",
+    odds_widget_prefix: str = "",
+    odds_source_mode: str | None = None,
+    slate_builder_context: dict | None = None,
+    whole_slate_state_key: str = "",
+) -> None:
+    st.markdown(f"### {BINARY_TARGET_LABEL} backtesting and calibration")
+    st.info(
+        "Save the projection snapshot before first pitch. After the game is final, upload the snapshot or your latest master CSV and fetch official results."
+    )
+
+    slate_date_text = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    slate_builder_context = dict(slate_builder_context or {})
+    usable_slate = isinstance(whole_slate_board, pd.DataFrame) and not whole_slate_board.empty
+
+    builder_required = ["df", "available_teams", "min_pa", "loaded_end", "include_low_sample"]
+    builder_ready = all(key in slate_builder_context for key in builder_required)
+    if builder_ready:
+        with st.expander("Entire-slate snapshot builder", expanded=not usable_slate):
+            st.caption(
+                "Builds both offenses for every available game. After it finishes, select Whole slate, "
+                "then download or add one snapshot containing the entire slate."
+            )
+            use_confirmed_lineups = st.checkbox(
+                "Use confirmed MLB lineups when posted",
+                value=bool(slate_builder_context.get("use_confirmed_lineups", True)),
+                key=f"{widget_prefix}_snapshot_build_confirmed",
+            )
+            build_entire_slate = st.button(
+                "Build / refresh entire-slate snapshot",
+                type="primary",
+                width="stretch",
+                key=f"{widget_prefix}_build_entire_slate_snapshot",
+            )
+        if build_entire_slate:
+            games, schedule_error = fetch_mlb_schedule(slate_date_text)
+            if schedule_error:
+                st.error(f"MLB slate unavailable: {schedule_error}")
+            elif not games:
+                st.error("No MLB games were available for the selected slate date.")
+            else:
+                with st.spinner("Building both offenses for every available game..."):
+                    built_slate, build_errors = build_whole_slate_model_board(
+                        slate_builder_context["df"],
+                        games,
+                        slate_builder_context["available_teams"],
+                        int(slate_builder_context["min_pa"]),
+                        slate_builder_context["loaded_end"],
+                        bool(slate_builder_context["include_low_sample"]),
+                        use_confirmed_lineups,
+                        float(slate_builder_context.get("team_runs", 4.5)),
+                        float(slate_builder_context.get("starter_innings", 5.5)),
+                        float(slate_builder_context.get("bullpen_multiplier", 1.0)),
+                        **dict(slate_builder_context.get("builder_kwargs", {})),
+                    )
+                if whole_slate_state_key:
+                    st.session_state[whole_slate_state_key] = built_slate
+                    st.session_state[f"{whole_slate_state_key}_errors"] = build_errors
+                whole_slate_board = built_slate
+                usable_slate = isinstance(built_slate, pd.DataFrame) and not built_slate.empty
+                if usable_slate:
+                    st.session_state[f"{widget_prefix}_snapshot_scope"] = "Whole slate"
+                    st.success(
+                        f"Entire-slate board built: {len(built_slate):,} hitter rows. "
+                        "The snapshot scope is now set to Whole slate."
+                    )
+                else:
+                    st.error("The slate builder did not return any hitter rows.")
+                if build_errors:
+                    with st.expander("Entire-slate build details"):
+                        for error in build_errors[:80]:
+                            st.code(error)
+
+    scope_options = ["Current matchup"] + (["Whole slate"] if usable_slate else [])
+    snapshot_scope = st.radio(
+        "Pregame snapshot scope", scope_options, horizontal=True,
+        index=(1 if usable_slate else 0), key=f"{widget_prefix}_snapshot_scope",
+    )
+    source_board = whole_slate_board.copy() if snapshot_scope == "Whole slate" else rankings.copy()
+    if snapshot_scope == "Whole slate":
+        source_board = apply_binary_probability_calibration(
+            source_board, st.session_state.get(calibration_state_key)
+        )
+    elif not usable_slate:
+        st.caption(
+            "Use the Entire-slate snapshot builder above to create every game and both offenses in one pass. "
+            "The current-matchup snapshot remains available until that build finishes."
+        )
+
+    odds_widget_prefix = odds_widget_prefix or widget_prefix
+    quotes_key = f"{odds_widget_prefix}_odds_quotes_{slate_date_text}"
+    odds_source_mode = odds_source_mode or st.session_state.get(
+        f"{odds_widget_prefix}_odds_source", ODDS_SOURCE_OPTIONS[0]
+    )
+    auto_cols = st.columns([2, 1])
+    with auto_cols[0]:
+        st.caption(
+            "Automatic lines are event-by-event for hitter props. Fetch them here before downloading the snapshot; "
+            "the saved line, prices, source and no-vig probability will then appear just like the pitcher snapshot."
+        )
+    with auto_cols[1]:
+        fetch_snapshot_lines = st.button(
+            "Fetch pregame lines", type="primary", width="stretch",
+            key=f"{widget_prefix}_fetch_snapshot_lines",
+        )
+    if fetch_snapshot_lines:
+        if not odds_api_key:
+            st.error("Add THE_ODDS_API_KEY in this Streamlit app's Secrets or use the temporary sidebar field.")
+        else:
+            games, schedule_error = fetch_mlb_schedule(slate_date_text)
+            if schedule_error:
+                st.error(f"MLB schedule unavailable: {schedule_error}")
+            elif not games:
+                st.error("No MLB games were available for the selected date.")
+            else:
+                if snapshot_scope == "Whole slate":
+                    game_values = pd.to_numeric(source_board.get("GamePK"), errors="coerce").dropna().astype(int).unique().tolist()
+                else:
+                    current_pk = pd.to_numeric(pd.Series([matchup.get("game_pk")]), errors="coerce").iloc[0]
+                    game_values = [int(current_pk)] if pd.notna(current_pk) else []
+                with st.spinner(f"Fetching {ODDS_API_MARKET_LABEL.lower()} lines for the pregame snapshot..."):
+                    new_quotes, quota, errors = fetch_batter_prop_quotes(odds_api_key, games, game_values)
+                existing_quotes = st.session_state.get(quotes_key, pd.DataFrame())
+                st.session_state[quotes_key] = combine_batter_quote_frames(existing_quotes, new_quotes, slate_date_text)
+                st.session_state[f"{widget_prefix}_snapshot_odds_quota"] = quota
+                st.session_state[f"{widget_prefix}_snapshot_odds_errors"] = errors
+                st.rerun()
+
+    snapshot_quotes = st.session_state.get(quotes_key, pd.DataFrame())
+    source_board = apply_batter_odds_to_board(
+        source_board, snapshot_quotes, odds_source_mode, matchup.get("game_pk")
+    )
+    quota = st.session_state.get(f"{widget_prefix}_snapshot_odds_quota", {})
+    line_count = int(pd.to_numeric(source_board.get("Market_Line"), errors="coerce").notna().sum()) if not source_board.empty else 0
+    status_cols = st.columns(3)
+    status_cols[0].metric("Players in snapshot", f"{len(source_board):,}")
+    status_cols[1].metric("Automatic lines matched", f"{line_count:,}")
+    status_cols[2].metric("API credits remaining", quota.get("requests_remaining", "—"))
+    odds_errors = st.session_state.get(f"{widget_prefix}_snapshot_odds_errors", [])
+    if odds_errors:
+        with st.expander("Pregame line-fetch details"):
+            for error in odds_errors[:50]:
+                st.code(error)
+
+    fingerprint = f"{matchup.get('game_pk')}_{matchup.get('slate_date')}_{matchup.get('batting_team')}_{BINARY_TARGET_SLUG}_{snapshot_scope}"
+    timestamp_key = f"{widget_prefix}_snapshot_timestamp_{fingerprint}"
+    if timestamp_key not in st.session_state:
+        st.session_state[timestamp_key] = pd.Timestamp.now(tz="UTC").isoformat()
+    snapshot = build_binary_projection_snapshot(
+        source_board, matchup, lookback_days, loaded_start, loaded_end, lineup_status,
+        extra_context=extra_context,
+        generated_at_utc=st.session_state[timestamp_key],
+    )
+
+    st.markdown("#### 1. Save today’s pregame predictions")
+    st.caption(
+        "Automatic values are copied from the selected odds source. You can still overwrite the line or prices manually when a market is missing."
+    )
+    editor_columns = [
+        "PlayerID", "Player", "Team", "Opponent", "LineupSpot", "Projected_PA",
+        "ModelPerPA", "ExpectedCount", "ModelProbability", "TwoPlusProbability", "ModelScore",
+        "Market_Line", "Over_Odds", "Under_Odds", "MarketProbability", "Line_Source", "Notes",
+    ]
+    editable = snapshot[[column for column in editor_columns if column in snapshot.columns]].copy()
+    editable = editable.rename(columns={
+        "LineupSpot": "Order", "Projected_PA": "Proj PA", "ModelPerPA": "Per PA",
+        "ExpectedCount": "Projected Hits", "ModelProbability": "1+ Hit",
+        "TwoPlusProbability": "2+ Hit", "ModelScore": "Model Score", "Market_Line": "Line", "Over_Odds": "Over Odds",
+        "Under_Odds": "Under Odds", "MarketProbability": "No-vig Market",
+        "Line_Source": "Line Source",
+    })
+    editable_columns = ["Line", "Over Odds", "Under Odds", "No-vig Market", "Notes"]
+    edited = st.data_editor(
+        editable,
+        hide_index=True,
+        width="stretch",
+        disabled=[column for column in editable.columns if column not in editable_columns],
+        column_config={
+            "Line": st.column_config.NumberColumn("Line", min_value=0.0, step=0.5, format="%.1f"),
+            "Over Odds": st.column_config.NumberColumn("Over odds", step=1),
+            "Under Odds": st.column_config.NumberColumn("Under odds", step=1),
+            "No-vig Market": st.column_config.NumberColumn(
+                "No-vig market", min_value=0.0, max_value=1.0, step=0.01, format="%.3f"
+            ),
+        },
+        key=f"{widget_prefix}_pregame_market_editor_{fingerprint}",
+    )
+    if not edited.empty:
+        edited_values = edited.set_index("PlayerID")
+        reverse_columns = {
+            "Line": "Market_Line", "Over Odds": "Over_Odds", "Under Odds": "Under_Odds",
+            "No-vig Market": "MarketProbability", "Notes": "Notes",
+        }
+        for row_index in snapshot.index:
+            player_id = snapshot.at[row_index, "PlayerID"]
+            if pd.isna(player_id) or player_id not in edited_values.index:
+                continue
+            row = edited_values.loc[player_id]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            for display_column, snapshot_column in reverse_columns.items():
+                if display_column in row.index:
+                    snapshot.at[row_index, snapshot_column] = row[display_column]
+    snapshot["SportsbookOdds"] = pd.to_numeric(snapshot.get("Over_Odds"), errors="coerce")
+    manual_fair = pd.to_numeric(snapshot.get("MarketProbability"), errors="coerce")
+    calculated_fair = pd.Series(
+        [no_vig_over_probability_batter(o, u) for o, u in zip(snapshot.get("Over_Odds"), snapshot.get("Under_Odds"))],
+        index=snapshot.index, dtype=float,
+    )
+    snapshot["MarketProbability"] = manual_fair.where(manual_fair.between(0, 1, inclusive="both"), calculated_fair)
+    snapshot["ModelMarketEdge"] = pd.to_numeric(snapshot.get("ModelOverProbability"), errors="coerce") - snapshot["MarketProbability"]
+    snapshot = normalize_binary_history(snapshot)
+    slate_text = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    scope_slug = "whole_slate" if snapshot_scope == "Whole slate" else "current_matchup"
+    snapshot_filename = f"{BINARY_TARGET_SLUG}_{scope_slug}_pregame_{slate_text}.csv"
+    download_label = "Download entire-slate pregame snapshot" if snapshot_scope == "Whole slate" else "Download pregame snapshot"
+    st.download_button(
+        download_label,
+        snapshot.to_csv(index=False).encode("utf-8"),
+        file_name=snapshot_filename,
+        mime="text/csv",
+        type="primary",
+        width="stretch",
+    )
+    if snapshot["SnapshotAfterStart"].fillna(False).any():
+        st.error("This snapshot timestamp is after scheduled first pitch. It will be excluded from a fair backtest.")
+
+    st.markdown("#### 2. Upload history and fill official results")
+    uploads = st.file_uploader(
+        "Upload pregame snapshots or the latest master-history CSV",
+        type=["csv"],
+        accept_multiple_files=True,
+        key=f"{widget_prefix}_history_upload",
+    )
+    history_key = f"{widget_prefix}_backtest_history"
+    upload_signature_key = f"{widget_prefix}_history_signature"
+    signature = tuple((getattr(file, "name", ""), getattr(file, "size", None)) for file in uploads or [])
+    if uploads and st.session_state.get(upload_signature_key) != signature:
+        uploaded_history, upload_errors = combine_binary_history_uploads(uploads)
+        st.session_state[history_key] = uploaded_history
+        st.session_state[upload_signature_key] = signature
+        st.session_state[f"{widget_prefix}_upload_errors"] = upload_errors
+    history = normalize_binary_history(st.session_state.get(history_key, pd.DataFrame()))
+    upload_errors = st.session_state.get(f"{widget_prefix}_upload_errors", [])
+    if upload_errors:
+        with st.expander("Upload details"):
+            for error in upload_errors:
+                st.code(error)
+
+    action_columns = st.columns(2)
+    add_snapshot_label = (
+        "Add entire-slate snapshot to session master"
+        if snapshot_scope == "Whole slate" else "Add current snapshot to session master"
+    )
+    with action_columns[0]:
+        if st.button(add_snapshot_label, width="stretch", key=f"{widget_prefix}_add_snapshot"):
+            history = normalize_binary_history(pd.concat([history, snapshot], ignore_index=True, sort=False))
+            st.session_state[history_key] = history
+            added_label = "Entire-slate snapshot" if snapshot_scope == "Whole slate" else "Current snapshot"
+            st.success(f"{added_label} added. Download the master CSV before leaving or rebooting.")
+    with action_columns[1]:
+        if st.button("Fetch official completed-game results", type="primary", width="stretch", key=f"{widget_prefix}_fetch_results"):
+            history, result_summary = fill_binary_actual_results(history)
+            st.session_state[history_key] = history
+            st.session_state[f"{widget_prefix}_result_summary"] = result_summary
+
+    result_summary = st.session_state.get(f"{widget_prefix}_result_summary", {})
+    if result_summary:
+        st.caption(
+            f"Result update: {result_summary.get('matched', 0)} matched · "
+            f"{result_summary.get('not_final', 0)} games not final · "
+            f"{result_summary.get('unmatched', 0)} unmatched/scratched hitters."
+        )
+        if result_summary.get("errors"):
+            with st.expander("Result-fetch details"):
+                for error in result_summary["errors"][:50]:
+                    st.code(error)
+
+    latest_only = st.checkbox(
+        "Use latest pregame snapshot per player/game",
+        value=True,
+        key=f"{widget_prefix}_latest_only",
+    )
+    exclude_after_start = st.checkbox(
+        "Exclude snapshots saved after first pitch",
+        value=True,
+        key=f"{widget_prefix}_exclude_after_start",
+    )
+    analysis_history = deduplicate_binary_history(history, latest_only, exclude_after_start)
+    completed_history = analysis_history[analysis_history["Actual_Event"].isin([0, 1])].copy()
+
+    counts = st.columns(4)
+    counts[0].metric("Master rows", f"{len(history):,}")
+    counts[1].metric("Analysis rows", f"{len(analysis_history):,}")
+    counts[2].metric("Completed outcomes", f"{len(completed_history):,}")
+    counts[3].metric("After-start rows", f"{int(history.get('SnapshotAfterStart', pd.Series(dtype=bool)).fillna(False).sum()):,}")
+    st.download_button(
+        "Download updated master history",
+        normalize_binary_history(history).to_csv(index=False).encode("utf-8"),
+        file_name=f"{BINARY_TARGET_SLUG}_backtest_master.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+    if completed_history.empty:
+        st.warning("No completed outcomes are available yet. Fetch results after games are final.")
+        return
+
+    st.markdown("#### 3. Probability accuracy")
+    active_metrics = binary_probability_metrics(completed_history, "ModelProbability")
+    raw_metrics = binary_probability_metrics(completed_history, "RawProbability")
+    metric_table = pd.DataFrame([
+        {"Probability": "Active/displayed", **active_metrics},
+        {"Probability": "Raw model", **raw_metrics},
+    ])
+    st.dataframe(
+        metric_table.style.format({
+            "Mean_Probability": "{:.1%}", "Actual_Rate": "{:.1%}",
+            "Brier": "{:.4f}", "Log_Loss": "{:.4f}", "Bias": "{:+.1%}",
+        }),
+        width="stretch", hide_index=True,
+    )
+    st.caption("Bias is predicted probability minus actual event rate. Positive means the model is too optimistic.")
+
+    calibration_table = binary_probability_calibration_table(completed_history)
+    if not calibration_table.empty:
+        st.dataframe(
+            calibration_table.style.format({
+                "Average_Probability": "{:.1%}", "Actual_Rate": "{:.1%}", "Calibration_Gap": "{:+.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+    st.markdown("#### 3b. Supplemental 2+ hit accuracy")
+    st.caption(
+        "The 2+ hit estimate is derived from the raw per-PA hit model and projected plate appearances. "
+        "The active 1+ hit calibration is intentionally not applied to this separate outcome."
+    )
+    two_plus_metrics = binary_probability_metrics(
+        completed_history, "TwoPlusProbability", "Actual_2plus_Hit"
+    )
+    if two_plus_metrics.get("N", 0) == 0:
+        st.info("No usable 2+ hit probability outcomes are available yet.")
+    else:
+        two_plus_table = pd.DataFrame([{
+            "Probability": "Raw 2+ hit", **two_plus_metrics
+        }])
+        st.dataframe(
+            two_plus_table.style.format({
+                "Mean_Probability": "{:.1%}", "Actual_Rate": "{:.1%}",
+                "Brier": "{:.4f}", "Log_Loss": "{:.4f}", "Bias": "{:+.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+        two_plus_calibration = binary_probability_calibration_table(
+            completed_history,
+            "TwoPlusProbability",
+            "Actual_2plus_Hit",
+            bins=[0, .10, .15, .20, .25, .30, .35, .40, .50, 1.001],
+            labels=["<10%", "10–14%", "15–19%", "20–24%", "25–29%", "30–34%", "35–39%", "40–49%", "50%+"],
+        )
+        st.dataframe(
+            two_plus_calibration.style.format({
+                "Average_Probability": "{:.1%}", "Actual_Rate": "{:.1%}", "Calibration_Gap": "{:+.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+    st.markdown("#### 4. Score validation")
+    score_table = binary_score_bucket_table(completed_history)
+    if not score_table.empty:
+        st.dataframe(
+            score_table.style.format({
+                "Average_Score": "{:.1f}", "Average_Probability": "{:.1%}", "Actual_Rate": "{:.1%}",
+            }),
+            width="stretch", hide_index=True,
+        )
+
+    st.markdown("#### 5. Calibrated probability × score")
+    active_calibration = st.session_state.get(calibration_state_key)
+    joint_matrix, joint_detail, joint_source = binary_score_probability_joint_table(
+        completed_history, active_calibration
+    )
+    if joint_matrix.empty:
+        st.info("Not enough completed rows are available for the combined probability-and-score check.")
+    else:
+        st.caption(
+            f"Each cell is actual {BINARY_EVENT_KIND.upper()} rate with its sample size. "
+            f"Probability source: {joint_source}. Cells below 10 outcomes are exploratory; "
+            "the chronological holdout remains the main test of calibration quality."
+        )
+        st.dataframe(joint_matrix, width="stretch")
+        with st.expander("Detailed probability × score results"):
+            detail_columns = [
+                "Score_Bucket", "Probability_Bucket", "Sample", "Wins",
+                "Average_Probability", "Actual_Rate", "Calibration_Gap",
+                "Probability_Bucket_Rate", "Score_Lift_Within_Probability", "Sample_Status",
+            ]
+            st.dataframe(
+                joint_detail[[column for column in detail_columns if column in joint_detail.columns]].style.format({
+                    "Wins": "{:.0f}",
+                    "Average_Probability": "{:.1%}",
+                    "Actual_Rate": "{:.1%}",
+                    "Calibration_Gap": "{:+.1%}",
+                    "Probability_Bucket_Rate": "{:.1%}",
+                    "Score_Lift_Within_Probability": "{:+.1%}",
+                }),
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "Score lift within probability compares each score cell's hit rate with the overall hit rate "
+                "of that same calibrated-probability bucket. Positive lift means score added separation beyond probability."
+            )
+
+    market_rows = completed_history[
+        completed_history["MarketProbability"].notna() | completed_history["MarketImpliedProbability"].notna()
+    ].copy()
+    if not market_rows.empty:
+        st.markdown("#### 6. Model versus market")
+        market_rows["FairMarket"] = market_rows["MarketProbability"].fillna(market_rows["MarketImpliedProbability"])
+        market_rows["ModelMarketEdge"] = market_rows["ModelProbability"] - market_rows["FairMarket"]
+        market_rows["EdgeBucket"] = pd.cut(
+            market_rows["ModelMarketEdge"],
+            bins=[-1, -.15, -.10, -.05, 0, .05, .10, .15, 1],
+            labels=["≤-15%", "-15 to -10%", "-10 to -5%", "-5 to 0%", "0 to +5%", "+5 to +10%", "+10 to +15%", "+15%+"],
+            include_lowest=True,
+        )
+        market_table = market_rows.groupby("EdgeBucket", observed=False).agg(
+            Sample=("Actual_Event", "size"),
+            Average_Model=("ModelProbability", "mean"),
+            Average_Market=("FairMarket", "mean"),
+            Actual_Rate=("Actual_Event", "mean"),
+        ).reset_index()
+        st.dataframe(
+            market_table.style.format({
+                "Average_Model": "{:.1%}", "Average_Market": "{:.1%}", "Actual_Rate": "{:.1%}",
+            }), width="stretch", hide_index=True,
+        )
+
+    st.markdown("#### 7. Fit probability calibration")
+    minimum_rows = st.number_input(
+        "Minimum completed hitter-games",
+        min_value=30,
+        max_value=5000,
+        value=int(BINARY_MIN_CALIBRATION_ROWS),
+        step=25 if BINARY_EVENT_KIND == "hit" else 100,
+        key=f"{widget_prefix}_minimum_calibration_rows",
+    )
+    fitted = fit_binary_calibration(completed_history, int(minimum_rows))
+    if not fitted.get("ok"):
+        st.info(fitted.get("message", "More completed games are required."))
+    else:
+        fit_table = pd.DataFrame([fitted])
+        show_columns = [
+            "n", "intercept", "slope", "raw_brier", "calibrated_brier",
+            "raw_logloss", "calibrated_logloss", "holdout_n",
+            "holdout_raw_brier", "holdout_calibrated_brier",
+            "holdout_raw_logloss", "holdout_calibrated_logloss",
+        ]
+        st.dataframe(
+            fit_table[[column for column in show_columns if column in fit_table.columns]].style.format({
+                "intercept": "{:+.4f}", "slope": "{:.4f}",
+                "raw_brier": "{:.4f}", "calibrated_brier": "{:.4f}",
+                "raw_logloss": "{:.4f}", "calibrated_logloss": "{:.4f}",
+                "holdout_raw_brier": "{:.4f}", "holdout_calibrated_brier": "{:.4f}",
+                "holdout_raw_logloss": "{:.4f}", "holdout_calibrated_logloss": "{:.4f}",
+            }), width="stretch", hide_index=True,
+        )
+        st.caption(
+            "The chronological holdout fits on the earlier 70% of games and tests the later 30%. Apply calibration only when holdout Brier score or log loss improves."
+        )
+        controls = st.columns(2)
+        with controls[0]:
+            st.download_button(
+                "Download calibration JSON",
+                json.dumps(fitted, indent=2).encode("utf-8"),
+                file_name=f"{BINARY_TARGET_SLUG}_calibration.json",
+                mime="application/json",
+                width="stretch",
+            )
+        with controls[1]:
+            if st.button("Apply fitted calibration to this dashboard", width="stretch", key=f"{widget_prefix}_apply_fitted_calibration"):
+                st.session_state[calibration_state_key] = fitted
+                st.rerun()
+
+    st.markdown("#### 8. Segment checks")
+    segment_columns = [
+        column for column in [
+            "LookbackDays", "LineupStatus", "Confidence_Level", "HomeAway",
+            "EffectiveStand", "SampleStatus", "ModelVersion",
+        ] if column in completed_history.columns
+    ]
+    if segment_columns:
+        segment = st.selectbox(
+            "Break results down by", segment_columns, key=f"{widget_prefix}_segment_choice"
+        )
+        segment_table = grouped_binary_metrics(completed_history, segment)
+        if not segment_table.empty:
+            st.dataframe(
+                segment_table.style.format({
+                    "Mean_Probability": "{:.1%}", "Actual_Rate": "{:.1%}",
+                    "Brier": "{:.4f}", "Log_Loss": "{:.4f}", "Bias": "{:+.1%}",
+                }), width="stretch", hide_index=True,
+            )
+
+    with st.expander("Completed history used in this report"):
+        st.dataframe(completed_history, width="stretch", hide_index=True, height=500)
+
+
+
+# -----------------------------------------------------------------------------
+# Automatic batter odds, whole-slate rankings, and three-person pairing tools
+# -----------------------------------------------------------------------------
+ODDS_API_SPORT = "baseball_mlb"
+ODDS_API_MARKET_KEY = "batter_hits"
+ODDS_API_MARKET_LABEL = "Batter hits"
+ODDS_BOOKMAKERS = {
+    "hardrockbet_fl": "Hard Rock Bet FL",
+    "prizepicks": "PrizePicks",
+    "fanduel": "FanDuel",
+    "draftkings": "DraftKings",
+    "pinnacle": "Pinnacle",
+}
+ODDS_SOURCE_OPTIONS = [
+    "Hard Rock Bet FL",
+    "PrizePicks",
+    "FanDuel",
+    "DraftKings",
+    "Pinnacle",
+    "Consensus sportsbooks",
+    "Best sportsbook over line",
+    "Best sportsbook under line",
+]
+ODDS_SOURCE_TO_KEY = {title: key for key, title in ODDS_BOOKMAKERS.items()}
+SPORTSBOOK_KEYS = {"hardrockbet_fl", "fanduel", "draftkings", "pinnacle"}
+
 
 def read_streamlit_secret(name: str) -> str:
     try:
@@ -275,27 +4281,10 @@ def read_streamlit_secret(name: str) -> str:
     return str(value or "").strip()
 
 
-def normalize_lookup_text(value: object) -> str:
-    raw = unicodedata.normalize("NFKD", str(value or ""))
-    ascii_text = raw.encode("ascii", "ignore").decode("ascii").lower()
-    return re.sub(r"[^a-z0-9]+", "", ascii_text)
-
-
 def normalize_person_name(value: object) -> str:
-    raw = unicodedata.normalize("NFKD", str(value or ""))
-    ascii_text = raw.encode("ascii", "ignore").decode("ascii").lower()
-    ascii_text = re.sub(r"\b(jr|sr|ii|iii|iv)\b", " ", ascii_text)
-    return re.sub(r"[^a-z0-9]+", "", ascii_text)
-
-
-def canonical_team_abbr(value: object) -> str:
-    normalized = normalize_lookup_text(value)
-    if normalized in TEAM_NAME_TO_ABBR:
-        return TEAM_NAME_TO_ABBR[normalized]
-    upper = str(value or "").strip().upper()
-    if upper in set(MLB_TEAM_ABBR.values()) | {"OAK"}:
-        return "ATH" if upper == "OAK" else upper
-    return upper
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    tokens = [token for token in re.findall(r"[a-z0-9]+", text.lower()) if token not in {"jr", "sr", "ii", "iii", "iv"}]
+    return "".join(tokens)
 
 
 def player_name_match_score(target: object, candidate: object) -> float:
@@ -310,25 +4299,35 @@ def player_name_match_score(target: object, candidate: object) -> float:
     suffixes = {"jr", "sr", "ii", "iii", "iv"}
     target_tokens = [token for token in target_tokens if token not in suffixes]
     candidate_tokens = [token for token in candidate_tokens if token not in suffixes]
+    ratio = SequenceMatcher(None, target_text, candidate_text).ratio()
     if target_tokens and candidate_tokens and target_tokens[-1] == candidate_tokens[-1]:
         if target_tokens[0][:1] == candidate_tokens[0][:1]:
-            return max(0.94, SequenceMatcher(None, target_text, candidate_text).ratio())
-        return max(0.78, SequenceMatcher(None, target_text, candidate_text).ratio())
-    return SequenceMatcher(None, target_text, candidate_text).ratio()
+            return max(0.94, ratio)
+        return max(0.78, ratio)
+    return ratio
 
 
-def _api_error_message(exc: Exception) -> str:
+def odds_team_key(value: object) -> str:
+    text = normalize_name(value)
+    aliases = {
+        "oaklandathletics": "athletics",
+        "sacramentoathletics": "athletics",
+        "athletics": "athletics",
+    }
+    return aliases.get(text, text)
+
+
+def _odds_api_error(exc: Exception) -> str:
     if isinstance(exc, HTTPError):
         try:
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:
             body = ""
-        detail = body[:500].strip()
-        return f"HTTP {exc.code}: {detail or exc.reason}"
+        return f"HTTP {exc.code}: {(body[:500].strip() or exc.reason)}"
     return f"{type(exc).__name__}: {exc}"
 
 
-def _response_quota(response) -> dict:
+def _odds_quota(response) -> dict:
     headers = getattr(response, "headers", {})
     return {
         "requests_remaining": headers.get("x-requests-remaining"),
@@ -338,81 +4337,70 @@ def _response_quota(response) -> dict:
 
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=8)
-def fetch_odds_api_events(
-    api_key: str,
-    commence_time_from: str,
-    commence_time_to: str,
-) -> tuple[list[dict], dict, str | None]:
-    params = urlencode(
-        {
-            "apiKey": api_key,
-            "dateFormat": "iso",
-            "commenceTimeFrom": commence_time_from,
-            "commenceTimeTo": commence_time_to,
-        }
-    )
+def fetch_odds_api_events_batter(api_key: str, commence_from: str, commence_to: str) -> tuple[list[dict], dict, str | None]:
+    params = urlencode({
+        "apiKey": api_key,
+        "dateFormat": "iso",
+        "commenceTimeFrom": commence_from,
+        "commenceTimeTo": commence_to,
+    })
     url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/events?{params}"
-    request = Request(url, headers={"User-Agent": "MLB-Pitcher-Lab/2.0", "Accept": "application/json"})
+    request = Request(url, headers={"User-Agent": "MLB-Hitter-Dashboard/3.0", "Accept": "application/json"})
     try:
         with urlopen(request, timeout=20) as response:
             payload = json.load(response)
-            quota = _response_quota(response)
+            quota = _odds_quota(response)
     except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-        return [], {}, _api_error_message(exc)
+        return [], {}, _odds_api_error(exc)
     if not isinstance(payload, list):
         return [], quota, "The events endpoint returned an unexpected response."
     return payload, quota, None
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=64)
-def fetch_odds_api_event_props(
-    api_key: str,
-    event_id: str,
-    bookmaker_keys: str,
-    market_keys: str,
-) -> tuple[dict, dict, str | None]:
-    params = urlencode(
-        {
-            "apiKey": api_key,
-            "bookmakers": bookmaker_keys,
-            "markets": market_keys,
-            "oddsFormat": "american",
-            "dateFormat": "iso",
-            "includeMultipliers": "true",
-        }
-    )
+def fetch_odds_api_event_batter_props(api_key: str, event_id: str, bookmaker_keys: str, market_key: str) -> tuple[dict, dict, str | None]:
+    params = urlencode({
+        "apiKey": api_key,
+        "bookmakers": bookmaker_keys,
+        "markets": market_key,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "includeMultipliers": "true",
+    })
     url = f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/events/{event_id}/odds?{params}"
-    request = Request(url, headers={"User-Agent": "MLB-Pitcher-Lab/2.0", "Accept": "application/json"})
+    request = Request(url, headers={"User-Agent": "MLB-Hitter-Dashboard/3.0", "Accept": "application/json"})
     try:
         with urlopen(request, timeout=25) as response:
             payload = json.load(response)
-            quota = _response_quota(response)
+            quota = _odds_quota(response)
     except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-        return {}, {}, _api_error_message(exc)
+        return {}, {}, _odds_api_error(exc)
     if not isinstance(payload, dict):
         return {}, quota, "The event odds endpoint returned an unexpected response."
     return payload, quota, None
 
 
-def slate_utc_bounds(slate_date: object) -> tuple[str, str]:
+def slate_utc_bounds_for_odds(slate_date: object) -> tuple[str, str]:
     day = pd.Timestamp(slate_date)
     try:
         start = day.tz_localize("America/New_York").tz_convert("UTC")
     except Exception:
         start = day.tz_localize("UTC")
-    end = start + pd.Timedelta(days=1, hours=8)
-    start = start - pd.Timedelta(hours=4)
-    return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
+    return (
+        (start - pd.Timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+        (start + pd.Timedelta(days=1, hours=8)).isoformat().replace("+00:00", "Z"),
+    )
 
 
-def match_odds_event(game: dict, events: list[dict]) -> dict | None:
-    away = canonical_team_abbr(game.get("away_abbr") or game.get("away_name"))
-    home = canonical_team_abbr(game.get("home_abbr") or game.get("home_name"))
-    candidates = [
-        event for event in events
-        if canonical_team_abbr(event.get("away_team")) == away
-        and canonical_team_abbr(event.get("home_team")) == home
-    ]
+def match_odds_event_for_game(game: dict, events: list[dict]) -> dict | None:
+    away_keys = {odds_team_key(game.get("away_name")), odds_team_key(game.get("away_abbr"))}
+    home_keys = {odds_team_key(game.get("home_name")), odds_team_key(game.get("home_abbr"))}
+    candidates = []
+    for event in events:
+        event_away = odds_team_key(event.get("away_team"))
+        event_home = odds_team_key(event.get("home_team"))
+        if event_away in away_keys and event_home in home_keys:
+            candidates.append(event)
     if not candidates:
         return None
     game_time = pd.to_datetime(game.get("game_datetime_utc"), utc=True, errors="coerce")
@@ -420,302 +4408,115 @@ def match_odds_event(game: dict, events: list[dict]) -> dict | None:
         return candidates[0]
     return min(
         candidates,
-        key=lambda event: abs(
-            (pd.to_datetime(event.get("commence_time"), utc=True, errors="coerce") - game_time).total_seconds()
-        ) if not pd.isna(pd.to_datetime(event.get("commence_time"), utc=True, errors="coerce")) else float("inf"),
+        key=lambda event: abs((pd.to_datetime(event.get("commence_time"), utc=True, errors="coerce") - game_time).total_seconds())
+        if not pd.isna(pd.to_datetime(event.get("commence_time"), utc=True, errors="coerce")) else float("inf"),
     )
 
 
-def parse_pitcher_prop_payload(payload: dict, game: dict) -> pd.DataFrame:
+def parse_batter_prop_payload(payload: dict, game: dict) -> pd.DataFrame:
     rows: list[dict] = []
-    event_id = payload.get("id")
     for bookmaker in payload.get("bookmakers", []) or []:
         bookmaker_key = str(bookmaker.get("key", ""))
         bookmaker_title = str(bookmaker.get("title") or ODDS_BOOKMAKERS.get(bookmaker_key, bookmaker_key))
         for market in bookmaker.get("markets", []) or []:
-            market_key = str(market.get("key", ""))
-            if market_key not in ODDS_API_MARKETS:
+            if str(market.get("key", "")) != ODDS_API_MARKET_KEY:
                 continue
-            last_update = market.get("last_update")
             grouped: dict[tuple[str, float], dict] = {}
             for outcome in market.get("outcomes", []) or []:
                 side = str(outcome.get("name", "")).strip().lower()
                 if side not in {"over", "under"}:
                     continue
                 player = str(outcome.get("description") or outcome.get("participant") or "").strip()
-                if not player:
-                    continue
                 point = pd.to_numeric(pd.Series([outcome.get("point")]), errors="coerce").iloc[0]
-                if pd.isna(point):
+                if not player or pd.isna(point):
                     continue
                 key = (normalize_person_name(player), float(point))
-                record = grouped.setdefault(
-                    key,
-                    {
-                        "SlateDate": str(game.get("slate_date", "")),
-                        "GamePK": game.get("game_pk"),
-                        "OddsEventID": event_id,
-                        "AwayTeam": payload.get("away_team"),
-                        "HomeTeam": payload.get("home_team"),
-                        "CommenceTimeUTC": payload.get("commence_time"),
-                        "BookmakerKey": bookmaker_key,
-                        "Bookmaker": bookmaker_title,
-                        "MarketKey": market_key,
-                        "Market": ODDS_API_MARKETS[market_key]["label"],
-                        "Player": player,
-                        "PlayerNorm": normalize_person_name(player),
-                        "Line": float(point),
-                        "OverOdds": np.nan,
-                        "UnderOdds": np.nan,
-                        "OverMultiplier": np.nan,
-                        "UnderMultiplier": np.nan,
-                        "LastUpdate": last_update,
-                    },
-                )
+                record = grouped.setdefault(key, {
+                    "SlateDate": str(game.get("slate_date", "")),
+                    "GamePK": game.get("game_pk"),
+                    "OddsEventID": payload.get("id"),
+                    "BookmakerKey": bookmaker_key,
+                    "Bookmaker": bookmaker_title,
+                    "MarketKey": ODDS_API_MARKET_KEY,
+                    "Market": ODDS_API_MARKET_LABEL,
+                    "Player": player,
+                    "PlayerNorm": normalize_person_name(player),
+                    "Line": float(point),
+                    "OverOdds": np.nan,
+                    "UnderOdds": np.nan,
+                    "OverMultiplier": np.nan,
+                    "UnderMultiplier": np.nan,
+                    "LastUpdate": market.get("last_update"),
+                })
                 price = pd.to_numeric(pd.Series([outcome.get("price")]), errors="coerce").iloc[0]
-                multiplier = outcome.get("multiplier")
-                if multiplier is None:
-                    multiplier = outcome.get("multipliers")
-                multiplier_numeric = pd.to_numeric(pd.Series([multiplier]), errors="coerce").iloc[0]
+                multiplier = outcome.get("multiplier") if outcome.get("multiplier") is not None else outcome.get("multipliers")
+                multiplier = pd.to_numeric(pd.Series([multiplier]), errors="coerce").iloc[0]
                 if side == "over":
                     record["OverOdds"] = float(price) if not pd.isna(price) else np.nan
-                    record["OverMultiplier"] = float(multiplier_numeric) if not pd.isna(multiplier_numeric) else np.nan
+                    record["OverMultiplier"] = float(multiplier) if not pd.isna(multiplier) else np.nan
                 else:
                     record["UnderOdds"] = float(price) if not pd.isna(price) else np.nan
-                    record["UnderMultiplier"] = float(multiplier_numeric) if not pd.isna(multiplier_numeric) else np.nan
+                    record["UnderMultiplier"] = float(multiplier) if not pd.isna(multiplier) else np.nan
             rows.extend(grouped.values())
     return pd.DataFrame(rows)
 
 
-def fetch_pitcher_prop_quotes(
-    api_key: str,
-    schedule: list[dict],
-    game_pks: list[int],
-) -> tuple[pd.DataFrame, dict, list[str]]:
+def fetch_batter_prop_quotes(api_key: str, games: list[dict], game_pks: list[int]) -> tuple[pd.DataFrame, dict, list[str]]:
     selected = {int(value) for value in game_pks if pd.notna(value)}
     if not api_key:
         return pd.DataFrame(), {}, ["The Odds API key is missing."]
-    if not schedule or not selected:
-        return pd.DataFrame(), {}, ["No games were selected."]
-    slate_date_value = next((game.get("slate_date") for game in schedule if game.get("game_pk") in selected), date.today())
-    commence_from, commence_to = slate_utc_bounds(slate_date_value)
-    events, events_quota, events_error = fetch_odds_api_events(api_key, commence_from, commence_to)
-    if events_error:
-        return pd.DataFrame(), events_quota, [f"Events: {events_error}"]
-
-    frames: list[pd.DataFrame] = []
-    errors: list[str] = []
-    quota_meta = dict(events_quota)
-    quota_cost_total = 0.0
-    matched_events = 0
-    queried_events = 0
+    if not games or not selected:
+        return pd.DataFrame(), {}, ["No MLB games were selected."]
+    slate_date_value = next((game.get("slate_date") for game in games if game.get("game_pk") in selected), date.today())
+    commence_from, commence_to = slate_utc_bounds_for_odds(slate_date_value)
+    events, quota, event_error = fetch_odds_api_events_batter(api_key, commence_from, commence_to)
+    if event_error:
+        return pd.DataFrame(), quota, [f"Events: {event_error}"]
     bookmaker_keys = ",".join(ODDS_BOOKMAKERS.keys())
-    market_keys = ",".join(ODDS_API_MARKETS.keys())
-
-    for game in schedule:
-        numeric_game_pk = pd.to_numeric(pd.Series([game.get("game_pk")]), errors="coerce").iloc[0]
-        if pd.isna(numeric_game_pk) or int(numeric_game_pk) not in selected:
+    frames, errors = [], []
+    total_cost = 0.0
+    matched = queried = 0
+    for game in games:
+        game_pk = pd.to_numeric(pd.Series([game.get("game_pk")]), errors="coerce").iloc[0]
+        if pd.isna(game_pk) or int(game_pk) not in selected:
             continue
-        event = match_odds_event(game, events)
+        event = match_odds_event_for_game(game, events)
         if not event:
-            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: no matching event was found.")
+            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: no matching odds event.")
             continue
-        matched_events += 1
-        payload, call_quota, call_error = fetch_odds_api_event_props(
-            api_key,
-            str(event.get("id")),
-            bookmaker_keys,
-            market_keys,
+        matched += 1
+        payload, call_quota, call_error = fetch_odds_api_event_batter_props(
+            api_key, str(event.get("id")), bookmaker_keys, ODDS_API_MARKET_KEY
         )
-        queried_events += 1
+        queried += 1
         if call_quota:
-            quota_meta.update({key: value for key, value in call_quota.items() if value is not None})
+            quota.update({key: value for key, value in call_quota.items() if value is not None})
             try:
-                quota_cost_total += float(call_quota.get("requests_last") or 0)
+                total_cost += float(call_quota.get("requests_last") or 0)
             except (TypeError, ValueError):
                 pass
         if call_error:
             errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: {call_error}")
             continue
-        frame = parse_pitcher_prop_payload(payload, game)
+        frame = parse_batter_prop_payload(payload, game)
         if frame.empty:
-            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: no requested pitcher props were returned.")
+            errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')}: no {ODDS_API_MARKET_LABEL.lower()} market returned.")
         else:
             frames.append(frame)
-
-    quota_meta["estimated_credits_used_this_fetch"] = quota_cost_total
-    quota_meta["events_matched"] = matched_events
-    quota_meta["events_queried"] = queried_events
+    quota["estimated_credits_used_this_fetch"] = total_cost
+    quota["events_matched"] = matched
+    quota["events_queried"] = queried
     if not frames:
-        return pd.DataFrame(), quota_meta, errors
+        return pd.DataFrame(), quota, errors
     quotes = pd.concat(frames, ignore_index=True, sort=False)
-    quotes["LastUpdateParsed"] = pd.to_datetime(quotes.get("LastUpdate"), utc=True, errors="coerce")
-    quotes = quotes.sort_values("LastUpdateParsed", na_position="first")
-    quotes = quotes.drop_duplicates(
+    quotes["_Updated"] = pd.to_datetime(quotes.get("LastUpdate"), utc=True, errors="coerce")
+    quotes = quotes.sort_values("_Updated", na_position="first").drop_duplicates(
         ["GamePK", "BookmakerKey", "MarketKey", "PlayerNorm", "Line"], keep="last"
-    ).drop(columns="LastUpdateParsed")
-    return quotes.reset_index(drop=True), quota_meta, errors
+    )
+    return quotes.drop(columns="_Updated").reset_index(drop=True), quota, errors
 
 
-def _matched_pitcher_quote_rows(quotes: pd.DataFrame, game_pk: object, pitcher_name: str, market_key: str) -> pd.DataFrame:
-    if quotes is None or quotes.empty:
-        return pd.DataFrame()
-    game_numeric = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
-    quote_game = pd.to_numeric(quotes.get("GamePK"), errors="coerce")
-    candidates = quotes[(quote_game.eq(game_numeric)) & quotes.get("MarketKey", pd.Series(index=quotes.index, dtype=object)).eq(market_key)].copy()
-    if candidates.empty:
-        return candidates
-    target_norm = normalize_person_name(pitcher_name)
-    exact = candidates[candidates.get("PlayerNorm", pd.Series(index=candidates.index, dtype=object)).eq(target_norm)]
-    if not exact.empty:
-        return exact
-    candidates["_NameScore"] = candidates.get("Player", "").map(lambda value: player_name_match_score(pitcher_name, value))
-    best = pd.to_numeric(candidates["_NameScore"], errors="coerce").max()
-    if pd.isna(best) or best < 0.84:
-        return pd.DataFrame(columns=candidates.columns)
-    return candidates[candidates["_NameScore"].ge(best - 0.015)].drop(columns="_NameScore", errors="ignore")
-
-
-def _latest_per_book(candidates: pd.DataFrame) -> pd.DataFrame:
-    if candidates.empty:
-        return candidates
-    work = candidates.copy()
-    work["_Updated"] = pd.to_datetime(work.get("LastUpdate"), utc=True, errors="coerce")
-    work["_Paired"] = work.get("OverOdds").notna().astype(int) + work.get("UnderOdds").notna().astype(int)
-    work = work.sort_values(["BookmakerKey", "_Paired", "_Updated"], na_position="first")
-    return work.drop_duplicates("BookmakerKey", keep="last").drop(columns=["_Updated", "_Paired"])
-
-
-def select_prop_quote(candidates: pd.DataFrame, source_mode: str) -> dict | None:
-    if candidates is None or candidates.empty:
-        return None
-    candidates = _latest_per_book(candidates)
-    direct_key = ODDS_SOURCE_TO_KEY.get(source_mode)
-    if direct_key:
-        direct = candidates[candidates["BookmakerKey"].eq(direct_key)].copy()
-        if direct.empty:
-            return None
-        row = direct.sort_values("LastUpdate", na_position="first").iloc[-1].to_dict()
-        row["SelectedSource"] = row.get("Bookmaker") or ODDS_BOOKMAKERS.get(direct_key, direct_key)
-        row["BookCount"] = 1
-        return row
-
-    books = candidates[candidates["BookmakerKey"].isin(SPORTSBOOK_KEYS)].copy()
-    if books.empty:
-        return None
-    if source_mode == "Consensus sportsbooks":
-        line = float(pd.to_numeric(books["Line"], errors="coerce").median())
-        over_odds = pd.to_numeric(books["OverOdds"], errors="coerce").median()
-        under_odds = pd.to_numeric(books["UnderOdds"], errors="coerce").median()
-        return {
-            "Line": line,
-            "OverOdds": float(over_odds) if not pd.isna(over_odds) else np.nan,
-            "UnderOdds": float(under_odds) if not pd.isna(under_odds) else np.nan,
-            "OverMultiplier": np.nan,
-            "UnderMultiplier": np.nan,
-            "SelectedSource": f"Consensus ({books['BookmakerKey'].nunique()} books)",
-            "BookmakerKey": "consensus",
-            "LastUpdate": pd.to_datetime(books["LastUpdate"], utc=True, errors="coerce").max(),
-            "BookCount": int(books["BookmakerKey"].nunique()),
-        }
-    if source_mode == "Best sportsbook over line":
-        best_line = pd.to_numeric(books["Line"], errors="coerce").min()
-        subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
-        subset["_Price"] = pd.to_numeric(subset["OverOdds"], errors="coerce").fillna(-100000)
-        row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
-        row["SelectedSource"] = f"Best over · {row.get('Bookmaker')}"
-        row["BookCount"] = int(books["BookmakerKey"].nunique())
-        return row
-    if source_mode == "Best sportsbook under line":
-        best_line = pd.to_numeric(books["Line"], errors="coerce").max()
-        subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
-        subset["_Price"] = pd.to_numeric(subset["UnderOdds"], errors="coerce").fillna(-100000)
-        row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
-        row["SelectedSource"] = f"Best under · {row.get('Bookmaker')}"
-        row["BookCount"] = int(books["BookmakerKey"].nunique())
-        return row
-    return None
-
-
-def american_implied_probability(odds: object) -> float:
-    numeric = pd.to_numeric(pd.Series([odds]), errors="coerce").iloc[0]
-    if pd.isna(numeric) or numeric == 0:
-        return np.nan
-    numeric = float(numeric)
-    if numeric < 0:
-        return -numeric / (-numeric + 100.0)
-    return 100.0 / (numeric + 100.0)
-
-
-def no_vig_over_probability(over_odds: object, under_odds: object) -> float:
-    over = american_implied_probability(over_odds)
-    under = american_implied_probability(under_odds)
-    if not np.isfinite(over) or not np.isfinite(under) or over + under <= 0:
-        return np.nan
-    return float(over / (over + under))
-
-
-def format_american_odds(value: object) -> str:
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(numeric):
-        return "—"
-    rounded = int(round(float(numeric)))
-    return f"+{rounded}" if rounded > 0 else str(rounded)
-
-
-def apply_odds_quotes_to_board(board: pd.DataFrame, quotes: pd.DataFrame, source_mode: str) -> pd.DataFrame:
-    result = board.copy()
-    for market_key, config in ODDS_API_MARKETS.items():
-        prefix = config["prefix"]
-        for column, default in {
-            f"{prefix}_Line": np.nan,
-            f"{prefix}_Over_Odds": np.nan,
-            f"{prefix}_Under_Odds": np.nan,
-            f"{prefix}_Over_Multiplier": np.nan,
-            f"{prefix}_Under_Multiplier": np.nan,
-            f"{prefix}_Line_Source": "",
-            f"{prefix}_Line_Updated": "",
-            f"{prefix}_Market_Over_Prob": np.nan,
-            f"{prefix}_Model_Over_Prob": np.nan,
-            f"{prefix}_Probability_Edge": np.nan,
-            f"{prefix}_Projection_Edge": np.nan,
-        }.items():
-            result[column] = default
-
-        for index, row in result.iterrows():
-            candidates = _matched_pitcher_quote_rows(quotes, row.get("GamePK"), str(row.get("Pitcher", "")), market_key)
-            selected = select_prop_quote(candidates, source_mode)
-            if not selected:
-                continue
-            line = pd.to_numeric(pd.Series([selected.get("Line")]), errors="coerce").iloc[0]
-            if pd.isna(line):
-                continue
-            over_odds = pd.to_numeric(pd.Series([selected.get("OverOdds")]), errors="coerce").iloc[0]
-            under_odds = pd.to_numeric(pd.Series([selected.get("UnderOdds")]), errors="coerce").iloc[0]
-            projection = float(pd.to_numeric(pd.Series([row.get(config["projection"])]), errors="coerce").iloc[0])
-            if prefix == "Outs":
-                sd = float(pd.to_numeric(pd.Series([row.get("Outs_SD")]), errors="coerce").fillna(2.5).iloc[0])
-                model_over = 1.0 - normal_cdf(float(line), projection, max(sd, 0.75))
-            else:
-                model_over = probability_over_line(projection, float(line))
-            market_over = no_vig_over_probability(over_odds, under_odds)
-            result.at[index, f"{prefix}_Line"] = float(line)
-            result.at[index, f"{prefix}_Over_Odds"] = float(over_odds) if not pd.isna(over_odds) else np.nan
-            result.at[index, f"{prefix}_Under_Odds"] = float(under_odds) if not pd.isna(under_odds) else np.nan
-            result.at[index, f"{prefix}_Over_Multiplier"] = selected.get("OverMultiplier", np.nan)
-            result.at[index, f"{prefix}_Under_Multiplier"] = selected.get("UnderMultiplier", np.nan)
-            result.at[index, f"{prefix}_Line_Source"] = str(selected.get("SelectedSource") or selected.get("Bookmaker") or "")
-            updated = selected.get("LastUpdate")
-            result.at[index, f"{prefix}_Line_Updated"] = str(updated) if updated is not None and not pd.isna(updated) else ""
-            result.at[index, f"{prefix}_Market_Over_Prob"] = market_over
-            result.at[index, f"{prefix}_Model_Over_Prob"] = float(model_over)
-            result.at[index, f"{prefix}_Probability_Edge"] = float(model_over - market_over) if np.isfinite(market_over) else np.nan
-            result.at[index, f"{prefix}_Projection_Edge"] = float(projection - float(line))
-    result["OddsSourceMode"] = source_mode
-    return result
-
-
-def combine_odds_quote_frames(existing: pd.DataFrame, new_quotes: pd.DataFrame, slate_date: object) -> pd.DataFrame:
+def combine_batter_quote_frames(existing: pd.DataFrame, new_quotes: pd.DataFrame, slate_date: object) -> pd.DataFrame:
     frames = []
     slate_text = str(pd.Timestamp(slate_date).date())
     if existing is not None and not existing.empty:
@@ -731,2102 +4532,555 @@ def combine_odds_quote_frames(existing: pd.DataFrame, new_quotes: pd.DataFrame, 
     combined = pd.concat(frames, ignore_index=True, sort=False)
     combined["_Updated"] = pd.to_datetime(combined.get("LastUpdate"), utc=True, errors="coerce")
     combined = combined.sort_values("_Updated", na_position="first")
-    keys = ["GamePK", "BookmakerKey", "MarketKey", "PlayerNorm", "Line"]
-    combined = combined.drop_duplicates([key for key in keys if key in combined.columns], keep="last")
-    return combined.drop(columns="_Updated", errors="ignore").reset_index(drop=True)
-
-# -----------------------------------------------------------------------------
-# Data loading and preparation
-# -----------------------------------------------------------------------------
-
-@st.cache_data(ttl=21600, show_spinner=False, max_entries=2)
-def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
-    return statcast(start_dt=start_date, end_dt=end_date, verbose=False, parallel=False)
+    combined = combined.drop_duplicates(["GamePK", "BookmakerKey", "MarketKey", "PlayerNorm", "Line"], keep="last")
+    return combined.drop(columns="_Updated").reset_index(drop=True)
 
 
-@st.cache_data(ttl=86400, show_spinner=False, max_entries=8)
-def lookup_names(player_ids: tuple[int, ...]) -> pd.DataFrame:
-    if not player_ids:
-        return pd.DataFrame(columns=["player_id", "Player"])
-    try:
-        lookup = playerid_reverse_lookup(list(player_ids), key_type="mlbam")
-    except Exception:
-        return pd.DataFrame(columns=["player_id", "Player"])
-    if lookup.empty:
-        return pd.DataFrame(columns=["player_id", "Player"])
-    lookup["Player"] = (
-        lookup["name_first"].fillna("").str.title()
-        + " "
-        + lookup["name_last"].fillna("").str.title()
-    ).str.strip()
-    return lookup.rename(columns={"key_mlbam": "player_id"})[["player_id", "Player"]]
-
-
-def prepare_statcast(raw: pd.DataFrame) -> pd.DataFrame:
-    if raw is None or raw.empty:
+def _matched_batter_quotes(quotes: pd.DataFrame, game_pk: object, player_name: str) -> pd.DataFrame:
+    if quotes is None or quotes.empty:
         return pd.DataFrame()
-
-    df = raw.copy()
-    expected = [
-        "batter", "pitcher", "game_pk", "at_bat_number", "game_date", "player_name",
-        "home_team", "away_team", "inning_topbot", "description", "events", "bb_type",
-        "launch_speed", "launch_angle", "launch_speed_angle", "estimated_woba_using_speedangle",
-        "woba_value", "estimated_ba_using_speedangle", "estimated_slg_using_speedangle", "zone",
-        "pitch_name", "release_speed", "pfx_x", "pfx_z", "release_extension", "stand", "p_throws",
-        "outs_on_play", "type",
-    ]
-    for column in expected:
-        if column not in df.columns:
-            df[column] = np.nan
-
-    numeric_columns = [
-        "batter", "pitcher", "game_pk", "at_bat_number", "launch_speed", "launch_angle",
-        "launch_speed_angle", "estimated_woba_using_speedangle", "woba_value",
-        "estimated_ba_using_speedangle", "estimated_slg_using_speedangle", "zone",
-        "release_speed", "pfx_x", "pfx_z", "release_extension", "outs_on_play",
-    ]
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    top = df["inning_topbot"].eq("Top").fillna(False)
-    df["batter_team"] = np.where(top, df["away_team"], df["home_team"])
-    df["pitcher_team"] = np.where(top, df["home_team"], df["away_team"])
-
-    description = df["description"].fillna("").astype(str)
-    events = df["events"].fillna("").astype(str)
-    df["is_pa_end"] = events.ne("")
-    df["is_k"] = events.isin(STRIKEOUT_EVENTS)
-    df["is_bb"] = events.isin(WALK_EVENTS)
-    df["is_hbp"] = events.eq("hit_by_pitch")
-    df["is_hit"] = events.isin(HIT_EVENTS)
-    df["is_hr"] = events.eq("home_run")
-    df["is_swing"] = description.isin(SWING_DESCRIPTIONS)
-    df["is_contact"] = description.isin(CONTACT_DESCRIPTIONS)
-    df["is_whiff"] = description.isin(WHIFF_DESCRIPTIONS)
-    df["is_called_strike"] = description.isin(CALLED_STRIKE_DESCRIPTIONS)
-    df["is_bbe"] = df["launch_speed"].notna() & df["launch_angle"].notna()
-    df["is_barrel"] = df["launch_speed_angle"].eq(6).fillna(False)
-    df["is_hard_hit"] = df["launch_speed"].ge(95).fillna(False)
-    df["is_ground_ball"] = df["bb_type"].eq("ground_ball").fillna(False)
-    df["is_fly_ball"] = df["bb_type"].eq("fly_ball").fillna(False)
-
-    df["pa_key"] = (
-        df["game_pk"].astype("Int64").astype(str)
-        + "-"
-        + df["at_bat_number"].astype("Int64").astype(str)
-    )
-
-    event_outs = events.map(OUTS_BY_EVENT).fillna(0.0)
-    df["outs_recorded"] = df["outs_on_play"].where(df["outs_on_play"].notna(), event_outs)
-    df["outs_recorded"] = pd.to_numeric(df["outs_recorded"], errors="coerce").fillna(0.0).clip(0, 3)
-
-    actual_woba = df["woba_value"].copy()
-    fallback_woba = events.map(
-        {
-            "walk": 0.69, "intent_walk": 0.69, "hit_by_pitch": 0.72,
-            "single": 0.88, "double": 1.25, "triple": 1.58, "home_run": 2.03,
-        }
-    ).fillna(0.0)
-    df["xwoba_value"] = df["estimated_woba_using_speedangle"].where(df["is_bbe"])
-    df["xwoba_value"] = df["xwoba_value"].where(df["xwoba_value"].notna(), actual_woba)
-    df["xwoba_value"] = df["xwoba_value"].where(df["xwoba_value"].notna(), fallback_woba)
-    df["xwoba_value"] = pd.to_numeric(df["xwoba_value"], errors="coerce").fillna(0.0)
-    return df
-
-
-def league_context(df: pd.DataFrame) -> dict:
-    pa = df[df["is_pa_end"]].copy()
-    pitches = max(len(df), 1)
-    swings = max(int(df["is_swing"].sum()), 1)
-    bbe = max(int(df["is_bbe"].sum()), 1)
-    plate_appearances = max(int(pa["pa_key"].nunique()), 1)
-    return {
-        "K_PA": float(pa["is_k"].sum() / plate_appearances),
-        "BB_PA": float(pa["is_bb"].sum() / plate_appearances),
-        "HR_PA": float(pa["is_hr"].sum() / plate_appearances),
-        "xwOBA": float(pa["xwoba_value"].sum() / plate_appearances),
-        "Brl_BBE": float(df["is_barrel"].sum() / bbe),
-        "HH_BBE": float(df["is_hard_hit"].sum() / bbe),
-        "Whiff": float(df["is_whiff"].sum() / swings),
-        "CSW": float((df["is_whiff"].sum() + df["is_called_strike"].sum()) / pitches),
-        "ER9": 4.30,
-    }
-
-
-# -----------------------------------------------------------------------------
-# MLB schedule, game feeds and pitcher game logs
-# -----------------------------------------------------------------------------
-
-@st.cache_data(ttl=900, show_spinner=False, max_entries=32)
-def fetch_mlb_schedule(slate_date: str) -> tuple[list[dict], str | None]:
-    url = (
-        "https://statsapi.mlb.com/api/v1/schedule"
-        f"?sportId=1&date={slate_date}&hydrate=probablePitcher,venue"
-    )
-    request = Request(url, headers={"User-Agent": "MLB-Pitcher-Lab/1.0", "Accept": "application/json"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-        return [], f"{type(exc).__name__}: {exc}"
-
-    games: list[dict] = []
-    for date_block in payload.get("dates", []):
-        for game in date_block.get("games", []):
-            teams = game.get("teams", {})
-            away_info = teams.get("away", {})
-            home_info = teams.get("home", {})
-            away_team = away_info.get("team", {}) or {}
-            home_team = home_info.get("team", {}) or {}
-            away_probable = away_info.get("probablePitcher", {}) or {}
-            home_probable = home_info.get("probablePitcher", {}) or {}
-            raw_time = game.get("gameDate")
-            game_time = "TBD"
-            if raw_time:
-                parsed = pd.to_datetime(raw_time, utc=True, errors="coerce")
-                if not pd.isna(parsed):
-                    try:
-                        game_time = parsed.tz_convert("America/New_York").strftime("%I:%M %p ET").lstrip("0")
-                    except Exception:
-                        game_time = parsed.strftime("%I:%M %p UTC").lstrip("0")
-            away_id = away_team.get("id")
-            home_id = home_team.get("id")
-            games.append(
-                {
-                    "game_pk": game.get("gamePk"),
-                    "slate_date": slate_date,
-                    "game_datetime_utc": raw_time,
-                    "time_et": game_time,
-                    "status": game.get("status", {}).get("detailedState", "Scheduled"),
-                    "venue": game.get("venue", {}).get("name", "Venue TBD"),
-                    "venue_id": game.get("venue", {}).get("id"),
-                    "away_id": away_id,
-                    "home_id": home_id,
-                    "away_abbr": MLB_TEAM_ABBR.get(away_id, away_team.get("name", "AWAY")[:3].upper()),
-                    "home_abbr": MLB_TEAM_ABBR.get(home_id, home_team.get("name", "HOME")[:3].upper()),
-                    "away_name": away_team.get("name", "Away"),
-                    "home_name": home_team.get("name", "Home"),
-                    "away_pitcher_id": away_probable.get("id"),
-                    "away_pitcher_name": away_probable.get("fullName", "TBD"),
-                    "home_pitcher_id": home_probable.get("id"),
-                    "home_pitcher_name": home_probable.get("fullName", "TBD"),
-                }
-            )
-    return games, None
-
-
-def _parse_team_lineup(team_box: dict) -> pd.DataFrame:
-    columns = ["player_id", "Player", "Position", "LineupSpot", "RawBattingOrder"]
-    if not isinstance(team_box, dict):
-        return pd.DataFrame(columns=columns)
-    players = team_box.get("players", {}) or {}
-    candidates: list[dict] = []
-    for player_key, record in players.items():
-        if not isinstance(record, dict):
-            continue
-        person = record.get("person", {}) or {}
-        player_id = person.get("id")
-        if player_id is None:
-            digits = "".join(character for character in str(player_key) if character.isdigit())
-            player_id = int(digits) if digits else None
-        raw_order = pd.to_numeric(pd.Series([record.get("battingOrder")]), errors="coerce").iloc[0]
-        numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
-        if pd.isna(raw_order) or pd.isna(numeric_id):
-            continue
-        raw_order = int(raw_order)
-        lineup_spot = raw_order // 100 if raw_order >= 100 else raw_order
-        if not 1 <= lineup_spot <= 9:
-            continue
-        game_status = record.get("gameStatus", {}) or {}
-        if bool(game_status.get("isSubstitute", False)):
-            continue
-        position = record.get("position", {}) or {}
-        candidates.append(
-            {
-                "player_id": int(numeric_id),
-                "Player": person.get("fullName") or f"MLB ID {int(numeric_id)}",
-                "Position": position.get("abbreviation") or position.get("name") or "",
-                "LineupSpot": int(lineup_spot),
-                "RawBattingOrder": raw_order,
-            }
-        )
-
-    ordered_ids = team_box.get("battingOrder") or team_box.get("batters") or []
-    existing_spots = {row["LineupSpot"] for row in candidates}
-    lookup: dict[int, dict] = {}
-    for player_key, record in players.items():
-        person = record.get("person", {}) if isinstance(record, dict) else {}
-        player_id = person.get("id")
-        if player_id is None:
-            digits = "".join(character for character in str(player_key) if character.isdigit())
-            player_id = int(digits) if digits else None
-        if player_id is not None:
-            lookup[int(player_id)] = record
-    if isinstance(ordered_ids, list) and len(ordered_ids) >= 9:
-        for spot, player_id in enumerate(ordered_ids[:9], start=1):
-            if spot in existing_spots:
-                continue
-            numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
-            if pd.isna(numeric_id):
-                continue
-            record = lookup.get(int(numeric_id), {})
-            person = record.get("person", {}) or {}
-            position = record.get("position", {}) or {}
-            candidates.append(
-                {
-                    "player_id": int(numeric_id),
-                    "Player": person.get("fullName") or f"MLB ID {int(numeric_id)}",
-                    "Position": position.get("abbreviation") or position.get("name") or "",
-                    "LineupSpot": spot,
-                    "RawBattingOrder": spot * 100,
-                }
-            )
-    if not candidates:
-        return pd.DataFrame(columns=columns)
-    lineup = pd.DataFrame(candidates).sort_values(["LineupSpot", "RawBattingOrder"])
-    return lineup.drop_duplicates("LineupSpot").head(9).reset_index(drop=True)[columns]
-
-
-@st.cache_data(ttl=300, show_spinner=False, max_entries=64)
-def fetch_game_lineups(game_pk: object) -> dict:
     numeric_game = pd.to_numeric(pd.Series([game_pk]), errors="coerce").iloc[0]
-    if pd.isna(numeric_game):
-        return {"ok": False, "away": pd.DataFrame(), "home": pd.DataFrame(), "error": "No game ID."}
-    game_pk_int = int(numeric_game)
-    endpoints = [
-        ("MLB live game feed", f"https://statsapi.mlb.com/api/v1.1/game/{game_pk_int}/feed/live"),
-        ("MLB boxscore", f"https://statsapi.mlb.com/api/v1/game/{game_pk_int}/boxscore"),
-    ]
-    errors: list[str] = []
-    for source, url in endpoints:
-        request = Request(url, headers={"User-Agent": "MLB-Pitcher-Lab/1.0", "Accept": "application/json"})
-        try:
-            with urlopen(request, timeout=15) as response:
-                payload = json.load(response)
-        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-            errors.append(f"{source}: {type(exc).__name__}: {exc}")
-            continue
-        if "liveData" in payload:
-            teams = payload.get("liveData", {}).get("boxscore", {}).get("teams", {})
-            game_state = payload.get("gameData", {}).get("status", {}).get("detailedState", "")
-            updated = payload.get("metaData", {}).get("timeStamp", "")
-        else:
-            teams = payload.get("teams", {})
-            game_state = ""
-            updated = ""
-        away = _parse_team_lineup(teams.get("away", {}))
-        home = _parse_team_lineup(teams.get("home", {}))
-        away_count = int(away["LineupSpot"].nunique()) if not away.empty else 0
-        home_count = int(home["LineupSpot"].nunique()) if not home.empty else 0
-        if away_count or home_count:
-            return {
-                "ok": away_count >= 9 and home_count >= 9,
-                "away": away,
-                "home": home,
-                "away_status": "Confirmed" if away_count >= 9 else ("Partial" if away_count else "Not posted"),
-                "home_status": "Confirmed" if home_count >= 9 else ("Partial" if home_count else "Not posted"),
-                "source": source,
-                "game_state": game_state,
-                "updated": updated,
-                "error": None,
-            }
-    return {
-        "ok": False,
-        "away": pd.DataFrame(),
-        "home": pd.DataFrame(),
-        "away_status": "Not posted",
-        "home_status": "Not posted",
-        "source": "Recent lineup fallback",
-        "game_state": "",
-        "updated": "",
-        "error": " | ".join(errors[-2:]) if errors else "No posted batting order yet.",
-    }
+    candidates = quotes[pd.to_numeric(quotes.get("GamePK"), errors="coerce").eq(numeric_game)].copy()
+    if candidates.empty:
+        return candidates
+    target = normalize_person_name(player_name)
+    exact = candidates[candidates.get("PlayerNorm", pd.Series(index=candidates.index, dtype=object)).eq(target)]
+    if not exact.empty:
+        return exact
+    candidates["_NameScore"] = candidates.get("Player", "").map(lambda value: player_name_match_score(player_name, value))
+    best = pd.to_numeric(candidates["_NameScore"], errors="coerce").max()
+    if pd.isna(best) or best < 0.84:
+        return pd.DataFrame(columns=candidates.columns)
+    return candidates[candidates["_NameScore"].ge(best - 0.015)].drop(columns="_NameScore", errors="ignore")
 
 
-@st.cache_data(ttl=21600, show_spinner=False, max_entries=256)
-def fetch_pitcher_game_log(pitcher_id: int, season: int) -> tuple[pd.DataFrame, str | None]:
-    url = (
-        f"https://statsapi.mlb.com/api/v1/people/{int(pitcher_id)}/stats"
-        f"?stats=gameLog&group=pitching&season={int(season)}"
-    )
-    request = Request(url, headers={"User-Agent": "MLB-Pitcher-Lab/1.0", "Accept": "application/json"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-        return pd.DataFrame(), f"{type(exc).__name__}: {exc}"
-
-    splits: list[dict] = []
-    for stats_block in payload.get("stats", []):
-        for split in stats_block.get("splits", []):
-            stat = split.get("stat", {}) or {}
-            opponent = split.get("opponent", {}) or {}
-            team = split.get("team", {}) or {}
-            row = {
-                "Date": pd.to_datetime(split.get("date"), errors="coerce"),
-                "Opponent": opponent.get("name", ""),
-                "Team": team.get("name", ""),
-                "GamesStarted": pd.to_numeric(pd.Series([stat.get("gamesStarted")]), errors="coerce").iloc[0],
-                "IP": stat.get("inningsPitched"),
-                "K": pd.to_numeric(pd.Series([stat.get("strikeOuts")]), errors="coerce").iloc[0],
-                "ER": pd.to_numeric(pd.Series([stat.get("earnedRuns")]), errors="coerce").iloc[0],
-                "BF": pd.to_numeric(pd.Series([stat.get("battersFaced")]), errors="coerce").iloc[0],
-                "Pitches": pd.to_numeric(pd.Series([stat.get("numberOfPitches")]), errors="coerce").iloc[0],
-                "Hits": pd.to_numeric(pd.Series([stat.get("hits")]), errors="coerce").iloc[0],
-                "BB": pd.to_numeric(pd.Series([stat.get("baseOnBalls")]), errors="coerce").iloc[0],
-                "HR": pd.to_numeric(pd.Series([stat.get("homeRuns")]), errors="coerce").iloc[0],
-            }
-            row["Outs"] = innings_to_outs(row["IP"])
-            splits.append(row)
-    if not splits:
-        return pd.DataFrame(), "The MLB game-log response contained no pitching splits."
-    frame = pd.DataFrame(splits).sort_values("Date").reset_index(drop=True)
-    for column in ["GamesStarted", "K", "ER", "BF", "Pitches", "Hits", "BB", "HR", "Outs"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    starters = frame[frame["GamesStarted"].fillna(0).ge(1)].copy()
-    if starters.empty:
-        starters = frame[(frame["Pitches"].fillna(0).ge(40)) | (frame["Outs"].fillna(0).ge(9))].copy()
-    return starters.reset_index(drop=True), None
+def _latest_batter_quote_per_book(candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates
+    work = candidates.copy()
+    work["_Updated"] = pd.to_datetime(work.get("LastUpdate"), utc=True, errors="coerce")
+    work["_Paired"] = work.get("OverOdds").notna().astype(int) + work.get("UnderOdds").notna().astype(int)
+    work = work.sort_values(["BookmakerKey", "_Paired", "_Updated"], na_position="first")
+    return work.drop_duplicates("BookmakerKey", keep="last").drop(columns=["_Updated", "_Paired"])
 
 
-# -----------------------------------------------------------------------------
-# Lineup, pitcher and pitch-type profiles
-# -----------------------------------------------------------------------------
-
-def infer_recent_lineup(df: pd.DataFrame, team: str) -> pd.DataFrame:
-    team_code = str(team or "").upper()
-    team_rows = df[df["batter_team"].astype(str).str.upper().isin({team_code, TEAM_ALIASES.get(team_code, "")})].copy()
-    team_rows = team_rows[team_rows["game_date"].notna()]
-    if team_rows.empty:
-        return pd.DataFrame(columns=["player_id", "Player", "Position", "LineupSpot"])
-    latest_date = team_rows["game_date"].max()
-    date_rows = team_rows[team_rows["game_date"].eq(latest_date)]
-    latest_game = pd.to_numeric(date_rows["game_pk"], errors="coerce").max()
-    game_rows = date_rows[date_rows["game_pk"].eq(latest_game)]
-    order = (
-        game_rows.groupby("batter")["at_bat_number"]
-        .min()
-        .sort_values()
-        .head(9)
-        .reset_index()
-        .rename(columns={"batter": "player_id"})
-    )
-    order["LineupSpot"] = np.arange(1, len(order) + 1)
-    names = lookup_names(tuple(order["player_id"].dropna().astype(int).tolist()))
-    order = order.merge(names, on="player_id", how="left")
-    order["Player"] = order["Player"].fillna(order["player_id"].apply(lambda value: f"MLB ID {int(value)}"))
-    order["Position"] = ""
-    return order[["player_id", "Player", "Position", "LineupSpot"]]
-
-
-def pitcher_statcast_profile(df: pd.DataFrame, pitcher_id: int, league: dict) -> dict:
-    pitches = df[df["pitcher"].eq(int(pitcher_id))].copy()
-    pa = pitches[pitches["is_pa_end"]].copy()
-    plate_appearances = int(pa["pa_key"].nunique()) if not pa.empty else 0
-    swings = int(pitches["is_swing"].sum())
-    bbe = int(pitches["is_bbe"].sum())
-    pitch_count = len(pitches)
-    hand = "R"
-    if not pitches.empty and not pitches["p_throws"].dropna().empty:
-        hand = str(pitches["p_throws"].dropna().mode().iloc[0])
-    k_rate = (int(pa["is_k"].sum()) + league["K_PA"] * 150) / (plate_appearances + 150)
-    bb_rate = (int(pa["is_bb"].sum()) + league["BB_PA"] * 150) / (plate_appearances + 150)
-    hr_rate = (int(pa["is_hr"].sum()) + league["HR_PA"] * 180) / (plate_appearances + 180)
-    xwoba = (float(pa["xwoba_value"].sum()) + league["xwOBA"] * 180) / (plate_appearances + 180)
-    barrel = (int(pitches["is_barrel"].sum()) + league["Brl_BBE"] * 100) / (bbe + 100)
-    hard_hit = (int(pitches["is_hard_hit"].sum()) + league["HH_BBE"] * 100) / (bbe + 100)
-    whiff = (int(pitches["is_whiff"].sum()) + league["Whiff"] * 200) / (swings + 200)
-    csw = (
-        int(pitches["is_whiff"].sum())
-        + int(pitches["is_called_strike"].sum())
-        + league["CSW"] * 350
-    ) / (pitch_count + 350)
-    return {
-        "Hand": hand if hand in {"L", "R"} else "R",
-        "Statcast_PA": plate_appearances,
-        "PitchCountSample": pitch_count,
-        "K_PA": float(k_rate),
-        "BB_PA": float(bb_rate),
-        "HR_PA": float(hr_rate),
-        "xwOBA_Allowed": float(xwoba),
-        "Brl_BBE_Allowed": float(barrel),
-        "HH_BBE_Allowed": float(hard_hit),
-        "Whiff_Pct": float(whiff),
-        "CSW_Pct": float(csw),
-    }
-
-
-def build_lineup_profile(
-    df: pd.DataFrame,
-    lineup: pd.DataFrame,
-    opponent_team: str,
-    pitcher_hand: str,
-    league: dict,
-) -> tuple[dict, pd.DataFrame]:
-    lineup = lineup.copy() if lineup is not None else pd.DataFrame()
-    lineup_ids = (
-        pd.to_numeric(lineup.get("player_id", pd.Series(dtype=float)), errors="coerce")
-        .dropna().astype(int).tolist()
-    )
-    team_code = str(opponent_team or "").upper()
-    team_values = {team_code}
-    if TEAM_ALIASES.get(team_code):
-        team_values.add(TEAM_ALIASES[team_code])
-
-    if lineup_ids:
-        sample = df[df["batter"].isin(lineup_ids) & df["p_throws"].eq(pitcher_hand)].copy()
-    else:
-        sample = df[df["batter_team"].isin(team_values) & df["p_throws"].eq(pitcher_hand)].copy()
-
-    pa = sample[sample["is_pa_end"]].copy()
-    if lineup.empty and not sample.empty:
-        lineup = infer_recent_lineup(df, opponent_team)
-        lineup_ids = lineup["player_id"].dropna().astype(int).tolist()
-
-    player_ids = lineup_ids or sorted(pa["batter"].dropna().astype(int).unique().tolist())[:9]
-    base = pd.DataFrame({"player_id": player_ids})
-    if not lineup.empty:
-        base = base.merge(lineup[["player_id", "Player", "Position", "LineupSpot"]], on="player_id", how="left")
-    names = lookup_names(tuple(player_ids))
-    base = base.merge(names, on="player_id", how="left", suffixes=("", "_Lookup"))
-    if "Player" not in base.columns:
-        base["Player"] = np.nan
-    if "Player_Lookup" in base.columns:
-        base["Player"] = base["Player"].fillna(base["Player_Lookup"])
-    base["Player"] = base["Player"].fillna(base["player_id"].apply(lambda value: f"MLB ID {int(value)}"))
-    base["LineupSpot"] = pd.to_numeric(base.get("LineupSpot"), errors="coerce")
-    base["LineupSpot"] = base["LineupSpot"].fillna(pd.Series(np.arange(1, len(base) + 1), index=base.index)).clip(1, 9)
-
-    if pa.empty:
-        for column, value in {
-            "PA": 0, "K": 0, "BB": 0, "HR": 0, "xwOBA": league["xwOBA"],
-            "K_Pct": league["K_PA"], "BB_Pct": league["BB_PA"], "HR_Pct": league["HR_PA"],
-            "Brl_BBE": league["Brl_BBE"], "HH_BBE": league["HH_BBE"],
-            "Whiff_Pct": league["Whiff"], "EffectiveStand": "R" if pitcher_hand == "L" else "L",
-        }.items():
-            base[column] = value
-    else:
-        pa_stats = (
-            pa.groupby("batter")
-            .agg(PA=("pa_key", "nunique"), K=("is_k", "sum"), BB=("is_bb", "sum"), HR=("is_hr", "sum"), xwOBA_Total=("xwoba_value", "sum"))
-            .reset_index().rename(columns={"batter": "player_id"})
-        )
-        pitch_stats = (
-            sample.groupby("batter")
-            .agg(Swings=("is_swing", "sum"), Whiffs=("is_whiff", "sum"), BBE=("is_bbe", "sum"), Barrels=("is_barrel", "sum"), HardHits=("is_hard_hit", "sum"))
-            .reset_index().rename(columns={"batter": "player_id"})
-        )
-        stands = sample.groupby("batter")["stand"].agg(lambda values: values.dropna().mode().iloc[0] if not values.dropna().empty else np.nan).reset_index().rename(columns={"batter": "player_id", "stand": "EffectiveStand"})
-        base = base.merge(pa_stats, on="player_id", how="left").merge(pitch_stats, on="player_id", how="left").merge(stands, on="player_id", how="left")
-        for column in ["PA", "K", "BB", "HR", "xwOBA_Total", "Swings", "Whiffs", "BBE", "Barrels", "HardHits"]:
-            base[column] = pd.to_numeric(base.get(column, 0), errors="coerce").fillna(0.0)
-        base["K_Pct"] = (base["K"] + league["K_PA"] * 30) / (base["PA"] + 30)
-        base["BB_Pct"] = (base["BB"] + league["BB_PA"] * 30) / (base["PA"] + 30)
-        base["HR_Pct"] = (base["HR"] + league["HR_PA"] * 40) / (base["PA"] + 40)
-        base["xwOBA"] = (base["xwOBA_Total"] + league["xwOBA"] * 35) / (base["PA"] + 35)
-        base["Brl_BBE"] = (base["Barrels"] + league["Brl_BBE"] * 25) / (base["BBE"] + 25)
-        base["HH_BBE"] = (base["HardHits"] + league["HH_BBE"] * 25) / (base["BBE"] + 25)
-        base["Whiff_Pct"] = (base["Whiffs"] + league["Whiff"] * 50) / (base["Swings"] + 50)
-        base["EffectiveStand"] = base["EffectiveStand"].where(base["EffectiveStand"].isin(["L", "R"]), "R" if pitcher_hand == "L" else "L")
-
-    lineup_weight_map = {1: 1.08, 2: 1.07, 3: 1.05, 4: 1.04, 5: 1.01, 6: 0.99, 7: 0.96, 8: 0.93, 9: 0.90}
-    base["Weight"] = base["LineupSpot"].round().map(lineup_weight_map).fillna(1.0)
-    weights = base["Weight"].to_numpy(dtype=float)
-    profile = {
-        "Lineup_PA_Sample": int(pd.to_numeric(base.get("PA", 0), errors="coerce").fillna(0).sum()),
-        "Opp_K_PA": float(np.average(base["K_Pct"], weights=weights)) if len(base) else league["K_PA"],
-        "Opp_BB_PA": float(np.average(base["BB_Pct"], weights=weights)) if len(base) else league["BB_PA"],
-        "Opp_HR_PA": float(np.average(base["HR_Pct"], weights=weights)) if len(base) else league["HR_PA"],
-        "Opp_xwOBA": float(np.average(base["xwOBA"], weights=weights)) if len(base) else league["xwOBA"],
-        "Opp_Brl_BBE": float(np.average(base["Brl_BBE"], weights=weights)) if len(base) else league["Brl_BBE"],
-        "Opp_HH_BBE": float(np.average(base["HH_BBE"], weights=weights)) if len(base) else league["HH_BBE"],
-        "Opp_Whiff": float(np.average(base["Whiff_Pct"], weights=weights)) if len(base) else league["Whiff"],
-        "Top6_K_Pct": float(np.average(base.loc[base["LineupSpot"].le(6), "K_Pct"], weights=base.loc[base["LineupSpot"].le(6), "Weight"])) if len(base.loc[base["LineupSpot"].le(6)]) else league["K_PA"],
-        "Bottom3_K_Pct": float(np.average(base.loc[base["LineupSpot"].ge(7), "K_Pct"], weights=base.loc[base["LineupSpot"].ge(7), "Weight"])) if len(base.loc[base["LineupSpot"].ge(7)]) else league["K_PA"],
-        "Lineup_Contact_Risk": float(1.0 - np.average(base["Whiff_Pct"], weights=weights)) if len(base) else 1.0 - league["Whiff"],
-    }
-    keep = ["LineupSpot", "Player", "Position", "EffectiveStand", "PA", "K_Pct", "BB_Pct", "HR_Pct", "xwOBA", "Brl_BBE", "HH_BBE", "Whiff_Pct"]
-    return profile, base[[column for column in keep if column in base.columns]].sort_values("LineupSpot")
-
-
-def build_pitch_type_matchup(
-    df: pd.DataFrame,
-    pitcher_id: int,
-    lineup: pd.DataFrame,
-    opponent_team: str,
-    pitcher_hand: str,
-    league: dict,
-) -> tuple[float, pd.DataFrame]:
-    pitcher_pitches = df[df["pitcher"].eq(int(pitcher_id)) & df["pitch_name"].notna()].copy()
-    if pitcher_pitches.empty:
-        return 50.0, pd.DataFrame()
-    total_pitches = max(len(pitcher_pitches), 1)
-    pitcher_rows = []
-    for pitch_name, group in pitcher_pitches.groupby("pitch_name"):
-        usage = len(group) / total_pitches
-        if usage < 0.025:
-            continue
-        swings = max(int(group["is_swing"].sum()), 1)
-        pa = group[group["is_pa_end"]]
-        pa_count = max(int(pa["pa_key"].nunique()), 1)
-        pitcher_rows.append(
-            {
-                "Pitch Type": str(pitch_name),
-                "Usage": usage,
-                "Velocity": float(pd.to_numeric(group["release_speed"], errors="coerce").mean()),
-                "Pitcher Whiff%": float(group["is_whiff"].sum() / swings),
-                "Pitcher CSW%": float((group["is_whiff"].sum() + group["is_called_strike"].sum()) / max(len(group), 1)),
-                "Pitcher xwOBA": float(pa["xwoba_value"].sum() / pa_count),
-            }
-        )
-    pitch_table = pd.DataFrame(pitcher_rows)
-    if pitch_table.empty:
-        return 50.0, pd.DataFrame()
-
-    lineup_ids = pd.to_numeric(lineup.get("player_id", pd.Series(dtype=float)), errors="coerce").dropna().astype(int).tolist() if lineup is not None else []
-    team_code = str(opponent_team or "").upper()
-    team_values = {team_code, TEAM_ALIASES.get(team_code, team_code)}
-    if lineup_ids:
-        hitter_sample = df[df["batter"].isin(lineup_ids) & df["p_throws"].eq(pitcher_hand)].copy()
-    else:
-        hitter_sample = df[df["batter_team"].isin(team_values) & df["p_throws"].eq(pitcher_hand)].copy()
-
-    matchup_rows: list[dict] = []
-    for row in pitch_table.itertuples(index=False):
-        pitch_name = getattr(row, "_0", None) if not hasattr(row, "Pitch_Type") else row.Pitch_Type
-        # itertuples sanitizes spaces; locate by position to stay robust.
-        pitch_name = row[0]
-        sample = hitter_sample[hitter_sample["pitch_name"].eq(pitch_name)]
-        swings = int(sample["is_swing"].sum())
-        pa = sample[sample["is_pa_end"]]
-        pa_count = int(pa["pa_key"].nunique())
-        league_pitch = df[df["pitch_name"].eq(pitch_name) & df["p_throws"].eq(pitcher_hand)]
-        league_pitch_pa = league_pitch[league_pitch["is_pa_end"]]
-        league_pa_count = max(int(league_pitch_pa["pa_key"].nunique()), 1)
-        league_swings = max(int(league_pitch["is_swing"].sum()), 1)
-        league_pitch_k = float(league_pitch_pa["is_k"].sum() / league_pa_count)
-        league_pitch_xwoba = float(league_pitch_pa["xwoba_value"].sum() / league_pa_count)
-        league_pitch_whiff = float(league_pitch["is_whiff"].sum() / league_swings)
-        hitter_k = (int(pa["is_k"].sum()) + league_pitch_k * 35) / (pa_count + 35)
-        hitter_xwoba = (float(pa["xwoba_value"].sum()) + league_pitch_xwoba * 35) / (pa_count + 35)
-        hitter_whiff = (int(sample["is_whiff"].sum()) + league_pitch_whiff * 60) / (swings + 60)
-        k_ratio = hitter_k / max(league_pitch_k, 0.001)
-        whiff_ratio = hitter_whiff / max(league_pitch_whiff, 0.001)
-        xwoba_ratio = max(league_pitch_xwoba, 0.001) / max(hitter_xwoba, 0.001)
-        raw_ratio = k_ratio ** 0.42 * whiff_ratio ** 0.28 * xwoba_ratio ** 0.30
-        score = float(np.clip(50.0 + 65.0 * math.log(max(raw_ratio, 0.25)), 0.0, 100.0))
-        matchup_rows.append(
-            {
-                "Pitch Type": pitch_name,
-                "Usage": float(row[1]),
-                "Velocity": float(row[2]),
-                "Pitcher Whiff%": float(row[3]),
-                "Pitcher CSW%": float(row[4]),
-                "Pitcher xwOBA": float(row[5]),
-                "Opponent Pitches": int(len(sample)),
-                "Opponent PA": int(pa_count),
-                "Opponent K%": float(hitter_k),
-                "Opponent Whiff%": float(hitter_whiff),
-                "Opponent xwOBA": float(hitter_xwoba),
-                "Match Score": score,
-            }
-        )
-    result = pd.DataFrame(matchup_rows)
-    if result.empty:
-        return 50.0, result
-    overall = float(np.average(result["Match Score"], weights=result["Usage"]))
-    return overall, result.sort_values("Usage", ascending=False).reset_index(drop=True)
-
-
-# -----------------------------------------------------------------------------
-# Park and weather
-# -----------------------------------------------------------------------------
-
-def load_local_csv(filename: str) -> pd.DataFrame:
-    paths = [Path(__file__).resolve().parent / filename, Path.cwd() / filename]
-    path = next((candidate for candidate in paths if candidate.exists()), None)
-    if path is None:
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.DataFrame()
-
-
-def park_run_factor(venue: str, lineup_table: pd.DataFrame) -> tuple[float, str]:
-    table = load_local_csv("park_factors.csv")
-    if table.empty or "venue" not in table.columns:
-        return 100.0, "Neutral fallback"
-    matches = table[table["venue"].apply(lambda value: venue_names_match(value, venue))]
-    if matches.empty:
-        return 100.0, "Neutral fallback"
-    row = matches.iloc[0]
-    if lineup_table is None or lineup_table.empty or "EffectiveStand" not in lineup_table.columns:
-        hit_factor = np.mean([float(row.get("hits_l", 100)), float(row.get("hits_r", 100))])
-        hr_factor = np.mean([float(row.get("hr_l", 100)), float(row.get("hr_r", 100))])
-    else:
-        weights = np.array([1.08, 1.07, 1.05, 1.04, 1.01, 0.99, 0.96, 0.93, 0.90])[: len(lineup_table)]
-        hit_values = []
-        hr_values = []
-        for stand in lineup_table["EffectiveStand"].fillna("R"):
-            suffix = "l" if str(stand).upper() == "L" else "r"
-            hit_values.append(float(row.get(f"hits_{suffix}", 100)))
-            hr_values.append(float(row.get(f"hr_{suffix}", 100)))
-        hit_factor = float(np.average(hit_values, weights=weights))
-        hr_factor = float(np.average(hr_values, weights=weights))
-    factor = 0.68 * hit_factor + 0.32 * hr_factor
-    return float(factor), f"park_factors.csv · {int(row.get('rolling_years', 3))}-year"
-
-
-def load_stadium_weather_metadata(venue: str) -> dict:
-    table = load_local_csv("stadium_weather.csv")
-    if table.empty or "venue" not in table.columns:
-        return {"ok": False, "roof_type": "open", "error": "stadium_weather.csv was unavailable."}
-    matches = table[table["venue"].apply(lambda value: venue_names_match(value, venue))]
-    if matches.empty:
-        return {"ok": False, "roof_type": "open", "error": f"No weather metadata matched {venue}."}
-    row = matches.iloc[0]
-    return {
-        "ok": True,
-        "latitude": float(row["latitude"]),
-        "longitude": float(row["longitude"]),
-        "outfield_bearing": float(row["outfield_bearing"]),
-        "roof_type": str(row["roof_type"]).lower().strip(),
-        "error": None,
-    }
-
-
-def classify_stadium_wind(wind_from_degrees: float, outfield_bearing: float | None) -> str:
-    if outfield_bearing is None or pd.isna(wind_from_degrees):
-        return "Cross/Calm"
-    wind_toward = (float(wind_from_degrees) + 180.0) % 360.0
-    difference = abs((wind_toward - float(outfield_bearing) + 180.0) % 360.0 - 180.0)
-    if difference <= 45.0:
-        return "Out"
-    if difference >= 135.0:
-        return "In"
-    return "Cross/Calm"
-
-
-@st.cache_data(ttl=1800, show_spinner=False, max_entries=64)
-def fetch_game_weather(latitude: float, longitude: float, game_datetime_utc: str, outfield_bearing: float | None) -> dict:
-    target = pd.to_datetime(game_datetime_utc, utc=True, errors="coerce")
-    if pd.isna(target):
-        return {"ok": False, "error": "No valid first-pitch time."}
-    target_date = target.strftime("%Y-%m-%d")
-    params = {
-        "latitude": round(float(latitude), 5),
-        "longitude": round(float(longitude), 5),
-        "hourly": "temperature_2m,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation_probability",
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "timezone": "GMT",
-        "start_date": target_date,
-        "end_date": target_date,
-    }
-    request = Request(
-        "https://api.open-meteo.com/v1/forecast?" + urlencode(params),
-        headers={"User-Agent": "MLB-Pitcher-Lab/1.0", "Accept": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=15) as response:
-            payload = json.load(response)
-        hourly = pd.DataFrame(payload.get("hourly", {}))
-        hourly["forecast_time"] = pd.to_datetime(hourly["time"], utc=True, errors="coerce")
-        hourly = hourly.dropna(subset=["forecast_time"])
-        if hourly.empty:
-            raise ValueError("No hourly weather rows")
-        row = hourly.loc[(hourly["forecast_time"] - target).abs().idxmin()]
-        wind_from = float(row.get("wind_direction_10m", 0.0))
+def select_batter_quote(candidates: pd.DataFrame, source_mode: str) -> dict | None:
+    if candidates is None or candidates.empty:
+        return None
+    candidates = _latest_batter_quote_per_book(candidates)
+    direct_key = ODDS_SOURCE_TO_KEY.get(source_mode)
+    if direct_key:
+        direct = candidates[candidates["BookmakerKey"].eq(direct_key)]
+        if direct.empty:
+            return None
+        row = direct.sort_values("LastUpdate", na_position="first").iloc[-1].to_dict()
+        row["SelectedSource"] = row.get("Bookmaker") or ODDS_BOOKMAKERS.get(direct_key, direct_key)
+        row["BookCount"] = 1
+        return row
+    books = candidates[candidates["BookmakerKey"].isin(SPORTSBOOK_KEYS)].copy()
+    if books.empty:
+        return None
+    if source_mode == "Consensus sportsbooks":
         return {
-            "ok": True,
-            "temperature_f": float(row.get("temperature_2m", 70.0)),
-            "humidity_pct": float(row.get("relative_humidity_2m", 50.0)),
-            "pressure_hpa": float(row.get("pressure_msl", 1013.25)),
-            "wind_mph": float(row.get("wind_speed_10m", 0.0)),
-            "wind_direction": classify_stadium_wind(wind_from, outfield_bearing),
-            "precip_probability": float(row.get("precipitation_probability", 0.0)),
-            "forecast_time": row["forecast_time"].strftime("%Y-%m-%d %H:%M UTC"),
-            "error": None,
+            "Line": float(pd.to_numeric(books["Line"], errors="coerce").median()),
+            "OverOdds": pd.to_numeric(books["OverOdds"], errors="coerce").median(),
+            "UnderOdds": pd.to_numeric(books["UnderOdds"], errors="coerce").median(),
+            "OverMultiplier": np.nan,
+            "UnderMultiplier": np.nan,
+            "SelectedSource": f"Consensus ({books['BookmakerKey'].nunique()} books)",
+            "BookmakerKey": "consensus",
+            "LastUpdate": pd.to_datetime(books["LastUpdate"], utc=True, errors="coerce").max(),
+            "BookCount": int(books["BookmakerKey"].nunique()),
         }
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError, TypeError, KeyError) as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if source_mode == "Best sportsbook over line":
+        best_line = pd.to_numeric(books["Line"], errors="coerce").min()
+        subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
+        subset["_Price"] = pd.to_numeric(subset["OverOdds"], errors="coerce").fillna(-100000)
+        row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
+        row["SelectedSource"] = f"Best over · {row.get('Bookmaker')}"
+        return row
+    if source_mode == "Best sportsbook under line":
+        best_line = pd.to_numeric(books["Line"], errors="coerce").max()
+        subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
+        subset["_Price"] = pd.to_numeric(subset["UnderOdds"], errors="coerce").fillna(-100000)
+        row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
+        row["SelectedSource"] = f"Best under · {row.get('Bookmaker')}"
+        return row
+    return None
 
 
-def automatic_weather(game: dict) -> dict:
-    metadata = load_stadium_weather_metadata(str(game.get("venue", "")))
-    if not metadata.get("ok"):
-        return {"ok": False, "metadata": metadata, "error": metadata.get("error")}
-    result = fetch_game_weather(
-        metadata["latitude"], metadata["longitude"], str(game.get("game_datetime_utc") or ""), metadata.get("outfield_bearing")
-    )
-    result["metadata"] = metadata
-    return result
+def no_vig_over_probability_batter(over_odds: object, under_odds: object) -> float:
+    over = american_odds_to_probability(over_odds)
+    under = american_odds_to_probability(under_odds)
+    if not np.isfinite(over) or not np.isfinite(under) or over + under <= 0:
+        return np.nan
+    return float(over / (over + under))
 
 
-def weather_run_multiplier(weather: dict) -> float:
-    metadata = weather.get("metadata", {}) if isinstance(weather, dict) else {}
-    roof_type = str(metadata.get("roof_type", "open"))
-    if roof_type == "fixed":
-        return 1.0
-    if not weather.get("ok"):
-        return 1.0
-    temperature = float(weather.get("temperature_f", 70.0))
-    humidity = float(weather.get("humidity_pct", 50.0))
-    pressure = float(weather.get("pressure_hpa", 1013.25))
-    wind = float(weather.get("wind_mph", 0.0))
-    wind_direction = str(weather.get("wind_direction", "Cross/Calm"))
-    carry = 1.0 + (temperature - 70.0) * 0.0025 + (humidity - 50.0) * 0.0003 + (1013.25 - pressure) * 0.00025
-    if wind_direction == "Out":
-        carry += wind * 0.007
-    elif wind_direction == "In":
-        carry -= wind * 0.007
-    return float(np.clip(1.0 + (carry - 1.0) * 0.45, 0.88, 1.14))
+def poisson_over_probability_batter(mean: float, line: float) -> float:
+    mean = max(float(mean), 0.0001)
+    threshold = max(int(math.floor(float(line))), 0)
+    cdf = sum(math.exp(-mean) * mean ** k / math.factorial(k) for k in range(threshold + 1))
+    return float(np.clip(1.0 - cdf, 0.0, 1.0))
 
 
-# -----------------------------------------------------------------------------
-# Projection model
-# -----------------------------------------------------------------------------
-
-def game_log_profile(logs: pd.DataFrame, league: dict) -> dict:
-    if logs is None or logs.empty:
-        return {
-            "Starts": 0, "Season_Outs": 16.5, "Recent_Outs": 16.5, "Outs_SD": 2.7,
-            "Season_BF": 22.5, "Recent_BF": 22.5, "Season_Pitches": 88.0, "Recent_Pitches": 88.0,
-            "Last_Start_Pitches": 88.0, "Last3_Pitches": 88.0, "Pitch_Count_Trend": 0.0,
-            "Quality_Start_Rate": 0.45, "Stable_Workload_Rate": 0.55, "Short_Hook_Rate": 0.18,
-            "Blowup_Hook_Rate": 0.15, "Recent_BB_BF": league["BB_PA"],
-            "Season_K_BF": league["K_PA"], "Recent_K_BF": league["K_PA"],
-            "Season_ER9": league["ER9"], "Recent_ER9": league["ER9"],
-        }
-    clean = logs.dropna(subset=["Outs"]).copy()
-    if clean.empty:
-        return game_log_profile(pd.DataFrame(), league)
-    clean["K_BF"] = safe_divide(clean["K"], clean["BF"], league["K_PA"])
-    clean["ER9"] = safe_divide(clean["ER"] * 27.0, clean["Outs"], league["ER9"])
-    clean["BB_BF"] = safe_divide(clean["BB"], clean["BF"], league["BB_PA"])
-    last3_pitches = float(pd.to_numeric(clean["Pitches"], errors="coerce").tail(3).mean()) if len(clean) else 88.0
-    season_pitches = float(pd.to_numeric(clean["Pitches"], errors="coerce").mean()) if len(clean) else 88.0
-    last_start_pitches = float(pd.to_numeric(clean["Pitches"], errors="coerce").dropna().iloc[-1]) if pd.to_numeric(clean["Pitches"], errors="coerce").dropna().size else season_pitches
-    return {
-        "Starts": int(len(clean)),
-        "Season_Outs": float(clean["Outs"].mean()),
-        "Recent_Outs": weighted_recent_mean(clean["Outs"], 5, clean["Outs"].mean()),
-        "Outs_SD": float(max(clean["Outs"].tail(10).std(ddof=1) if len(clean.tail(10)) > 1 else 2.5, 1.5)),
-        "Season_BF": float(clean["BF"].mean()),
-        "Recent_BF": weighted_recent_mean(clean["BF"], 5, clean["BF"].mean()),
-        "Season_Pitches": season_pitches,
-        "Recent_Pitches": weighted_recent_mean(clean["Pitches"], 5, clean["Pitches"].mean()),
-        "Last_Start_Pitches": last_start_pitches,
-        "Last3_Pitches": last3_pitches,
-        "Pitch_Count_Trend": float(last3_pitches - season_pitches),
-        "Quality_Start_Rate": float((clean["Outs"].ge(18)).mean()),
-        "Stable_Workload_Rate": float((clean["Outs"].tail(5).ge(15)).mean()),
-        "Short_Hook_Rate": float((clean["Outs"].le(12)).mean()),
-        "Blowup_Hook_Rate": float(((clean["ER"].ge(4)) & (clean["Outs"].le(15))).mean()),
-        "Recent_BB_BF": weighted_recent_mean(clean["BB_BF"], 5, clean["BB_BF"].mean()),
-        "Season_K_BF": float(clean["K"].sum() / max(clean["BF"].sum(), 1.0)),
-        "Recent_K_BF": weighted_recent_mean(clean["K_BF"], 5, clean["K_BF"].mean()),
-        "Season_ER9": float(clean["ER"].sum() * 27.0 / max(clean["Outs"].sum(), 1.0)),
-        "Recent_ER9": weighted_recent_mean(clean["ER9"], 5, clean["ER9"].mean()),
-    }
-
-
-
-
-def pitcher_recent_arsenal_profile(df: pd.DataFrame, pitcher_id: int, league: dict) -> dict:
-    """Recent-form arsenal signals from currently loaded Statcast data.
-
-    These features are intentionally self-contained so the dashboard still works
-    without paid feeds: velocity trend, recent whiff/CSW, and pitch-mix change.
-    """
-    pitches = df[df["pitcher"].eq(int(pitcher_id))].copy()
+def apply_batter_odds_to_board(board: pd.DataFrame, quotes: pd.DataFrame, source_mode: str, default_game_pk: object = None) -> pd.DataFrame:
+    result = board.copy()
+    if "GamePK" not in result.columns:
+        result["GamePK"] = default_game_pk
     defaults = {
-        "Recent_Whiff_Pct": league["Whiff"],
-        "Recent_CSW_Pct": league["CSW"],
-        "Fastball_Velo": np.nan,
-        "Fastball_Velo_Trend": 0.0,
-        "Pitch_Mix_Change": 0.0,
-        "Arsenal_Form_Score": 50.0,
+        "Market_Line": np.nan,
+        "Over_Odds": np.nan,
+        "Under_Odds": np.nan,
+        "Over_Multiplier": np.nan,
+        "Under_Multiplier": np.nan,
+        "Line_Source": "",
+        "Line_Updated": "",
+        "Market_Over_Prob": np.nan,
+        "Model_Over_Prob": np.nan,
+        "Model_Market_Edge": np.nan,
+        "Projection_Edge": np.nan,
     }
-    if pitches.empty or "game_date" not in pitches.columns:
-        return defaults
-    pitches["game_date"] = pd.to_datetime(pitches["game_date"], errors="coerce")
-    pitches = pitches[pitches["game_date"].notna()].copy()
-    if pitches.empty:
-        return defaults
-    max_date = pitches["game_date"].max()
-    recent = pitches[pitches["game_date"].ge(max_date - pd.Timedelta(days=14))].copy()
-    prior = pitches[pitches["game_date"].lt(max_date - pd.Timedelta(days=14))].copy()
-    if recent.empty:
-        recent = pitches.tail(min(len(pitches), 250)).copy()
-    recent_swings = max(int(recent["is_swing"].sum()), 1)
-    recent_whiff = float(recent["is_whiff"].sum() / recent_swings)
-    recent_csw = float((recent["is_whiff"].sum() + recent["is_called_strike"].sum()) / max(len(recent), 1))
-    fb_mask = recent["pitch_name"].astype(str).str.contains("4-Seam|Fastball|Sinker|Cutter", case=False, na=False)
-    recent_fb = float(pd.to_numeric(recent.loc[fb_mask, "release_speed"], errors="coerce").mean()) if fb_mask.any() else np.nan
-    if prior.empty:
-        prior_fb = recent_fb
-        mix_change = 0.0
-    else:
-        prior_fb_mask = prior["pitch_name"].astype(str).str.contains("4-Seam|Fastball|Sinker|Cutter", case=False, na=False)
-        prior_fb = float(pd.to_numeric(prior.loc[prior_fb_mask, "release_speed"], errors="coerce").mean()) if prior_fb_mask.any() else recent_fb
-        recent_mix = recent["pitch_name"].value_counts(normalize=True)
-        prior_mix = prior["pitch_name"].value_counts(normalize=True)
-        all_pitches = recent_mix.index.union(prior_mix.index)
-        mix_change = float((recent_mix.reindex(all_pitches, fill_value=0.0) - prior_mix.reindex(all_pitches, fill_value=0.0)).abs().sum() / 2.0)
-    velo_trend = 0.0 if pd.isna(recent_fb) or pd.isna(prior_fb) else float(recent_fb - prior_fb)
-    arsenal_score = float(np.clip(50.0 + (recent_whiff - league["Whiff"]) * 170.0 + (recent_csw - league["CSW"]) * 145.0 + velo_trend * 5.0 - mix_change * 18.0, 0.0, 100.0))
-    return {
-        "Recent_Whiff_Pct": recent_whiff,
-        "Recent_CSW_Pct": recent_csw,
-        "Fastball_Velo": recent_fb,
-        "Fastball_Velo_Trend": velo_trend,
-        "Pitch_Mix_Change": mix_change,
-        "Arsenal_Form_Score": arsenal_score,
-    }
-
-def build_pitcher_projection(
-    df: pd.DataFrame,
-    league: dict,
-    game: dict,
-    pitcher_id: int,
-    pitcher_name: str,
-    pitcher_team: str,
-    opponent_team: str,
-    opponent_side: str,
-    lineup: pd.DataFrame,
-    lineup_status: str,
-    weather: dict,
-    season: int,
-) -> tuple[dict, dict]:
-    logs, log_error = fetch_pitcher_game_log(int(pitcher_id), int(season))
-    log = game_log_profile(logs, league)
-    pitcher = pitcher_statcast_profile(df, int(pitcher_id), league)
-    opponent, hitter_table = build_lineup_profile(df, lineup, opponent_team, pitcher["Hand"], league)
-    pitch_match_score, pitch_match_table = build_pitch_type_matchup(df, int(pitcher_id), lineup, opponent_team, pitcher["Hand"], league)
-    arsenal = pitcher_recent_arsenal_profile(df, int(pitcher_id), league)
-    if pitch_match_table is not None and not pitch_match_table.empty:
-        pitch_mix_weights = pd.to_numeric(pitch_match_table.get("Usage"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        if pitch_mix_weights.sum() <= 0:
-            pitch_mix_weights = np.ones(len(pitch_match_table), dtype=float)
-        pitch_mix_whiff = float(np.average(pd.to_numeric(pitch_match_table.get("Opponent Whiff%"), errors="coerce").fillna(league["Whiff"]), weights=pitch_mix_weights))
-        pitch_mix_xwoba = float(np.average(pd.to_numeric(pitch_match_table.get("Opponent xwOBA"), errors="coerce").fillna(league["xwOBA"]), weights=pitch_mix_weights))
-        pitch_mix_damage = float(np.average(pd.to_numeric(pitch_match_table.get("Pitcher xwOBA"), errors="coerce").fillna(league["xwOBA"]), weights=pitch_mix_weights))
-    else:
-        pitch_mix_whiff = league["Whiff"]
-        pitch_mix_xwoba = league["xwOBA"]
-        pitch_mix_damage = league["xwOBA"]
-    park_factor, park_source = park_run_factor(str(game.get("venue", "")), hitter_table)
-    weather_factor = weather_run_multiplier(weather)
-
-    base_outs = 0.55 * log["Recent_Outs"] + 0.30 * log["Season_Outs"] + 0.15 * 16.5
-    lineup_difficulty = (
-        (opponent["Opp_xwOBA"] / max(league["xwOBA"], 0.001)) ** 0.18
-        * (opponent["Opp_BB_PA"] / max(league["BB_PA"], 0.001)) ** 0.06
-        * (pitcher["BB_PA"] / max(league["BB_PA"], 0.001)) ** 0.05
-    )
-    projected_outs = float(np.clip(base_outs / max(lineup_difficulty, 0.75), 9.0, 22.0))
-    bf_per_out = (
-        0.55 * (log["Recent_BF"] / max(log["Recent_Outs"], 1.0))
-        + 0.45 * (log["Season_BF"] / max(log["Season_Outs"], 1.0))
-    )
-    projected_bf = float(np.clip(projected_outs * bf_per_out, 13.0, 31.0))
-    projected_pitches = float(np.clip(0.60 * log["Recent_Pitches"] + 0.40 * log["Season_Pitches"], 65.0, 112.0))
-
-    base_k_rate = 0.35 * pitcher["K_PA"] + 0.35 * log["Recent_K_BF"] + 0.30 * log["Season_K_BF"]
-    matchup_factor = (
-        (opponent["Opp_K_PA"] / max(league["K_PA"], 0.001)) ** 0.36
-        * (opponent["Opp_Whiff"] / max(league["Whiff"], 0.001)) ** 0.16
-        * (pitcher["Whiff_Pct"] / max(league["Whiff"], 0.001)) ** 0.16
-        * (1.0 + (pitch_match_score - 50.0) / 320.0)
-    )
-    adjusted_k_rate = float(np.clip(base_k_rate * matchup_factor, 0.075, 0.46))
-    projected_k = float(np.clip(projected_bf * adjusted_k_rate, 1.0, 13.5))
-
-    quality_er9 = (
-        league["ER9"]
-        * (pitcher["xwOBA_Allowed"] / max(league["xwOBA"], 0.001)) ** 1.25
-        * (pitcher["BB_PA"] / max(league["BB_PA"], 0.001)) ** 0.18
-        * (pitcher["Brl_BBE_Allowed"] / max(league["Brl_BBE"], 0.001)) ** 0.24
-        * (pitcher["HR_PA"] / max(league["HR_PA"], 0.001)) ** 0.15
-    )
-    base_er9 = 0.45 * log["Recent_ER9"] + 0.35 * log["Season_ER9"] + 0.20 * quality_er9
-    offense_factor = (
-        (opponent["Opp_xwOBA"] / max(league["xwOBA"], 0.001)) ** 0.62
-        * (opponent["Opp_BB_PA"] / max(league["BB_PA"], 0.001)) ** 0.13
-        * (opponent["Opp_Brl_BBE"] / max(league["Brl_BBE"], 0.001)) ** 0.18
-        * (opponent["Opp_HR_PA"] / max(league["HR_PA"], 0.001)) ** 0.07
-    )
-    adjusted_er9 = float(np.clip(base_er9 * offense_factor * (park_factor / 100.0) ** 0.58 * weather_factor, 1.35, 9.0))
-    projected_er = float(np.clip(adjusted_er9 * projected_outs / 27.0, 0.35, 6.5))
-
-    p_0_1 = poisson_cdf(1, projected_er)
-    p_0_3 = poisson_cdf(3, projected_er)
-    p_2_3 = max(p_0_3 - p_0_1, 0.0)
-    p_4_plus = max(1.0 - p_0_3, 0.0)
-
-    sample_conf = 100.0 * (1.0 - math.exp(-max(pitcher["Statcast_PA"], 0) / 220.0))
-    starts_conf = 100.0 * (1.0 - math.exp(-max(log["Starts"], 0) / 8.0))
-    lineup_conf = {"Confirmed": 100.0, "Partial": 72.0, "Recent fallback": 55.0, "Not posted": 48.0}.get(lineup_status, 50.0)
-    confidence = float(np.clip(0.40 * sample_conf + 0.40 * starts_conf + 0.20 * lineup_conf, 0.0, 100.0))
-    confidence_level = "High" if confidence >= 70 else ("Medium" if confidence >= 45 else "Low")
-    workload_confidence = float(np.clip(
-        0.25 * starts_conf
-        + 0.25 * (100.0 - min(100.0, max(log["Outs_SD"], 0.0) * 14.0))
-        + 0.20 * log["Stable_Workload_Rate"] * 100.0
-        + 0.15 * log["Quality_Start_Rate"] * 100.0
-        + 0.15 * (100.0 - log["Short_Hook_Rate"] * 100.0)
-        - max(0.0, 72.0 - log["Last_Start_Pitches"]) * 0.45,
-        0.0, 100.0,
-    ))
-    command_score = float(np.clip(
-        55.0
-        + (league["BB_PA"] - pitcher["BB_PA"]) * 430.0
-        + (pitcher["CSW_Pct"] - league["CSW"]) * 185.0
-        + (league["BB_PA"] - log["Recent_BB_BF"]) * 185.0,
-        0.0, 100.0,
-    ))
-    k_confidence_score = float(np.clip(
-        0.28 * confidence
-        + 0.22 * pitch_match_score
-        + 0.18 * arsenal["Arsenal_Form_Score"]
-        + 0.17 * (100.0 * (1.0 - math.exp(-max(opponent["Lineup_PA_Sample"], 0) / 240.0)))
-        + 0.15 * command_score,
-        0.0, 100.0,
-    ))
-    run_environment_risk = float(np.clip(
-        50.0
-        + (park_factor - 100.0) * 1.1
-        + (weather_factor - 1.0) * 115.0
-        + (opponent["Opp_xwOBA"] - league["xwOBA"]) * 235.0
-        + (pitch_mix_xwoba - league["xwOBA"]) * 185.0,
-        0.0, 100.0,
-    ))
-    projection_quality_score = float(np.clip(0.36 * k_confidence_score + 0.34 * workload_confidence + 0.30 * command_score, 0.0, 100.0))
-
-    row = {
-        "PitcherID": int(pitcher_id),
-        "Pitcher": str(pitcher_name),
-        "Team": pitcher_team,
-        "Opponent": opponent_team,
-        "Matchup": f"{game.get('away_abbr')} @ {game.get('home_abbr')}",
-        "Game": f"{game.get('away_abbr')} @ {game.get('home_abbr')} · {game.get('time_et')}",
-        "GamePK": game.get("game_pk"),
-        "SlateDate": game.get("slate_date"),
-        "GameDateTimeUTC": game.get("game_datetime_utc"),
-        "PitcherLocation": "Home" if str(pitcher_team) == str(game.get("home_abbr")) else "Away",
-        "Venue": game.get("venue"),
-        "Hand": pitcher["Hand"],
-        "Proj_K": projected_k,
-        "Proj_ER": projected_er,
-        "Proj_Outs": projected_outs,
-        "Proj_Innings": projected_outs / 3.0,
-        "Proj_BF": projected_bf,
-        "Proj_Pitches": projected_pitches,
-        "Adj_K_Rate": adjusted_k_rate,
-        "Pitcher_K_Rate": pitcher["K_PA"],
-        "Opponent_K_Rate": opponent["Opp_K_PA"],
-        "Top6_K_Rate": opponent["Top6_K_Pct"],
-        "Bottom3_K_Rate": opponent["Bottom3_K_Pct"],
-        "Lineup_Contact_Risk": opponent["Lineup_Contact_Risk"],
-        "Whiff_Pct": pitcher["Whiff_Pct"],
-        "CSW_Pct": pitcher["CSW_Pct"],
-        "Recent_Whiff_Pct": arsenal["Recent_Whiff_Pct"],
-        "Recent_CSW_Pct": arsenal["Recent_CSW_Pct"],
-        "Fastball_Velo": arsenal["Fastball_Velo"],
-        "Fastball_Velo_Trend": arsenal["Fastball_Velo_Trend"],
-        "Pitch_Mix_Change": arsenal["Pitch_Mix_Change"],
-        "Arsenal_Form_Score": arsenal["Arsenal_Form_Score"],
-        "PitchTypeScore": pitch_match_score,
-        "PitchMix_Opp_Whiff": pitch_mix_whiff,
-        "PitchMix_Opp_xwOBA": pitch_mix_xwoba,
-        "PitchMix_Damage_xwOBA": pitch_mix_damage,
-        "xwOBA_Allowed": pitcher["xwOBA_Allowed"],
-        "BB_Rate": pitcher["BB_PA"],
-        "K_minus_BB": pitcher["K_PA"] - pitcher["BB_PA"],
-        "Barrel_Allowed": pitcher["Brl_BBE_Allowed"],
-        "HardHit_Allowed": pitcher["HH_BBE_Allowed"],
-        "Opp_xwOBA": opponent["Opp_xwOBA"],
-        "Opp_Barrel": opponent["Opp_Brl_BBE"],
-        "Recent_Outs": log["Recent_Outs"],
-        "Season_Pitches": log["Season_Pitches"],
-        "Recent_Pitches": log["Recent_Pitches"],
-        "Last_Start_Pitches": log["Last_Start_Pitches"],
-        "Last3_Pitches": log["Last3_Pitches"],
-        "Pitch_Count_Trend": log["Pitch_Count_Trend"],
-        "Quality_Start_Rate": log["Quality_Start_Rate"],
-        "Stable_Workload_Rate": log["Stable_Workload_Rate"],
-        "Short_Hook_Rate": log["Short_Hook_Rate"],
-        "Blowup_Hook_Rate": log["Blowup_Hook_Rate"],
-        "Recent_K_Rate": log["Recent_K_BF"],
-        "Recent_ER9": log["Recent_ER9"],
-        "Season_ER9": log["Season_ER9"],
-        "Outs_SD": log["Outs_SD"],
-        "Starts": log["Starts"],
-        "Park_Run_Factor": park_factor,
-        "Park_Source": park_source,
-        "Weather_Factor": weather_factor,
-        "Lineup_Status": lineup_status,
-        "Lineup_Sample_PA": opponent["Lineup_PA_Sample"],
-        "Confidence": confidence,
-        "Confidence_Level": confidence_level,
-        "K_Confidence_Score": k_confidence_score,
-        "Command_Score": command_score,
-        "Workload_Confidence_Score": workload_confidence,
-        "Run_Environment_Risk": run_environment_risk,
-        "Projection_Quality_Score": projection_quality_score,
-        "P_0_1_ER": p_0_1,
-        "P_2_3_ER": p_2_3,
-        "P_4plus_ER": p_4_plus,
-    }
-    detail = {
-        "lineup": hitter_table,
-        "pitch_types": pitch_match_table,
-        "game_log": logs.tail(10).copy() if logs is not None and not logs.empty else pd.DataFrame(),
-        "weather": weather,
-        "log_error": log_error,
-        "park_source": park_source,
-        "opponent_side": opponent_side,
-    }
-    return row, detail
-
-
-def parse_calibration_payload(payload: object) -> dict:
-    """Normalize a calibration JSON payload into the app's expected structure."""
-    if not isinstance(payload, dict):
-        return {}
-    targets = payload.get("targets", payload)
-    if not isinstance(targets, dict):
-        return {}
-    normalized: dict[str, dict] = {}
-    aliases = {
-        "K": "Strikeouts", "Strikeouts": "Strikeouts",
-        "ER": "Earned runs", "Earned runs": "Earned runs",
-        "Outs": "Outs",
-    }
-    for key, value in targets.items():
-        target_name = aliases.get(str(key))
-        if target_name is None or not isinstance(value, dict):
+    for column, default in defaults.items():
+        result[column] = default
+    if quotes is None or quotes.empty:
+        return result
+    for index, row in result.iterrows():
+        candidates = _matched_batter_quotes(quotes, row.get("GamePK"), str(row.get("Player", "")))
+        selected = select_batter_quote(candidates, source_mode)
+        if not selected:
             continue
-        slope = pd.to_numeric(pd.Series([value.get("slope")]), errors="coerce").iloc[0]
-        intercept = pd.to_numeric(pd.Series([value.get("intercept")]), errors="coerce").iloc[0]
-        if pd.isna(slope) or pd.isna(intercept):
+        line = pd.to_numeric(pd.Series([selected.get("Line")]), errors="coerce").iloc[0]
+        if pd.isna(line):
             continue
-        normalized[target_name] = {
-            "slope": float(slope),
-            "intercept": float(intercept),
-            "n": int(pd.to_numeric(pd.Series([value.get("n", 0)]), errors="coerce").fillna(0).iloc[0]),
-        }
-    if not normalized:
-        return {}
-    return {
-        "version": str(payload.get("version", "pitcher-calibration")),
-        "created_at_utc": str(payload.get("created_at_utc", "")),
-        "targets": normalized,
-    }
-
-
-def apply_projection_calibration(board: pd.DataFrame, calibration: dict | None) -> pd.DataFrame:
-    """Apply saved linear calibration while retaining the uncalibrated projections."""
-    result = board.copy()
-    payload = parse_calibration_payload(calibration or {})
-    target_payload = payload.get("targets", {}) if payload else {}
-    limits = {"Strikeouts": (0.0, 18.0), "Earned runs": (0.0, 10.0), "Outs": (3.0, 27.0)}
-    for target_name, config in BACKTEST_TARGETS.items():
-        projection_col = config["projection"]
-        raw_col = f"Raw_{projection_col}"
-        if projection_col not in result.columns:
-            continue
-        if raw_col not in result.columns:
-            result[raw_col] = pd.to_numeric(result[projection_col], errors="coerce")
+        over_odds = pd.to_numeric(pd.Series([selected.get("OverOdds")]), errors="coerce").iloc[0]
+        under_odds = pd.to_numeric(pd.Series([selected.get("UnderOdds")]), errors="coerce").iloc[0]
+        displayed_probability = pd.to_numeric(pd.Series([row.get(BINARY_PROBABILITY_COLUMN)]), errors="coerce").iloc[0]
+        per_pa = pd.to_numeric(pd.Series([row.get("Model_Hit_Per_PA")]), errors="coerce").iloc[0]
+        projected_pa = pd.to_numeric(pd.Series([row.get("Projected_PA")]), errors="coerce").iloc[0]
+        expected_count = float(per_pa * projected_pa) if pd.notna(per_pa) and pd.notna(projected_pa) else np.nan
+        if float(line) <= 0.5 and pd.notna(displayed_probability):
+            model_over = float(displayed_probability)
+        elif np.isfinite(expected_count):
+            model_over = poisson_over_probability_batter(expected_count, float(line))
         else:
-            result[raw_col] = pd.to_numeric(result[raw_col], errors="coerce")
-        coefficients = target_payload.get(target_name)
-        if not coefficients:
-            result[projection_col] = result[raw_col]
-            continue
-        calibrated = float(coefficients["intercept"]) + float(coefficients["slope"]) * result[raw_col]
-        lower, upper = limits[target_name]
-        result[projection_col] = calibrated.clip(lower, upper)
-    if "Proj_Outs" in result.columns:
-        result["Proj_Innings"] = pd.to_numeric(result["Proj_Outs"], errors="coerce") / 3.0
-    if "Proj_ER" in result.columns:
-        er_means = pd.to_numeric(result["Proj_ER"], errors="coerce").fillna(0.0)
-        result["P_0_1_ER"] = er_means.map(lambda mean: poisson_cdf(1, float(mean)))
-        result["P_2_3_ER"] = er_means.map(lambda mean: max(poisson_cdf(3, float(mean)) - poisson_cdf(1, float(mean)), 0.0))
-        result["P_4plus_ER"] = er_means.map(lambda mean: max(1.0 - poisson_cdf(3, float(mean)), 0.0))
-    result["Calibration_Applied"] = bool(target_payload)
-    result["Calibration_Version"] = payload.get("version", "") if payload else ""
+            model_over = np.nan
+        market_over = no_vig_over_probability_batter(over_odds, under_odds)
+        result.at[index, "Market_Line"] = float(line)
+        result.at[index, "Over_Odds"] = float(over_odds) if not pd.isna(over_odds) else np.nan
+        result.at[index, "Under_Odds"] = float(under_odds) if not pd.isna(under_odds) else np.nan
+        result.at[index, "Over_Multiplier"] = selected.get("OverMultiplier", np.nan)
+        result.at[index, "Under_Multiplier"] = selected.get("UnderMultiplier", np.nan)
+        result.at[index, "Line_Source"] = str(selected.get("SelectedSource") or selected.get("Bookmaker") or "")
+        result.at[index, "Line_Updated"] = str(selected.get("LastUpdate") or "")
+        result.at[index, "Market_Over_Prob"] = market_over
+        result.at[index, "Model_Over_Prob"] = model_over
+        result.at[index, "Model_Market_Edge"] = float(model_over - market_over) if np.isfinite(model_over) and np.isfinite(market_over) else np.nan
+        result.at[index, "Projection_Edge"] = float(expected_count - float(line)) if np.isfinite(expected_count) else np.nan
+    result["OddsSourceMode"] = source_mode
     return result
 
 
-def assign_scores(board: pd.DataFrame) -> pd.DataFrame:
-    result = board.copy()
-    derived_columns = [
-        "Rank", "K_Rank", "ER_Rank", "Outs_Rank", "K_Score",
-        "Run_Prevention_Score", "Outs_Score", "Overall_Score",
-    ]
-    result = result.drop(columns=[column for column in derived_columns if column in result.columns], errors="ignore")
-    result["K_Score"] = (
-        percentile(result["Proj_K"]) * 0.24
-        + percentile(result["Adj_K_Rate"]) * 0.13
-        + percentile(result["Whiff_Pct"]) * 0.09
-        + percentile(result["CSW_Pct"]) * 0.08
-        + percentile(result["Opponent_K_Rate"]) * 0.10
-        + percentile(result.get("Top6_K_Rate", result["Opponent_K_Rate"])) * 0.06
-        + result["PitchTypeScore"].clip(0, 100) * 0.08
-        + percentile(result.get("PitchMix_Opp_Whiff", result["Opponent_K_Rate"])) * 0.05
-        + percentile(result.get("Arsenal_Form_Score", pd.Series(50, index=result.index))) * 0.07
-        + percentile(result["Proj_BF"]) * 0.06
-        + percentile(result["Recent_K_Rate"]) * 0.04
-    )
-    result["Run_Prevention_Score"] = (
-        percentile(result["Proj_ER"], higher_is_better=False) * 0.30
-        + percentile(result["xwOBA_Allowed"], higher_is_better=False) * 0.15
-        + percentile(result["K_minus_BB"]) * 0.10
-        + percentile(result["Barrel_Allowed"], higher_is_better=False) * 0.10
-        + percentile(result["HardHit_Allowed"], higher_is_better=False) * 0.08
-        + percentile(result["Opp_xwOBA"], higher_is_better=False) * 0.12
-        + percentile(result["Park_Run_Factor"], higher_is_better=False) * 0.06
-        + percentile(result.get("Run_Environment_Risk", pd.Series(50, index=result.index)), higher_is_better=False) * 0.06
-        + percentile(result.get("Command_Score", pd.Series(50, index=result.index))) * 0.06
-        + percentile(result["Recent_ER9"], higher_is_better=False) * 0.05
-    )
-    result["Outs_Score"] = (
-        percentile(result["Proj_Outs"]) * 0.45
-        + percentile(result["Recent_Outs"]) * 0.20
-        + percentile(result["Proj_Pitches"]) * 0.08
-        + percentile(result.get("Workload_Confidence_Score", pd.Series(50, index=result.index))) * 0.14
-        + percentile(result["BB_Rate"], higher_is_better=False) * 0.08
-        + percentile(result["Opp_xwOBA"], higher_is_better=False) * 0.06
-        + percentile(result["Starts"]) * 0.04
-    )
-    result["Overall_Score"] = 0.36 * result["K_Score"] + 0.30 * result["Run_Prevention_Score"] + 0.22 * result["Outs_Score"] + 0.12 * result.get("Projection_Quality_Score", pd.Series(50, index=result.index))
-    risk_notes = []
-    for _, row in result.iterrows():
-        notes = []
-        proj_k = pd.to_numeric(pd.Series([row.get("Proj_K")]), errors="coerce").iloc[0]
-        proj_er = pd.to_numeric(pd.Series([row.get("Proj_ER")]), errors="coerce").iloc[0]
-        proj_outs = pd.to_numeric(pd.Series([row.get("Proj_Outs")]), errors="coerce").iloc[0]
-        if pd.notna(proj_k) and 5.0 <= proj_k <= 6.9:
-            notes.append("K bucket has run high")
-        if pd.notna(row.get("K_Score")) and float(row.get("K_Score")) >= 85:
-            notes.append("High K-score volatility")
-        if pd.notna(proj_er) and proj_er >= 3.5:
-            notes.append("High ER range has run high")
-        if pd.notna(proj_outs) and proj_outs >= 18:
-            notes.append("High outs hook risk")
-        if pd.notna(row.get("Workload_Confidence_Score")) and float(row.get("Workload_Confidence_Score")) < 50:
-            notes.append("Workload caution")
-        if pd.notna(row.get("Command_Score")) and float(row.get("Command_Score")) < 45:
-            notes.append("Command risk")
-        risk_notes.append("; ".join(notes) if notes else "Clean")
-    result["Projection_Risk_Note"] = risk_notes
-    result["K_Rank"] = result["Proj_K"].rank(method="min", ascending=False).astype(int)
-    result["ER_Rank"] = result["Proj_ER"].rank(method="min", ascending=True).astype(int)
-    result["Outs_Rank"] = result["Proj_Outs"].rank(method="min", ascending=False).astype(int)
-    result = result.sort_values(["Overall_Score", "Proj_K"], ascending=False).reset_index(drop=True)
-    result.insert(0, "Rank", np.arange(1, len(result) + 1))
-    return result
+def render_batter_odds_section(board: pd.DataFrame, matchup: dict, api_key: str, widget_prefix: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    slate_date = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    quotes_key = f"{widget_prefix}_odds_quotes_{slate_date}"
+    meta_key = f"{widget_prefix}_odds_meta_{slate_date}"
+    errors_key = f"{widget_prefix}_odds_errors_{slate_date}"
+    with st.expander(f"Automatic sportsbook / PrizePicks {ODDS_API_MARKET_LABEL.lower()} lines", expanded=False):
+        source_mode = st.selectbox("Line source", ODDS_SOURCE_OPTIONS, key=f"{widget_prefix}_odds_source")
+        scope = st.radio("Fetch scope", ["Current game", "Entire slate"], horizontal=True, key=f"{widget_prefix}_odds_scope")
+        games, schedule_error = fetch_mlb_schedule(slate_date)
+        if schedule_error:
+            st.warning(f"MLB schedule unavailable: {schedule_error}")
+        fetch_clicked = st.button("Fetch / refresh lines", type="primary", width="stretch", key=f"{widget_prefix}_fetch_odds")
+        if fetch_clicked:
+            if not api_key:
+                st.error("Add THE_ODDS_API_KEY in this Streamlit app's Secrets or use the temporary sidebar field.")
+            elif not games:
+                st.error("No MLB games were available for the selected slate date.")
+            else:
+                game_pks = [int(game["game_pk"]) for game in games if game.get("game_pk") is not None]
+                if scope == "Current game":
+                    current_pk = pd.to_numeric(pd.Series([matchup.get("game_pk")]), errors="coerce").iloc[0]
+                    game_pks = [int(current_pk)] if pd.notna(current_pk) else []
+                with st.spinner(f"Fetching {ODDS_API_MARKET_LABEL.lower()} lines..."):
+                    new_quotes, quota, errors = fetch_batter_prop_quotes(api_key, games, game_pks)
+                existing = st.session_state.get(quotes_key, pd.DataFrame())
+                st.session_state[quotes_key] = combine_batter_quote_frames(existing, new_quotes, slate_date)
+                st.session_state[meta_key] = quota
+                st.session_state[errors_key] = errors
+        quotes = st.session_state.get(quotes_key, pd.DataFrame())
+        quota = st.session_state.get(meta_key, {})
+        errors = st.session_state.get(errors_key, [])
+        metrics = st.columns(4)
+        metrics[0].metric("Quotes", f"{len(quotes):,}" if isinstance(quotes, pd.DataFrame) else "0")
+        metrics[1].metric("Events queried", quota.get("events_queried", "—"))
+        metrics[2].metric("Credits this fetch", quota.get("estimated_credits_used_this_fetch", "—"))
+        metrics[3].metric("Credits remaining", quota.get("requests_remaining", "—"))
+        if errors:
+            with st.expander("Odds-fetch details"):
+                for error in errors[:50]:
+                    st.code(error)
+        if isinstance(quotes, pd.DataFrame) and not quotes.empty:
+            st.caption("The selected source is matched by game and player. Manual backtest editing remains available when a market is missing.")
+    source_mode = st.session_state.get(f"{widget_prefix}_odds_source", ODDS_SOURCE_OPTIONS[0])
+    quotes = st.session_state.get(quotes_key, pd.DataFrame())
+    return apply_batter_odds_to_board(board, quotes, source_mode, matchup.get("game_pk")), quotes, source_mode
 
 
-# -----------------------------------------------------------------------------
-# Backtesting, result collection and calibration
-# -----------------------------------------------------------------------------
-
-def build_projection_snapshot(
-    board: pd.DataFrame,
-    slate_date: object,
-    lookback_days: int,
-    generated_at_utc: str,
-) -> pd.DataFrame:
-    snapshot = board.copy()
-    snapshot["SlateDate"] = str(pd.Timestamp(slate_date).date())
-    snapshot["GeneratedAtUTC"] = str(generated_at_utc)
-    snapshot["ModelVersion"] = MODEL_VERSION
-    snapshot["LookbackDays"] = int(lookback_days)
-    snapshot["Baseline_K"] = (
-        pd.to_numeric(snapshot.get("Recent_K_Rate"), errors="coerce")
-        * pd.to_numeric(snapshot.get("Proj_BF"), errors="coerce")
-    )
-    snapshot["Baseline_ER"] = (
-        pd.to_numeric(snapshot.get("Recent_ER9"), errors="coerce")
-        * pd.to_numeric(snapshot.get("Proj_Outs"), errors="coerce") / 27.0
-    )
-    snapshot["Baseline_Outs"] = pd.to_numeric(snapshot.get("Recent_Outs"), errors="coerce")
-    blank_numeric = [
-        "K_Line", "ER_Line", "Outs_Line", "K_Closing_Line", "ER_Closing_Line", "Outs_Closing_Line",
-        "Actual_K", "Actual_ER", "Actual_Outs", "Actual_BF", "Actual_Pitches",
-    ]
-    for column in blank_numeric:
-        if column not in snapshot.columns:
-            snapshot[column] = np.nan
-    if "Notes" not in snapshot.columns:
-        snapshot["Notes"] = ""
-    preferred_columns = [
-        "SlateDate", "GameDateTimeUTC", "GeneratedAtUTC", "ModelVersion", "LookbackDays",
-        "GamePK", "PitcherID", "Pitcher", "Team", "Opponent", "PitcherLocation", "Game", "Venue", "Hand",
-        "Lineup_Status", "Confidence", "Confidence_Level", "Calibration_Applied", "Calibration_Version",
-        "Proj_K", "Proj_ER", "Proj_Outs", "Proj_BF", "Proj_Pitches", "Outs_SD",
-        "Raw_Proj_K", "Raw_Proj_ER", "Raw_Proj_Outs",
-        "Baseline_K", "Baseline_ER", "Baseline_Outs",
-        "K_Score", "Run_Prevention_Score", "Outs_Score", "Overall_Score",
-        "Adj_K_Rate", "Pitcher_K_Rate", "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate", "PitchMix_Opp_Whiff", "Whiff_Pct", "CSW_Pct", "Recent_Whiff_Pct", "Recent_CSW_Pct", "Fastball_Velo_Trend", "PitchTypeScore",
-        "xwOBA_Allowed", "BB_Rate", "K_minus_BB", "Barrel_Allowed", "HardHit_Allowed", "Opp_xwOBA",
-        "Recent_Outs", "Recent_K_Rate", "Recent_ER9", "Season_ER9", "Starts",
-        "Park_Run_Factor", "Weather_Factor",
-        "K_Line", "ER_Line", "Outs_Line", "K_Closing_Line", "ER_Closing_Line", "Outs_Closing_Line",
-        "OddsSourceMode",
-        "K_Line_Source", "K_Over_Odds", "K_Under_Odds", "K_Line_Updated", "K_Market_Over_Prob", "K_Model_Over_Prob", "K_Probability_Edge", "K_Projection_Edge",
-        "ER_Line_Source", "ER_Over_Odds", "ER_Under_Odds", "ER_Line_Updated", "ER_Market_Over_Prob", "ER_Model_Over_Prob", "ER_Probability_Edge", "ER_Projection_Edge",
-        "Outs_Line_Source", "Outs_Over_Odds", "Outs_Under_Odds", "Outs_Line_Updated", "Outs_Market_Over_Prob", "Outs_Model_Over_Prob", "Outs_Probability_Edge", "Outs_Projection_Edge",
-        "Actual_K", "Actual_ER", "Actual_Outs", "Actual_BF", "Actual_Pitches", "Notes",
-    ]
-    existing = [column for column in preferred_columns if column in snapshot.columns]
-    extras = [column for column in snapshot.columns if column not in existing and column not in {"DetailKey", "Rank", "K_Rank", "ER_Rank", "Outs_Rank"}]
-    return snapshot[existing + extras].copy()
-
-
-def normalize_backtest_history(history: pd.DataFrame) -> pd.DataFrame:
-    if history is None or history.empty:
+def lineup_seed_as_roster(lineup_seed: pd.DataFrame) -> pd.DataFrame:
+    if lineup_seed is None or lineup_seed.empty:
         return pd.DataFrame()
-    result = history.copy()
-    aliases = {
-        "Date": "SlateDate", "Pitcher_ID": "PitcherID", "Game_ID": "GamePK",
-        "Projected_K": "Proj_K", "Projected_ER": "Proj_ER", "Projected_Outs": "Proj_Outs",
-        "ActualK": "Actual_K", "ActualER": "Actual_ER", "ActualOuts": "Actual_Outs",
-    }
-    result = result.rename(columns={key: value for key, value in aliases.items() if key in result.columns and value not in result.columns})
-    for column in ["SlateDate", "GameDateTimeUTC", "GeneratedAtUTC"]:
-        if column not in result.columns:
-            result[column] = pd.NaT if column != "SlateDate" else ""
-    result["SlateDate"] = pd.to_datetime(result["SlateDate"], errors="coerce").dt.date
-    result["GameDateTimeUTC"] = pd.to_datetime(result["GameDateTimeUTC"], utc=True, errors="coerce")
-    result["GeneratedAtUTC"] = pd.to_datetime(result["GeneratedAtUTC"], utc=True, errors="coerce")
-    numeric_columns = {
-        "GamePK", "PitcherID", "LookbackDays", "Proj_K", "Proj_ER", "Proj_Outs", "Proj_BF", "Proj_Pitches",
-        "Outs_SD", "Workload_Confidence_Score", "Command_Score", "K_Confidence_Score", "Projection_Quality_Score", "Projection_Risk_Note", "Baseline_K", "Baseline_ER", "Baseline_Outs", "K_Score", "Run_Prevention_Score",
-        "Outs_Score", "Overall_Score", "K_Line", "ER_Line", "Outs_Line", "K_Closing_Line", "ER_Closing_Line",
-        "Outs_Closing_Line", "K_Over_Odds", "K_Under_Odds", "ER_Over_Odds", "ER_Under_Odds",
-        "Outs_Over_Odds", "Outs_Under_Odds", "K_Market_Over_Prob", "K_Model_Over_Prob",
-        "K_Probability_Edge", "K_Projection_Edge", "ER_Market_Over_Prob", "ER_Model_Over_Prob",
-        "ER_Probability_Edge", "ER_Projection_Edge", "Outs_Market_Over_Prob", "Outs_Model_Over_Prob",
-        "Outs_Probability_Edge", "Outs_Projection_Edge", "Actual_K", "Actual_ER", "Actual_Outs", "Actual_BF", "Actual_Pitches",
-    }
-    for column in numeric_columns:
-        if column not in result.columns:
-            result[column] = np.nan
-        result[column] = pd.to_numeric(result[column], errors="coerce")
-    if "ModelVersion" not in result.columns:
-        result["ModelVersion"] = "unknown"
-    if "Lineup_Status" not in result.columns:
-        result["Lineup_Status"] = "Unknown"
-    if "Confidence_Level" not in result.columns:
-        result["Confidence_Level"] = "Unknown"
-    if "Pitcher" not in result.columns:
-        result["Pitcher"] = ""
-    result["SnapshotAfterStart"] = (
-        result["GeneratedAtUTC"].notna()
-        & result["GameDateTimeUTC"].notna()
-        & result["GeneratedAtUTC"].gt(result["GameDateTimeUTC"])
-    )
+    roster = lineup_seed[["player_id"]].drop_duplicates().copy()
+    roster["Player"] = np.nan
+    roster["Bats"] = np.nan
+    roster["Position"] = ""
+    roster["RosterStatus"] = "Slate lineup"
+    return roster
+
+
+def add_slate_grade(board: pd.DataFrame, probability_weight: float, score_weight: float, confidence_weight: float) -> pd.DataFrame:
+    result = board.copy()
+    probability = pd.to_numeric(result.get(BINARY_PROBABILITY_COLUMN), errors="coerce")
+    score = pd.to_numeric(result.get(BINARY_SCORE_COLUMN), errors="coerce").fillna(50.0).clip(0, 100)
+    confidence = pd.to_numeric(result.get("Confidence"), errors="coerce").fillna(50.0).clip(0, 100)
+    result["ProbabilityGrade"] = percentile(probability).clip(0, 100)
+    total = max(float(probability_weight + score_weight + confidence_weight), 1.0)
+    result["SlateGrade"] = (
+        result["ProbabilityGrade"] * float(probability_weight)
+        + score * float(score_weight)
+        + confidence * float(confidence_weight)
+    ) / total
+    result = result.sort_values(["SlateGrade", BINARY_PROBABILITY_COLUMN, BINARY_SCORE_COLUMN], ascending=False).reset_index(drop=True)
+    result = result.drop(columns=["SlateRank"], errors="ignore")
+    result.insert(0, "SlateRank", np.arange(1, len(result) + 1))
     return result
 
 
-def combine_history_uploads(uploaded_files: list[object]) -> tuple[pd.DataFrame, list[str]]:
-    frames: list[pd.DataFrame] = []
-    errors: list[str] = []
-    for uploaded in uploaded_files or []:
-        try:
-            content = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
-            frame = pd.read_csv(StringIO(content.decode("utf-8-sig")))
-            if not frame.empty:
-                frame["SourceFile"] = getattr(uploaded, "name", "uploaded.csv")
-                frames.append(frame)
-        except Exception as exc:
-            errors.append(f"{getattr(uploaded, 'name', 'file')}: {type(exc).__name__}: {exc}")
-    if not frames:
-        return pd.DataFrame(), errors
-    return normalize_backtest_history(pd.concat(frames, ignore_index=True, sort=False)), errors
-
-
-def append_snapshot_to_history(history: pd.DataFrame, snapshot: pd.DataFrame) -> pd.DataFrame:
-    """Add or replace one generated slate snapshot in the in-session master history."""
-    current = normalize_backtest_history(history)
-    addition = snapshot.copy() if snapshot is not None else pd.DataFrame()
-    if addition.empty:
-        return current
-    if "SourceFile" not in addition.columns:
-        addition["SourceFile"] = "session_current_snapshot"
-    addition = normalize_backtest_history(addition)
-    combined = normalize_backtest_history(
-        pd.concat([current, addition], ignore_index=True, sort=False)
-    )
-
-    # Re-clicking the button should replace the same generated snapshot rather
-    # than inflating the master with duplicate pitcher rows.
-    game_key = combined["GamePK"].where(
-        combined["GamePK"].notna(), combined["SlateDate"].astype(str)
-    ).astype(str)
-    pitcher_key = combined["PitcherID"].where(
-        combined["PitcherID"].notna(),
-        combined["Pitcher"].map(normalize_lookup_text),
-    ).astype(str)
-    generated_key = combined["GeneratedAtUTC"].astype(str)
-    combined["_SessionSnapshotKey"] = game_key + "|" + pitcher_key + "|" + generated_key
-    combined = combined.drop_duplicates("_SessionSnapshotKey", keep="last")
-    return combined.drop(columns="_SessionSnapshotKey").reset_index(drop=True)
-
-
-def deduplicate_history(history: pd.DataFrame, latest_only: bool = True, exclude_after_start: bool = True) -> pd.DataFrame:
-    result = normalize_backtest_history(history)
+def generate_three_man_pairings(
+    board: pd.DataFrame,
+    number_of_pairings: int,
+    candidate_pool: int,
+    minimum_confidence: float,
+    max_same_team: int,
+    require_different_games: bool,
+    style: str,
+    diversity_strength: float,
+) -> pd.DataFrame:
+    if board is None or board.empty:
+        return pd.DataFrame()
+    candidates = board.copy()
+    candidates["Confidence"] = pd.to_numeric(candidates.get("Confidence"), errors="coerce").fillna(0.0)
+    candidates = candidates[candidates["Confidence"].ge(float(minimum_confidence))]
+    candidates = candidates.drop_duplicates(["Player", "GamePK"], keep="first")
+    candidates = candidates.sort_values(["SlateGrade", BINARY_PROBABILITY_COLUMN], ascending=False).head(int(candidate_pool)).reset_index(drop=True)
+    if len(candidates) < 3:
+        return pd.DataFrame()
+    rows = []
+    for indices in combinations(range(len(candidates)), 3):
+        trio = candidates.iloc[list(indices)]
+        team_counts = trio.get("Team", pd.Series(["", "", ""])).astype(str).value_counts()
+        if not team_counts.empty and int(team_counts.max()) > int(max_same_team):
+            continue
+        game_values = trio.get("GamePK", pd.Series([np.nan, np.nan, np.nan])).astype(str)
+        unique_games = game_values.nunique(dropna=True)
+        if require_different_games and unique_games < 3:
+            continue
+        probabilities = pd.to_numeric(trio[BINARY_PROBABILITY_COLUMN], errors="coerce").clip(0.001, 0.999)
+        if probabilities.isna().any():
+            continue
+        grades = pd.to_numeric(trio["SlateGrade"], errors="coerce").fillna(50.0)
+        confidence = pd.to_numeric(trio["Confidence"], errors="coerce").fillna(50.0)
+        market_edges = pd.to_numeric(trio.get("Model_Market_Edge"), errors="coerce") if "Model_Market_Edge" in trio.columns else pd.Series(np.nan, index=trio.index)
+        mean_edge = float(market_edges.mean()) if market_edges.notna().any() else np.nan
+        edge_grade = float(np.clip(50.0 + (mean_edge * 250.0 if np.isfinite(mean_edge) else 0.0), 0, 100))
+        geometric_probability = float(np.prod(probabilities.to_numpy()) ** (1.0 / 3.0))
+        joint_probability = float(np.prod(probabilities.to_numpy()))
+        avg_grade = float(grades.mean())
+        min_conf = float(confidence.min())
+        if style == "Highest probability":
+            raw_score = .35 * avg_grade + .45 * geometric_probability * 100 + .15 * min_conf + .05 * edge_grade
+        elif style == "Model strength":
+            raw_score = .65 * avg_grade + .20 * geometric_probability * 100 + .10 * min_conf + .05 * edge_grade
+        elif style == "Market edge":
+            raw_score = .40 * avg_grade + .20 * geometric_probability * 100 + .10 * min_conf + .30 * edge_grade
+        else:
+            raw_score = .55 * avg_grade + .25 * geometric_probability * 100 + .15 * min_conf + .05 * edge_grade
+        if unique_games < 3:
+            raw_score -= (3 - unique_games) * 2.5
+        if not team_counts.empty and int(team_counts.max()) > 1:
+            raw_score -= (int(team_counts.max()) - 1) * 3.0
+        player_keys = tuple(f"{row.Player}|{row.GamePK}" for row in trio.itertuples())
+        expected_counts = pd.to_numeric(trio.get(BINARY_EXPECTED_COUNT_COLUMN), errors="coerce")
+        def leg_text(position: int) -> str:
+            count_value = expected_counts.iloc[position] if position < len(expected_counts) else np.nan
+            count_part = f" · {count_value:.2f} exp" if pd.notna(count_value) else ""
+            return f"{float(probabilities.iloc[position]):.1%}{count_part} · {trio.iloc[position].get('Team', '')}"
+        rows.append({
+            "PlayerKeys": player_keys,
+            "PairingScore": raw_score,
+            "EstimatedAll3Probability": joint_probability,
+            "AverageLegProbability": float(probabilities.mean()),
+            "GeometricLegProbability": geometric_probability,
+            "AverageSlateGrade": avg_grade,
+            "MinimumConfidence": min_conf,
+            "AverageMarketEdge": mean_edge,
+            "Player 1": str(trio.iloc[0].get("Player", "")),
+            "Leg 1": leg_text(0),
+            "Player 2": str(trio.iloc[1].get("Player", "")),
+            "Leg 2": leg_text(1),
+            "Player 3": str(trio.iloc[2].get("Player", "")),
+            "Leg 3": leg_text(2),
+            "Games": " | ".join(trio.get("Game", pd.Series(["", "", ""])).astype(str).tolist()),
+        })
+    if not rows:
+        return pd.DataFrame()
+    combo_table = pd.DataFrame(rows).sort_values("PairingScore", ascending=False).reset_index(drop=True)
+    selected_rows = []
+    exposure: dict[str, int] = {}
+    remaining = combo_table.copy()
+    for _ in range(min(int(number_of_pairings), len(remaining))):
+        if remaining.empty:
+            break
+        remaining["_Adjusted"] = remaining.apply(
+            lambda row: float(row["PairingScore"]) - float(diversity_strength) * sum(exposure.get(key, 0) for key in row["PlayerKeys"]),
+            axis=1,
+        )
+        best_index = remaining["_Adjusted"].idxmax()
+        chosen = remaining.loc[best_index].copy()
+        chosen["SelectionScore"] = chosen["_Adjusted"]
+        selected_rows.append(chosen)
+        for key in chosen["PlayerKeys"]:
+            exposure[key] = exposure.get(key, 0) + 1
+        remaining = remaining.drop(index=best_index)
+    result = pd.DataFrame(selected_rows).reset_index(drop=True)
     if result.empty:
         return result
-    if exclude_after_start and "SnapshotAfterStart" in result.columns:
-        result = result[~result["SnapshotAfterStart"].fillna(False)].copy()
-    if latest_only:
-        result = result.sort_values("GeneratedAtUTC", na_position="first")
-        game_key = result["GamePK"].where(result["GamePK"].notna(), result["SlateDate"].astype(str))
-        result["_GameKey"] = game_key.astype(str)
-        result = result.drop_duplicates(["_GameKey", "PitcherID"], keep="last").drop(columns="_GameKey")
-    return result.reset_index(drop=True)
+    result.insert(0, "Pairing", np.arange(1, len(result) + 1))
+    return result.drop(columns=["PlayerKeys", "_Adjusted"], errors="ignore")
 
 
 
-@st.cache_data(ttl=300, max_entries=160, show_spinner=False)
-def fetch_completed_pitcher_results(game_pk: int) -> dict:
-    """Fetch official pitcher box-score results for one MLB game.
-
-    This intentionally uses the game-specific live feed instead of the season
-    game-log cache. The projection board can cache a pitcher's season game log
-    for several hours; reusing that cache after a game ends can make the result
-    grader miss the newly completed start.
-    """
-    game_pk = int(game_pk)
-    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
-    request = Request(
-        url,
-        headers={"User-Agent": "MLB-Pitcher-Backtest/1.1", "Accept": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=20) as response:
-            payload = json.load(response)
-    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-        return {
-            "ok": False,
-            "final": False,
-            "data": pd.DataFrame(),
-            "status": "Fetch error",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    game_data = payload.get("gameData", {}) or {}
-    status = game_data.get("status", {}) or {}
-    abstract_state = str(status.get("abstractGameState", "") or "")
-    detailed_state = str(status.get("detailedState", "") or "")
-    coded_state = str(status.get("codedGameState", "") or "")
-    status_text = detailed_state or abstract_state or coded_state or "Unknown"
-    final = (
-        abstract_state.lower() == "final"
-        or coded_state.upper() == "F"
-        or any(
-            token in detailed_state.lower()
-            for token in ["final", "game over", "completed early"]
-        )
-    )
-    if not final:
-        return {
-            "ok": True,
-            "final": False,
-            "data": pd.DataFrame(),
-            "status": status_text,
-            "error": None,
-        }
-
-    rows: list[dict] = []
-    teams = (((payload.get("liveData", {}) or {}).get("boxscore", {}) or {}).get("teams", {}) or {})
-    for side in ["away", "home"]:
-        team_box = teams.get(side, {}) or {}
-        players = team_box.get("players", {}) or {}
-        ordered_pitchers = team_box.get("pitchers", []) or []
-        ordered_lookup: dict[int, int] = {}
-        for order_index, raw_pitcher_id in enumerate(ordered_pitchers):
-            numeric_id = pd.to_numeric(pd.Series([raw_pitcher_id]), errors="coerce").iloc[0]
-            if not pd.isna(numeric_id):
-                ordered_lookup[int(numeric_id)] = int(order_index)
-
-        for player_key, record in players.items():
-            if not isinstance(record, dict):
+def build_whole_slate_model_board(
+    df: pd.DataFrame,
+    games: list[dict],
+    available_teams: list[str],
+    min_pa: int,
+    loaded_end: object,
+    include_low_sample: bool,
+    use_confirmed_lineups: bool,
+    team_runs: float,
+    starter_innings: float,
+    bullpen_multiplier: float,
+) -> tuple[pd.DataFrame, list[str]]:
+    boards, errors = [], []
+    total = max(len(games) * 2, 1)
+    progress = st.progress(0.0, text="Preparing whole-slate hit board...")
+    completed = 0
+    for game in games:
+        for side in ["away", "home"]:
+            completed += 1
+            batting_code = game.get(f"{side}_abbr")
+            team = match_statcast_team(batting_code, available_teams)
+            opponent_side = "home" if side == "away" else "away"
+            pitcher_id = game.get(f"{opponent_side}_pitcher_id")
+            pitcher_name = game.get(f"{opponent_side}_pitcher_name")
+            if team is None or pitcher_id is None:
+                errors.append(f"{game.get('away_abbr')} @ {game.get('home_abbr')} · {batting_code}: team or probable starter unavailable.")
+                progress.progress(completed / total)
                 continue
-            person = record.get("person", {}) or {}
-            player_id = person.get("id")
-            if player_id is None:
-                digits = "".join(character for character in str(player_key) if character.isdigit())
-                player_id = int(digits) if digits else None
-            numeric_id = pd.to_numeric(pd.Series([player_id]), errors="coerce").iloc[0]
-            if pd.isna(numeric_id):
+            lineup_seed = infer_recent_lineup(df, team)
+            lineup_status = "Recent lineup fallback"
+            if use_confirmed_lineups:
+                lineup_result = fetch_mlb_confirmed_lineup(game.get("game_pk"), side)
+                posted = _clean_lineup_seed(lineup_result.get("lineup"))
+                if lineup_result.get("ok") and len(posted) >= 9:
+                    lineup_seed = posted
+                    lineup_status = "Confirmed"
+                elif lineup_result.get("status") == "Partial":
+                    lineup_status = "Partial / recent fallback"
+            lineup_seed = _clean_lineup_seed(lineup_seed)
+            if lineup_seed.empty:
+                errors.append(f"{batting_code} vs {pitcher_name}: no usable lineup seed.")
+                progress.progress(completed / total)
                 continue
-            player_id_int = int(numeric_id)
-
-            pitching = ((record.get("stats", {}) or {}).get("pitching", {}) or {})
-            if not pitching:
-                continue
-            ip = pitching.get("inningsPitched")
-            outs = innings_to_outs(ip)
-            bf = pd.to_numeric(pd.Series([pitching.get("battersFaced")]), errors="coerce").iloc[0]
-            pitches = pd.to_numeric(pd.Series([pitching.get("numberOfPitches")]), errors="coerce").iloc[0]
-            # Ignore rostered pitchers who did not appear.
-            if (pd.isna(outs) or float(outs) <= 0) and (pd.isna(bf) or float(bf) <= 0) and (pd.isna(pitches) or float(pitches) <= 0):
-                continue
-
-            games_started = pd.to_numeric(
-                pd.Series([pitching.get("gamesStarted")]), errors="coerce"
-            ).iloc[0]
-            rows.append({
-                "PitcherID": player_id_int,
-                "Pitcher_Official": str(person.get("fullName") or ""),
-                "Actual_K": pd.to_numeric(pd.Series([pitching.get("strikeOuts")]), errors="coerce").fillna(0).iloc[0],
-                "Actual_ER": pd.to_numeric(pd.Series([pitching.get("earnedRuns")]), errors="coerce").fillna(0).iloc[0],
-                "Actual_Outs": float(outs) if not pd.isna(outs) else np.nan,
-                "Actual_BF": float(bf) if not pd.isna(bf) else np.nan,
-                "Actual_Pitches": float(pitches) if not pd.isna(pitches) else np.nan,
-                "GamesStarted": float(games_started) if not pd.isna(games_started) else np.nan,
-                "PitchingOrder": ordered_lookup.get(player_id_int, 999),
-                "Side": side,
-            })
-
-    data = pd.DataFrame(rows)
-    if not data.empty:
-        # A player should appear only once, but keep the fullest pitching line if
-        # MLB's response ever contains a duplicate record.
-        data["_Completeness"] = data[
-            ["Actual_K", "Actual_ER", "Actual_Outs", "Actual_BF", "Actual_Pitches"]
-        ].notna().sum(axis=1)
-        data = (
-            data.sort_values(["PitcherID", "_Completeness", "Actual_Pitches"], ascending=[True, False, False])
-            .drop_duplicates("PitcherID", keep="first")
-            .drop(columns="_Completeness")
-            .reset_index(drop=True)
-        )
-    return {
-        "ok": True,
-        "final": True,
-        "data": data,
-        "status": status_text or "Final",
-        "error": None,
-    }
-
-
-def fill_actual_results(history: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Fill official K, ER, outs, BF and pitch counts for completed games.
-
-    GamePK is the primary key because it handles doubleheaders and avoids stale
-    season game-log caches. A date-based game-log fallback remains for older
-    imported rows that do not contain a GamePK.
-    """
-    result = normalize_backtest_history(history)
-    summary = {
-        "matched": 0,
-        "not_final": 0,
-        "unmatched": 0,
-        "fallback_matched": 0,
-        "missing_game_pk": 0,
-        "errors": [],
-    }
-    if result.empty or "PitcherID" not in result.columns:
-        return result, summary
-
-    # Primary path: fetch one official game feed per GamePK and match by MLB pitcher ID.
-    game_ids = (
-        pd.to_numeric(result.get("GamePK"), errors="coerce")
-        .dropna()
-        .astype(int)
-        .unique()
-        .tolist()
-    )
-    rows_without_game_pk = int(pd.to_numeric(result.get("GamePK"), errors="coerce").isna().sum())
-    summary["missing_game_pk"] = rows_without_game_pk
-
-    total_work = max(len(game_ids) + (1 if rows_without_game_pk else 0), 1)
-    completed_work = 0
-    progress = st.progress(0.0, text="Fetching official pitcher results...")
-
-    for game_pk in game_ids:
-        try:
-            game_result = fetch_completed_pitcher_results(int(game_pk))
-            game_mask = pd.to_numeric(result["GamePK"], errors="coerce").eq(int(game_pk))
-            if not game_result.get("ok"):
-                summary["errors"].append(f"Game {game_pk}: {game_result.get('error')}")
-            elif not game_result.get("final"):
-                summary["not_final"] += 1
-            else:
-                official = game_result.get("data", pd.DataFrame())
-                if official is None or official.empty:
-                    unmatched_rows = int(game_mask.sum())
-                    summary["unmatched"] += unmatched_rows
-                    summary["errors"].append(
-                        f"Game {game_pk} is final, but MLB returned no pitcher box-score rows."
-                    )
-                else:
-                    official = official.set_index("PitcherID")
-                    for row_index in result.index[game_mask]:
-                        pitcher_id = result.at[row_index, "PitcherID"]
-                        numeric_pitcher = pd.to_numeric(pd.Series([pitcher_id]), errors="coerce").iloc[0]
-                        if pd.isna(numeric_pitcher) or int(numeric_pitcher) not in official.index:
-                            summary["unmatched"] += 1
-                            continue
-                        actual = official.loc[int(numeric_pitcher)]
-                        if isinstance(actual, pd.DataFrame):
-                            actual = actual.iloc[0]
-                        for column in ["Actual_K", "Actual_ER", "Actual_Outs", "Actual_BF", "Actual_Pitches"]:
-                            result.at[row_index, column] = pd.to_numeric(
-                                pd.Series([actual.get(column)]), errors="coerce"
-                            ).iloc[0]
-                        summary["matched"] += 1
-        except Exception as exc:
-            summary["errors"].append(f"Game {game_pk}: {type(exc).__name__}: {exc}")
-        completed_work += 1
-        progress.progress(
-            min(completed_work / total_work, 1.0),
-            text=f"Checked {completed_work} of {total_work} result groups",
-        )
-
-    # Compatibility fallback for old CSV rows that lack GamePK.
-    missing_pk_mask = pd.to_numeric(result.get("GamePK"), errors="coerce").isna()
-    fallback_candidates = result[
-        missing_pk_mask & result["PitcherID"].notna() & result["SlateDate"].notna()
-    ].copy()
-    if not fallback_candidates.empty:
-        pairs = fallback_candidates[["PitcherID", "SlateDate"]].drop_duplicates()
-        for pair in pairs.itertuples(index=False):
-            pitcher_id = int(pair.PitcherID)
-            slate_day = pair.SlateDate
+            roster = lineup_seed_as_roster(lineup_seed)
+            park = fetch_savant_park_factors(game.get("venue", ""), pd.Timestamp(loaded_end).year, "Hits")
             try:
-                # Clear only the season game-log cache before grading old rows so
-                # a pregame cached log cannot hide a newly completed appearance.
-                fetch_pitcher_game_log.clear()
-                logs, error = fetch_pitcher_game_log(pitcher_id, int(pd.Timestamp(slate_day).year))
-                if error and (logs is None or logs.empty):
-                    summary["errors"].append(f"{pitcher_id} {slate_day}: {error}")
-                    continue
-                game_rows = logs[
-                    pd.to_datetime(logs["Date"], errors="coerce").dt.date.eq(slate_day)
-                ].copy()
-                mask = missing_pk_mask & result["PitcherID"].eq(pitcher_id) & result["SlateDate"].eq(slate_day)
-                if game_rows.empty:
-                    summary["unmatched"] += int(mask.sum())
-                    continue
-                actual = game_rows.sort_values(["Pitches", "Outs"], ascending=False).iloc[0]
-                for column, source_column in {
-                    "Actual_K": "K",
-                    "Actual_ER": "ER",
-                    "Actual_Outs": "Outs",
-                    "Actual_BF": "BF",
-                    "Actual_Pitches": "Pitches",
-                }.items():
-                    result.loc[mask, column] = pd.to_numeric(
-                        pd.Series([actual.get(source_column)]), errors="coerce"
-                    ).iloc[0]
-                matched_rows = int(mask.sum())
-                summary["matched"] += matched_rows
-                summary["fallback_matched"] += matched_rows
-            except Exception as exc:
-                summary["errors"].append(
-                    f"Fallback {pitcher_id} {slate_day}: {type(exc).__name__}: {exc}"
+                board, _ = build_hit_board(
+                    df=df, pitcher_id=int(pitcher_id), team=team, min_pa=min_pa,
+                    end_date=pd.Timestamp(loaded_end), park_hit_factor_lhb=float(park["L"]),
+                    park_hit_factor_rhb=float(park["R"]), team_runs=float(team_runs),
+                    is_away=side == "away", starter_innings=float(starter_innings),
+                    bullpen_multiplier=float(bullpen_multiplier), lineup_override=lineup_seed,
+                    lineup_edits=None, sprint_upload=None, active_roster=roster,
+                    include_low_sample=include_low_sample,
                 )
-        completed_work += 1
-        progress.progress(
-            min(completed_work / total_work, 1.0),
-            text=f"Checked {completed_work} of {total_work} result groups",
-        )
-
+            except Exception as exc:
+                errors.append(f"{batting_code} vs {pitcher_name}: {type(exc).__name__}: {exc}")
+                progress.progress(completed / total)
+                continue
+            if board.empty:
+                errors.append(f"{batting_code} vs {pitcher_name}: model returned no hitters.")
+                progress.progress(completed / total)
+                continue
+            board = board[pd.to_numeric(board.get("LineupSpot"), errors="coerce").between(1, 9)].copy()
+            board["GamePK"] = game.get("game_pk")
+            board["SlateDate"] = game.get("slate_date")
+            board["Team"] = batting_code
+            board["Opponent"] = game.get(f"{opponent_side}_abbr")
+            board["Game"] = f"{game.get('away_abbr')} @ {game.get('home_abbr')}"
+            board["StartingPitcherID"] = pitcher_id
+            board["StartingPitcher"] = pitcher_name
+            board["HomeAway"] = "Away" if side == "away" else "Home"
+            board["LineupStatus"] = lineup_status
+            board["Venue"] = game.get("venue")
+            board["GameDateTimeUTC"] = game.get("game_datetime_utc")
+            boards.append(board)
+            progress.progress(completed / total, text=f"Built {completed} of {total} offense matchups")
     progress.empty()
-    return normalize_backtest_history(result), summary
+    if not boards:
+        return pd.DataFrame(), errors
+    combined = pd.concat(boards, ignore_index=True, sort=False)
+    combined = combined.drop(columns=["Rank"], errors="ignore")
+    return combined, errors
 
 
-def projection_metrics(history: pd.DataFrame, projection_col: str, actual_col: str, baseline_col: str) -> dict:
-    columns = [column for column in [projection_col, actual_col, baseline_col] if column in history.columns]
-    clean = history[columns].copy()
-    clean[projection_col] = pd.to_numeric(clean[projection_col], errors="coerce")
-    clean[actual_col] = pd.to_numeric(clean[actual_col], errors="coerce")
-    clean = clean.dropna(subset=[projection_col, actual_col])
-    if clean.empty:
-        return {"N": 0, "MAE": np.nan, "RMSE": np.nan, "Bias": np.nan, "Correlation": np.nan, "Baseline_MAE": np.nan}
-    errors = clean[projection_col] - clean[actual_col]
-    baseline_mae = np.nan
-    if baseline_col in clean.columns:
-        baseline = pd.to_numeric(clean[baseline_col], errors="coerce")
-        valid = baseline.notna()
-        if valid.any():
-            baseline_mae = float((baseline[valid] - clean.loc[valid, actual_col]).abs().mean())
-    correlation = clean[[projection_col, actual_col]].corr().iloc[0, 1] if len(clean) >= 3 else np.nan
-    return {
-        "N": int(len(clean)),
-        "MAE": float(errors.abs().mean()),
-        "RMSE": float(np.sqrt(np.mean(np.square(errors)))),
-        "Bias": float(errors.mean()),
-        "Correlation": float(correlation) if not pd.isna(correlation) else np.nan,
-        "Baseline_MAE": baseline_mae,
+
+def render_slate_tools(
+    df: pd.DataFrame,
+    matchup: dict,
+    available_teams: list[str],
+    min_pa: int,
+    loaded_end: object,
+    include_low_sample: bool,
+    calibration: dict | None,
+    odds_quotes: pd.DataFrame,
+    odds_source_mode: str,
+    widget_prefix: str,
+    
+) -> None:
+    st.markdown("### Whole-slate Top 10 and three-person pairing suggestions")
+    st.caption(
+        "The Slate Grade combines probability rank, the dashboard's 0–100 model score, and confidence. "
+        "Pairings are suggestions—not guarantees—and the displayed all-three probability is an independence approximation."
+    )
+    slate_date = str(pd.Timestamp(matchup.get("slate_date") or date.today()).date())
+    games, schedule_error = fetch_mlb_schedule(slate_date)
+    if schedule_error:
+        st.warning(f"MLB slate unavailable: {schedule_error}")
+    if not games:
+        st.info("No games were available for this slate date.")
+        return
+    controls = st.columns(4)
+    with controls[0]:
+        slate_team_runs = st.number_input("Default team implied runs", 2.0, 8.0, 4.5, 0.1, key=f"{widget_prefix}_slate_runs")
+    with controls[1]:
+        slate_starter_innings = st.number_input("Default starter innings", 3.0, 7.5, 5.5, 0.5, key=f"{widget_prefix}_slate_ip")
+    with controls[2]:
+        slate_bullpen = st.number_input("Default bullpen multiplier", 0.75, 1.30, 1.00, 0.01, key=f"{widget_prefix}_slate_bullpen")
+    with controls[3]:
+        use_confirmed = st.checkbox("Use confirmed MLB lineups when posted", value=True, key=f"{widget_prefix}_slate_confirmed")
+    
+    board_key = f"{widget_prefix}_whole_slate_board_{slate_date}"
+    error_key = f"{widget_prefix}_whole_slate_errors_{slate_date}"
+    if st.button("Build / refresh whole-slate board", type="primary", width="stretch", key=f"{widget_prefix}_build_slate"):
+        with st.spinner("Building both offenses for every available game..."):
+            built, errors = build_whole_slate_model_board(
+                df, games, available_teams, min_pa, loaded_end, include_low_sample,
+                use_confirmed, slate_team_runs, slate_starter_innings, slate_bullpen,
+            )
+        st.session_state[board_key] = built
+        st.session_state[error_key] = errors
+    slate_board = st.session_state.get(board_key, pd.DataFrame())
+    build_errors = st.session_state.get(error_key, [])
+    if build_errors:
+        with st.expander("Slate-build details"):
+            for error in build_errors[:80]:
+                st.code(error)
+    if slate_board is None or slate_board.empty:
+        st.info("Press Build / refresh whole-slate board to create the Top 10 and pairing pool.")
+        return
+    slate_board = apply_binary_probability_calibration(slate_board, calibration)
+    slate_board = apply_batter_odds_to_board(slate_board, odds_quotes, odds_source_mode)
+    st.markdown("#### Top 10 settings")
+    weight_columns = st.columns(3)
+    probability_weight = weight_columns[0].slider("Probability weight", 0, 100, 45, 5, key=f"{widget_prefix}_prob_weight")
+    score_weight = weight_columns[1].slider("Model score weight", 0, 100, 35, 5, key=f"{widget_prefix}_score_weight")
+    confidence_weight = weight_columns[2].slider("Confidence weight", 0, 100, 20, 5, key=f"{widget_prefix}_confidence_weight")
+    ranked_slate = add_slate_grade(slate_board, probability_weight, score_weight, confidence_weight)
+    top_columns = [
+        "SlateRank", "Player", "Team", "Opponent", "Game", "LineupSpot",
+        BINARY_EXPECTED_COUNT_COLUMN, BINARY_PROBABILITY_COLUMN, "Model_2plus_Hit", BINARY_SCORE_COLUMN, "Confidence", "Confidence_Level",
+        "SlateGrade", "LineupStatus", "Market_Line", "Market_Over_Prob", "Model_Market_Edge", "Line_Source",
+    ]
+    top10 = ranked_slate[[column for column in top_columns if column in ranked_slate.columns]].head(10).copy()
+    top10 = top10.rename(columns={
+        BINARY_EXPECTED_COUNT_COLUMN: BINARY_EXPECTED_COUNT_LABEL,
+        BINARY_PROBABILITY_COLUMN: BINARY_TARGET_LABEL,
+        "Model_2plus_Hit": "2+ Hit",
+        BINARY_SCORE_COLUMN: "Model Score",
+        "LineupSpot": "Order",
+        "Market_Over_Prob": "No-vig Market",
+        "Model_Market_Edge": "Model Edge",
+        "Market_Line": "Line",
+    })
+    format_map = {
+        BINARY_EXPECTED_COUNT_LABEL: "{:.2f}", BINARY_TARGET_LABEL: "{:.1%}", "2+ Hit": "{:.1%}", "Model Score": "{:.1f}", "Confidence": "{:.1f}",
+        "SlateGrade": "{:.1f}", "No-vig Market": "{:.1%}", "Model Edge": "{:+.1%}", "Line": "{:.1f}", "Order": "{:.0f}",
     }
-
-
-def fit_linear_calibration(history: pd.DataFrame, projection_col: str, actual_col: str, min_rows: int = 30) -> dict:
-    clean = history[[projection_col, actual_col, "SlateDate"]].copy()
-    clean[projection_col] = pd.to_numeric(clean[projection_col], errors="coerce")
-    clean[actual_col] = pd.to_numeric(clean[actual_col], errors="coerce")
-    clean["SlateDate"] = pd.to_datetime(clean["SlateDate"], errors="coerce")
-    clean = clean.dropna(subset=[projection_col, actual_col]).sort_values("SlateDate")
-    if len(clean) < min_rows or clean[projection_col].nunique() < 2:
-        return {
-            "ok": False, "n": int(len(clean)),
-            "message": f"Need at least {min_rows} completed starts with varied projections.",
-            "slope": np.nan, "intercept": np.nan, "raw_mae": np.nan,
-            "calibrated_mae": np.nan, "holdout_n": 0,
-            "holdout_raw_mae": np.nan, "holdout_calibrated_mae": np.nan,
-        }
-    slope, intercept = np.polyfit(clean[projection_col].to_numpy(float), clean[actual_col].to_numpy(float), 1)
-    slope = float(np.clip(slope, 0.25, 1.75))
-    intercept = float(intercept)
-    calibrated = intercept + slope * clean[projection_col]
-    raw_mae = float((clean[projection_col] - clean[actual_col]).abs().mean())
-    calibrated_mae = float((calibrated - clean[actual_col]).abs().mean())
-
-    split_index = max(int(len(clean) * 0.70), min_rows // 2)
-    train = clean.iloc[:split_index]
-    test = clean.iloc[split_index:]
-    holdout_raw_mae = np.nan
-    holdout_calibrated_mae = np.nan
-    if len(train) >= 20 and len(test) >= 10 and train[projection_col].nunique() >= 2:
-        holdout_slope, holdout_intercept = np.polyfit(train[projection_col].to_numpy(float), train[actual_col].to_numpy(float), 1)
-        holdout_slope = float(np.clip(holdout_slope, 0.25, 1.75))
-        holdout_prediction = float(holdout_intercept) + holdout_slope * test[projection_col]
-        holdout_raw_mae = float((test[projection_col] - test[actual_col]).abs().mean())
-        holdout_calibrated_mae = float((holdout_prediction - test[actual_col]).abs().mean())
-    return {
-        "ok": True, "n": int(len(clean)), "slope": slope, "intercept": intercept,
-        "raw_mae": raw_mae, "calibrated_mae": calibrated_mae,
-        "holdout_n": int(len(test)), "holdout_raw_mae": holdout_raw_mae,
-        "holdout_calibrated_mae": holdout_calibrated_mae,
-    }
-
-
-def make_calibration_bundle(history: pd.DataFrame, min_rows: int = 30) -> tuple[dict, pd.DataFrame]:
-    payload = {
-        "version": MODEL_VERSION,
-        "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
-        "method": "linear_actual_equals_intercept_plus_slope_times_projection",
-        "targets": {},
-    }
-    rows: list[dict] = []
-    for target_name, config in BACKTEST_TARGETS.items():
-        fit = fit_linear_calibration(history, config["projection"], config["actual"], min_rows=min_rows)
-        row = {"Target": target_name, **fit}
-        rows.append(row)
-        if fit.get("ok"):
-            payload["targets"][target_name] = {
-                "projection_column": config["projection"],
-                "actual_column": config["actual"],
-                "intercept": fit["intercept"],
-                "slope": fit["slope"],
-                "n": fit["n"],
-            }
-    return payload, pd.DataFrame(rows)
-
-
-def poisson_prop_probabilities(mean: float, line: float) -> tuple[float, float, float]:
-    mean = max(float(mean), 0.0001)
-    line = float(line)
-    floor_line = math.floor(line)
-    is_integer = abs(line - round(line)) < 1e-9
-    over = 1.0 - poisson_cdf(floor_line, mean)
-    if is_integer:
-        under = poisson_cdf(floor_line - 1, mean) if floor_line >= 1 else 0.0
-        push = max(1.0 - over - under, 0.0)
-    else:
-        under = poisson_cdf(floor_line, mean)
-        push = 0.0
-    return float(np.clip(over, 0, 1)), float(np.clip(under, 0, 1)), float(np.clip(push, 0, 1))
-
-
-def prop_calibration_records(history: pd.DataFrame, target_name: str) -> pd.DataFrame:
-    config = BACKTEST_TARGETS[target_name]
-    projection_col, actual_col, line_col = config["projection"], config["actual"], config["line"]
-    required = [projection_col, actual_col, line_col]
-    if any(column not in history.columns for column in required):
-        return pd.DataFrame()
-    clean = history.copy()
-    for column in required:
-        clean[column] = pd.to_numeric(clean[column], errors="coerce")
-    clean = clean.dropna(subset=required)
-    if clean.empty:
-        return clean
-    records: list[dict] = []
-    for row in clean.itertuples(index=False):
-        projection = float(getattr(row, projection_col))
-        actual = float(getattr(row, actual_col))
-        line = float(getattr(row, line_col))
-        if target_name in {"Strikeouts", "Earned runs"}:
-            over, under, push_probability = poisson_prop_probabilities(projection, line)
-        else:
-            sd = pd.to_numeric(pd.Series([getattr(row, "Outs_SD", 2.5)]), errors="coerce").fillna(2.5).iloc[0]
-            over = float(np.clip(1.0 - normal_cdf(line, projection, float(sd)), 0, 1))
-            under = 1.0 - over
-            push_probability = 0.0
-        if actual == line:
-            outcome = np.nan
-        elif over >= under:
-            outcome = float(actual > line)
-        else:
-            outcome = float(actual < line)
-        no_push_total = max(over + under, 1e-9)
-        preferred_probability = max(over, under) / no_push_total
-        records.append({
-            "Target": target_name,
-            "Preferred_Side": "Over" if over >= under else "Under",
-            "Preferred_Probability": preferred_probability,
-            "Outcome": outcome,
-            "Projection": projection,
-            "Line": line,
-            "Actual": actual,
-            "Projection_Edge": projection - line,
-            "Push_Probability": push_probability,
-        })
-    return pd.DataFrame(records).dropna(subset=["Outcome"])
-
-
-def probability_calibration_table(records: pd.DataFrame) -> tuple[pd.DataFrame, float]:
-    if records is None or records.empty:
-        return pd.DataFrame(), np.nan
-    bins = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 1.001]
-    labels = ["50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75%+"]
-    frame = records.copy()
-    frame["Probability_Bucket"] = pd.cut(frame["Preferred_Probability"], bins=bins, labels=labels, right=False, include_lowest=True)
-    grouped = frame.groupby("Probability_Bucket", observed=False).agg(
-        Sample=("Outcome", "size"),
-        Average_Probability=("Preferred_Probability", "mean"),
-        Actual_Win_Rate=("Outcome", "mean"),
-    ).reset_index()
-    grouped["Calibration_Gap"] = grouped["Actual_Win_Rate"] - grouped["Average_Probability"]
-    brier = float(np.mean(np.square(frame["Preferred_Probability"] - frame["Outcome"])))
-    return grouped, brier
-
-
-def _bucket_accuracy_summary(frame: pd.DataFrame, bucket_col: str, projection_col: str, actual_col: str) -> pd.DataFrame:
-    if frame is None or frame.empty:
-        return pd.DataFrame()
-    frame = frame.copy()
-    frame["Error"] = frame[projection_col] - frame[actual_col]
-    frame["Abs_Error"] = frame["Error"].abs()
-    frame["Squared_Error"] = np.square(frame["Error"])
-    frame["Actual_Above_Projection"] = frame[actual_col] > frame[projection_col]
-    grouped = frame.groupby(bucket_col, observed=False).agg(
-        Sample=(actual_col, "size"),
-        Average_Projection=(projection_col, "mean"),
-        Average_Actual=(actual_col, "mean"),
-        MAE=("Abs_Error", "mean"),
-        RMSE=("Squared_Error", lambda values: float(np.sqrt(np.mean(values))) if len(values) else np.nan),
-        Bias=("Error", "mean"),
-        Actual_Above_Projection_Rate=("Actual_Above_Projection", "mean"),
-    ).reset_index()
-    return grouped
-
-
-def projection_bucket_edges(target_name: str) -> tuple[list[float], list[str]]:
-    if target_name == "Strikeouts":
-        return [0, 3, 4, 5, 6, 7, 8, 30], ["0–2.9", "3.0–3.9", "4.0–4.9", "5.0–5.9", "6.0–6.9", "7.0–7.9", "8.0+"]
-    if target_name == "Earned runs":
-        return [0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 20], ["0.0–1.4", "1.5–1.9", "2.0–2.4", "2.5–2.9", "3.0–3.4", "3.5–3.9", "4.0+"]
-    return [0, 12, 15, 18, 21, 24, 40], ["0–11", "12–14", "15–17", "18–20", "21–23", "24+"]
-
-
-def model_projection_bucket_table(history: pd.DataFrame, target_name: str) -> pd.DataFrame:
-    config = BACKTEST_TARGETS[target_name]
-    projection_col, actual_col = config["projection"], config["actual"]
-    required = [projection_col, actual_col]
-    if any(column not in history.columns for column in required):
-        return pd.DataFrame()
-    frame = history[required].copy()
-    for column in required:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=required)
-    if frame.empty:
-        return frame
-    bins, labels = projection_bucket_edges(target_name)
-    frame["Projection_Bucket"] = pd.cut(frame[projection_col], bins=bins, labels=labels, include_lowest=True, right=False)
-    return _bucket_accuracy_summary(frame, "Projection_Bucket", projection_col, actual_col)
-
-
-def score_bucket_table(history: pd.DataFrame, target_name: str) -> pd.DataFrame:
-    config = BACKTEST_TARGETS[target_name]
-    score_col, projection_col, actual_col = config["score"], config["projection"], config["actual"]
-    required = [score_col, projection_col, actual_col]
-    if any(column not in history.columns for column in required):
-        return pd.DataFrame()
-    frame = history[required].copy()
-    for column in required:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame = frame.dropna(subset=required)
-    if frame.empty:
-        return frame
-    bins = [-0.001, 30, 45, 55, 70, 85, 100.001]
-    labels = ["0–29", "30–44", "45–54", "55–69", "70–84", "85–100"]
-    frame["Score_Bucket"] = pd.cut(frame[score_col], bins=bins, labels=labels, include_lowest=True, right=False)
-    grouped = _bucket_accuracy_summary(frame, "Score_Bucket", projection_col, actual_col)
-    if not grouped.empty:
-        avg_score = frame.groupby("Score_Bucket", observed=False)[score_col].mean().reset_index(name="Average_Score")
-        grouped = grouped.merge(avg_score, on="Score_Bucket", how="left")
-    return grouped
-
-
-def grouped_accuracy(history: pd.DataFrame, group_column: str) -> pd.DataFrame:
-    if group_column not in history.columns:
-        return pd.DataFrame()
-    rows: list[dict] = []
-    for group_value, group in history.groupby(group_column, dropna=False):
-        for target_name, config in BACKTEST_TARGETS.items():
-            metrics = projection_metrics(group, config["projection"], config["actual"], config["baseline"])
-            if metrics["N"]:
-                rows.append({"Group": str(group_value), "Target": target_name, **metrics})
-    return pd.DataFrame(rows)
-
-
-# -----------------------------------------------------------------------------
-# UI helpers
-# -----------------------------------------------------------------------------
-
-def inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        :root { --ink:#0f172a; --muted:#64748b; }
-        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"], .stApp {
-            background:#ffffff !important; color:var(--ink) !important;
-        }
-        [data-testid="stHeader"] { background:rgba(255,255,255,.96) !important; }
-        .block-container { max-width:1800px; padding-top:1rem; padding-bottom:2.5rem; }
-        [data-testid="stSidebar"] { background:linear-gradient(180deg,#071b33,#0f3b66 58%,#164e63); }
-        [data-testid="stSidebar"] * { color:#f8fafc; }
-        [data-testid="stSidebar"] input { color:#0f172a !important; }
-        .app-kicker { display:inline-flex; padding:.35rem .75rem; border-radius:999px; color:white;
-            background:linear-gradient(90deg,#0ea5e9,#2563eb,#7c3aed); font-size:.72rem; font-weight:900;
-            letter-spacing:.11em; text-transform:uppercase; box-shadow:0 8px 20px rgba(37,99,235,.22); }
-        .hero { border-radius:24px; padding:1.1rem 1.25rem; margin:.7rem 0 1rem;
-            background:linear-gradient(115deg,#082f49,#1d4ed8,#6d28d9); color:white;
-            box-shadow:0 18px 38px rgba(15,23,42,.18); }
-        .hero h2 { color:white; margin:0; }
-        .hero p { color:#dbeafe; margin:.25rem 0 0; }
-        div[data-testid="stMetric"] { background:linear-gradient(145deg,#ffffff,#eff6ff); border:1px solid #bfdbfe;
-            border-radius:17px; padding:.8rem 1rem; box-shadow:0 9px 24px rgba(15,23,42,.07); }
-        [data-testid="stDataFrame"] { border:1px solid #cbd5e1; border-radius:14px; overflow:hidden; }
-        [data-baseweb="tab"] { background:#f8fafc; border-radius:10px 10px 0 0; }
-        .leader { background:linear-gradient(145deg,#ffffff,#f0f9ff); border:1px solid #bae6fd; border-radius:17px;
-            padding:.95rem 1rem; min-height:128px; box-shadow:0 10px 25px rgba(15,23,42,.07); }
-        .leader .label { font-size:.72rem; font-weight:900; color:#64748b; letter-spacing:.08em; }
-        .leader .name { font-size:1.1rem; font-weight:900; color:#0f172a; margin:.2rem 0; }
-        .leader .value { font-size:1.55rem; font-weight:950; color:#0369a1; }
-        .note { background:#eff6ff; border-left:5px solid #2563eb; border-radius:12px; padding:.75rem .9rem; color:#334155; }
-        </style>
-        """,
-        unsafe_allow_html=True,
+    score_subsets = [column for column in ["Model Score", "Confidence", "SlateGrade"] if column in top10.columns]
+    top_style = top10.style
+    if score_subsets:
+        top_style = top_style.background_gradient(cmap="RdYlGn", subset=score_subsets, vmin=0, vmax=100)
+    st.dataframe(top_style.format({key: value for key, value in format_map.items() if key in top10.columns}, na_rep="—"), width="stretch", hide_index=True)
+    st.download_button(
+        "Download whole-slate board",
+        ranked_slate.to_csv(index=False).encode("utf-8"),
+        file_name=f"{BINARY_TARGET_SLUG}_whole_slate_{slate_date}.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    st.markdown("#### Generate multiple three-person pairings")
+    pairing_controls_1 = st.columns(4)
+    pair_count = pairing_controls_1[0].slider("Number of pairings", 1, 20, 10, 1, key=f"{widget_prefix}_pair_count")
+    pool_size = pairing_controls_1[1].slider("Candidate pool", 6, min(30, max(6, len(ranked_slate))), min(15, max(6, len(ranked_slate))), 1, key=f"{widget_prefix}_pool_size")
+    minimum_confidence = pairing_controls_1[2].slider("Minimum confidence", 0, 90, 45, 5, key=f"{widget_prefix}_min_conf")
+    max_same_team = pairing_controls_1[3].selectbox("Max hitters from one team", [1, 2, 3], index=0, key=f"{widget_prefix}_max_team")
+    pairing_controls_2 = st.columns(3)
+    require_different_games = pairing_controls_2[0].checkbox("Require three different games", value=True, key=f"{widget_prefix}_different_games")
+    style = pairing_controls_2[1].selectbox("Pairing style", ["Balanced", "Highest probability", "Model strength", "Market edge"], key=f"{widget_prefix}_pair_style")
+    diversity = pairing_controls_2[2].slider("Player-exposure diversity", 0.0, 10.0, 3.0, 0.5, key=f"{widget_prefix}_diversity")
+    if style == "Market edge" and not pd.to_numeric(ranked_slate.get("Model_Market_Edge"), errors="coerce").notna().any():
+        st.warning("Market-edge style needs fetched sportsbook odds. It will behave close to Balanced until lines are available.")
+    pairings = generate_three_man_pairings(
+        ranked_slate, pair_count, pool_size, minimum_confidence, max_same_team,
+        require_different_games, style, diversity,
+    )
+    if pairings.empty:
+        st.warning("No valid three-person combinations met the selected restrictions. Increase the pool or loosen team/game limits.")
+        return
+    pairing_view = pairings.copy()
+    display_columns = [
+        "Pairing", "Player 1", "Leg 1", "Player 2", "Leg 2", "Player 3", "Leg 3",
+        "PairingScore", "EstimatedAll3Probability", "AverageLegProbability",
+        "MinimumConfidence", "AverageMarketEdge", "Games",
+    ]
+    pairing_view = pairing_view[[column for column in display_columns if column in pairing_view.columns]]
+    st.dataframe(
+        pairing_view.style.background_gradient(cmap="RdYlGn", subset=[column for column in ["PairingScore", "MinimumConfidence"] if column in pairing_view.columns], axis=0).format({
+            "PairingScore": "{:.1f}", "EstimatedAll3Probability": "{:.2%}",
+            "AverageLegProbability": "{:.1%}", "MinimumConfidence": "{:.1f}",
+            "AverageMarketEdge": "{:+.1%}",
+        }, na_rep="—"),
+        width="stretch", hide_index=True, height=600,
+    )
+    st.caption(
+        "Estimated all-three probability multiplies the three model probabilities and assumes independence. "
+        "Same-game and same-team outcomes can be correlated, so treat it as a comparison tool rather than an exact entry probability."
     )
 
 
-def score_label(value: float) -> str:
-    value = float(value)
-    if value >= 85:
-        return "Elite"
-    if value >= 70:
-        return "Strong"
-    if value >= 55:
-        return "Above average"
-    if value >= 45:
-        return "Neutral"
-    if value >= 30:
-        return "Weak"
-    return "Poor"
-
-
-def render_leader(row: pd.Series, label: str, value_text: str, sub_text: str) -> None:
-    st.markdown(
-        f"""
-        <div class="leader">
-            <div class="label">{escape(label.upper())}</div>
-            <div class="name">{escape(str(row['Pitcher']))}</div>
-            <div class="value">{escape(value_text)}</div>
-            <div style="color:#64748b;font-size:.82rem;">{escape(sub_text)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Table color system
-# -----------------------------------------------------------------------------
-
-FAVORABLE_BG = "background-color:#dcfce7;color:#14532d;font-weight:800;"
-FAVORABLE_SOFT_BG = "background-color:#ecfdf5;color:#166534;font-weight:750;"
-WARNING_BG = "background-color:#fef3c7;color:#92400e;font-weight:760;"
-UNFAVORABLE_BG = "background-color:#fee2e2;color:#991b1b;font-weight:800;"
-UNFAVORABLE_SOFT_BG = "background-color:#fff1f2;color:#9f1239;font-weight:750;"
-POWER_BG = "background-color:#dbeafe;color:#1e3a8a;font-weight:820;"
-NEUTRAL_BG = "background-color:#fffdf8;color:#162033;"
-HEADER_BG = "background-color:#102033;color:#f8fafc;font-weight:900;"
-
-
-def _column_styles_by_percentile(series: pd.Series, higher_is_better: bool = True) -> list[str]:
-    """Red/yellow/green table colors where green always means favorable for the pitcher."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    styles = [NEUTRAL_BG] * len(series)
-    if numeric.notna().sum() < 2 or numeric.nunique(dropna=True) < 2:
-        return styles
-    ranks = numeric.rank(pct=True, method="average")
-    if not higher_is_better:
-        ranks = 1.0 - ranks
-    output: list[str] = []
-    for value, rank in zip(numeric, ranks):
-        if pd.isna(value) or pd.isna(rank):
-            output.append(NEUTRAL_BG)
-        elif rank >= 0.80:
-            output.append(FAVORABLE_BG)
-        elif rank >= 0.62:
-            output.append(FAVORABLE_SOFT_BG)
-        elif rank <= 0.20:
-            output.append(UNFAVORABLE_BG)
-        elif rank <= 0.38:
-            output.append(WARNING_BG)
-        else:
-            output.append(NEUTRAL_BG)
-    return output
-
-
-def _edge_styles(series: pd.Series, *, lower_is_better_target: bool = False) -> list[str]:
-    """Style prop edges. For K/Outs, positive edge favors over; for ER, positive edge is run-risk."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    styles: list[str] = []
-    for value in numeric:
-        if pd.isna(value):
-            styles.append(NEUTRAL_BG)
-            continue
-        # ER edge above line means the pitcher is projected for more runs: risky for pitcher.
-        if lower_is_better_target:
-            if value <= -0.50:
-                styles.append(FAVORABLE_BG)
-            elif value < 0:
-                styles.append(FAVORABLE_SOFT_BG)
-            elif value >= 0.75:
-                styles.append(UNFAVORABLE_BG)
-            elif value > 0:
-                styles.append(WARNING_BG)
-            else:
-                styles.append(NEUTRAL_BG)
-        else:
-            if value >= 1.00:
-                styles.append(FAVORABLE_BG)
-            elif value > 0:
-                styles.append(FAVORABLE_SOFT_BG)
-            elif value <= -1.00:
-                styles.append(UNFAVORABLE_BG)
-            elif value < 0:
-                styles.append(WARNING_BG)
-            else:
-                styles.append(NEUTRAL_BG)
-    return styles
-
-
-def _risk_note_styles(series: pd.Series) -> list[str]:
-    styles: list[str] = []
-    for value in series.fillna("").astype(str):
-        text = value.lower()
-        if text == "clean" or text.strip() == "":
-            styles.append(FAVORABLE_SOFT_BG)
-        elif any(token in text for token in ["high", "risk", "caution", "hook", "command", "volatility"]):
-            styles.append(UNFAVORABLE_SOFT_BG)
-        else:
-            styles.append(WARNING_BG)
-    return styles
-
-
-def style_board(frame: pd.DataFrame, score_columns: list[str], lower_better: list[str] | None = None):
-    """Pitcher-friendly table styling.
-
-    Green always means favorable for the pitcher or for the displayed prop side.
-    Red always means unfavorable / contact / hit / HR / run-risk / short-hook risk.
-    This avoids matplotlib-dependent gradients and works on Streamlit Cloud.
-    """
-    lower_better = lower_better or []
-    styler = frame.style.set_table_styles([
-        {"selector": "th", "props": [("background-color", "#102033"), ("color", "#f8fafc"), ("font-weight", "900"), ("border", "1px solid #d9cdb9")]},
-        {"selector": "td", "props": [("background-color", "#fffdf8"), ("color", "#162033"), ("border", "1px solid #efe4d3")]},
-        {"selector": "tbody tr:hover td", "props": [("background-color", "#eef8f7")]},
-    ])
-
-    # Projection/score/signal columns: higher values are good unless explicitly passed as lower_better.
-    for column in score_columns:
-        if column in frame.columns:
-            styler = styler.apply(
-                lambda s, col=column: _column_styles_by_percentile(s, higher_is_better=col not in lower_better),
-                subset=[column],
-                axis=0,
-            )
-
-    # Risk columns: lower is favorable for the pitcher. These are hit/HR/run/contact risk signals.
-    for column in lower_better:
-        if column in frame.columns and column not in score_columns:
-            styler = styler.apply(
-                lambda s: _column_styles_by_percentile(s, higher_is_better=False),
-                subset=[column],
-                axis=0,
-            )
-
-    # Projection edge columns get explicit red/green side logic.
-    for column in frame.columns:
-        col_text = str(column).lower()
-        if "edge" in col_text:
-            er_like = col_text.startswith("er") or "earned" in col_text or "run" in col_text
-            styler = styler.apply(
-                lambda s, er_like=er_like: _edge_styles(s, lower_is_better_target=er_like),
-                subset=[column],
-                axis=0,
-            )
-        elif "risk note" in col_text or "projection_risk_note" in col_text:
-            styler = styler.apply(_risk_note_styles, subset=[column], axis=0)
-
-    return styler
-
-
-def render_color_legend(location: str = "dashboard") -> None:
-    """Render a compact legend explaining the table colors."""
-    st.markdown(
-        f"""
-        <div class="legend-card">
-            <div class="legend-title">Table Color Key · {escape(str(location).title())}</div>
-            <div class="legend-grid">
-                <div class="legend-item"><span class="legend-swatch favorable"></span><b>Green</b><span>Favorable for pitcher / strong support</span></div>
-                <div class="legend-item"><span class="legend-swatch warning"></span><b>Yellow</b><span>Caution or mixed signal</span></div>
-                <div class="legend-item"><span class="legend-swatch unfavorable"></span><b>Red</b><span>Unfavorable: hit, HR, run, walk, contact, or hook risk</span></div>
-                <div class="legend-item"><span class="legend-swatch blue"></span><b>Blue</b><span>Projection/score strength or model power signal</span></div>
-            </div>
-            <div class="legend-note">
-                For K/Outs tables, higher green values usually support pitcher overs. For ER/run-risk tables, red means more damage risk; green means run prevention.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-
-
-
-# -----------------------------------------------------------------------------
-# Sleek Edge theme overlay
-# -----------------------------------------------------------------------------
 def inject_edge_theme() -> None:
     st.markdown(
         """
@@ -2935,22 +5189,6 @@ def inject_edge_theme() -> None:
         [data-testid="stTable"] tbody tr:hover, [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"] { background:#eef8f7 !important; }
         .streamlit-expanderHeader { background:#fffdf8 !important; border:1px solid var(--line) !important; border-radius:14px !important; font-weight:850 !important; color:var(--ink) !important; }
         .stAlert { border-radius:14px !important; }
-        .legend-card {
-            background:linear-gradient(145deg,#fffdf8,#fff7ea); border:1px solid #eadfce;
-            border-radius:18px; padding:.85rem 1rem; box-shadow:0 8px 22px rgba(38,28,12,.07);
-            margin:.45rem 0 1rem;
-        }
-        .legend-title { font-weight:950; color:#102033; margin-bottom:.55rem; letter-spacing:-.01em; }
-        .legend-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.55rem; }
-        .legend-item { display:flex; align-items:center; gap:.45rem; padding:.48rem .55rem; border-radius:12px; background:#ffffff; border:1px solid #efe4d3; font-size:.82rem; }
-        .legend-item span:last-child { color:#64748b; font-size:.75rem; }
-        .legend-swatch { width:18px; height:18px; border-radius:6px; display:inline-block; border:1px solid rgba(15,23,42,.10); flex:0 0 auto; }
-        .legend-swatch.favorable { background:#22c55e; }
-        .legend-swatch.warning { background:#f59e0b; }
-        .legend-swatch.unfavorable { background:#ef4444; }
-        .legend-swatch.blue { background:#3b82f6; }
-        .legend-note { margin-top:.5rem; color:#64748b; font-size:.78rem; }
-        @media (max-width: 1100px) { .legend-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
         hr { border-color:#e6dac7 !important; }
         </style>
         """,
@@ -2965,12 +5203,12 @@ def render_edge_header() -> None:
             <div class="edge-brand">
                 <div class="edge-logo">⚾</div>
                 <div>
-                    <div class="edge-brand-title">PITCH EDGE</div>
-                    <div class="edge-brand-subtitle">Pitcher prop projections & model accuracy</div>
+                    <div class="edge-brand-title">HITS EDGE</div>
+                    <div class="edge-brand-subtitle">1+ hit & 2-hit probability lab</div>
                 </div>
             </div>
             <div class="edge-nav">
-                <span class="edge-nav-item active">Dashboard</span><span class="edge-nav-item">Matchups</span><span class="edge-nav-item">Pitchers</span><span class="edge-nav-item">Lineups</span><span class="edge-nav-item">Park Factors</span><span class="edge-nav-item">Backtest</span><span class="edge-nav-item">Settings</span>
+                <span class="edge-nav-item active">Dashboard</span><span class="edge-nav-item">Matchups</span><span class="edge-nav-item">Players</span><span class="edge-nav-item">Lineups</span><span class="edge-nav-item">Park Factors</span><span class="edge-nav-item">Backtest</span><span class="edge-nav-item">Settings</span>
             </div>
             <div class="edge-meta">
                 <span>☾</span>
@@ -2982,777 +5220,661 @@ def render_edge_header() -> None:
         unsafe_allow_html=True,
     )
 
-inject_css()
+inject_clean_css()
 inject_edge_theme()
 render_edge_header()
-st.caption('Sleek model dashboard for strikeouts, earned runs, outs, score buckets, and projection accuracy.')
-render_color_legend('pitcher dashboard')
-st.caption("Projected strikeouts, earned runs, outs, opponent-lineup fit, pitch-type matchups and 0–100 category scores.")
+MODEL_KEY = "clean_hits"
+odds_api_key = read_streamlit_secret("THE_ODDS_API_KEY")
+
+st.caption('Sleek model dashboard for 1+ hit probability, 2+ hit probability, score validation, slate Top 10, pairing suggestions, and matchup context.')
+st.caption(
+    "A one-hit-first model with a supplemental 2+ hit probability, expected batting average, contact skill, pitch-shape fit, "
+    "zone fit, platoon splits, pitcher vulnerability, recent form and projected opportunities."
+)
 
 with st.sidebar:
-    st.header("Pitcher slate")
-    slate_date = st.date_input("Slate date", value=date.today(), key="pitcher_slate_date")
-    lookback_days = st.slider("Statcast lookback days", 21, 90, 45, 3)
-    min_starts = st.slider("Minimum starts for full confidence", 1, 8, 3)
-    include_tbd = st.checkbox("Show games with one probable pitcher TBD", value=False)
-    calibration_upload = st.file_uploader("Optional calibration JSON", type=["json"], key="pitcher_calibration_upload")
-    uploaded_calibration: dict = {}
-    if calibration_upload is not None:
-        try:
-            uploaded_calibration = parse_calibration_payload(json.loads(calibration_upload.getvalue().decode("utf-8-sig")))
-            if uploaded_calibration:
-                st.success("Calibration file loaded. Rebuild the board to apply it.")
-            else:
-                st.warning("The calibration JSON did not contain valid K, ER or outs coefficients.")
-        except Exception as exc:
-            st.warning(f"Calibration file could not be read: {type(exc).__name__}: {exc}")
-    session_calibration = parse_calibration_payload(st.session_state.get("pitcher_calibration", {}))
-    active_calibration = uploaded_calibration or session_calibration
-    st.caption("The model automatically uses posted MLB lineups and falls back to the most recent observed batting order.")
+    st.header("Statcast sample")
+    yesterday = date.today() - timedelta(days=1)
+    end_date_value = st.date_input(
+        "Stats through",
+        value=yesterday,
+        max_value=yesterday,
+        key="clean_hits_end_date",
+    )
+    lookback_days = st.slider(
+        "Lookback days", 21, 120, 60, 7, key="clean_hits_lookback"
+    )
+    min_pa = st.slider(
+        "Minimum hitter PA", 10, 100, 30, 5, key="clean_hits_min_pa"
+    )
+    include_low_sample = st.checkbox(
+        "Include active-roster hitters below the PA threshold",
+        value=True,
+        key="clean_hits_include_low_sample",
+        help="Roster players with little or no Statcast history are included with league-average priors and Low confidence.",
+    )
+    refresh = st.button(
+        "Load / refresh Statcast", type="primary", key="clean_hits_refresh"
+    )
     st.divider()
-    st.subheader("Automatic prop lines")
-    secret_odds_key = read_streamlit_secret("THE_ODDS_API_KEY")
-    if secret_odds_key:
-        odds_api_key = secret_odds_key
-        st.success("The Odds API key loaded from Streamlit Secrets.")
-    else:
-        odds_api_key = st.text_input(
-            "The Odds API key (session only)",
-            type="password",
-            help="Recommended: save THE_ODDS_API_KEY in Streamlit Secrets. This field is only a temporary fallback.",
-            key="pitcher_odds_api_key_input",
-        ).strip()
-        st.caption("Add THE_ODDS_API_KEY to Streamlit Secrets so the key survives a reboot.")
-    odds_source_mode = st.selectbox(
-        "Default line source",
-        ODDS_SOURCE_OPTIONS,
-        index=0,
-        key="pitcher_odds_source_mode",
+    st.subheader("Probability calibration")
+    hits_calibration_upload = st.file_uploader(
+        "Optional hits calibration JSON", type=["json"], key="clean_hits_calibration_upload"
     )
-    st.caption("Props are fetched only when you press the fetch button, preventing accidental API-credit use on every Streamlit rerun.")
-    build_button = st.button("Build / refresh pitcher board", type="primary", width="stretch")
-    if st.button("Clear odds cache and loaded lines", width="stretch"):
-        fetch_odds_api_events.clear()
-        fetch_odds_api_event_props.clear()
-        st.session_state.pop("pitcher_odds_quotes", None)
-        st.session_state.pop("pitcher_odds_meta", None)
-        st.session_state.pop("pitcher_odds_errors", None)
-        st.rerun()
-    if st.button("Clear cached MLB data", width="stretch"):
-        fetch_mlb_schedule.clear()
-        fetch_game_lineups.clear()
-        fetch_pitcher_game_log.clear()
-        fetch_game_weather.clear()
-        st.cache_data.clear()
-        st.rerun()
-
-schedule, schedule_error = fetch_mlb_schedule(str(slate_date))
-if schedule_error:
-    st.error(f"Could not load the MLB slate: {schedule_error}")
-elif not schedule:
-    st.info("No MLB games were returned for the selected date.")
-else:
-    probable_count = sum(int(game.get("away_pitcher_id") is not None) + int(game.get("home_pitcher_id") is not None) for game in schedule)
-    st.markdown(
-        f"""
-        <div class="hero">
-            <h2>{len(schedule)} games · {probable_count} probable starters</h2>
-            <p>{escape(str(slate_date))} · MLB schedule, posted lineups, park context and first-pitch weather.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-if build_button and schedule:
-    end_date = pd.Timestamp(slate_date) - pd.Timedelta(days=1)
-    start_date = end_date - pd.Timedelta(days=int(lookback_days) - 1)
-    with st.spinner(f"Loading Statcast from {start_date.date()} through {end_date.date()}..."):
-        try:
-            raw = load_statcast(str(start_date.date()), str(end_date.date()))
-            prepared = prepare_statcast(raw)
-        except Exception as exc:
-            st.error(f"Statcast could not be loaded: {type(exc).__name__}: {exc}")
-            prepared = pd.DataFrame()
-    if not prepared.empty:
-        league = league_context(prepared)
-        rows: list[dict] = []
-        details: dict[str, dict] = {}
-        progress = st.progress(0.0, text="Building pitcher projections...")
-        total_games = max(len(schedule), 1)
-        for game_index, game in enumerate(schedule):
-            lineups = fetch_game_lineups(game.get("game_pk"))
-            weather = automatic_weather(game)
-            configurations = [
-                {
-                    "pitcher_id": game.get("away_pitcher_id"), "pitcher_name": game.get("away_pitcher_name"),
-                    "pitcher_team": game.get("away_abbr"), "opponent_team": game.get("home_abbr"),
-                    "opponent_side": "home", "lineup": lineups.get("home", pd.DataFrame()),
-                    "lineup_status": lineups.get("home_status", "Not posted"),
-                },
-                {
-                    "pitcher_id": game.get("home_pitcher_id"), "pitcher_name": game.get("home_pitcher_name"),
-                    "pitcher_team": game.get("home_abbr"), "opponent_team": game.get("away_abbr"),
-                    "opponent_side": "away", "lineup": lineups.get("away", pd.DataFrame()),
-                    "lineup_status": lineups.get("away_status", "Not posted"),
-                },
-            ]
-            for config in configurations:
-                if config["pitcher_id"] is None:
-                    if include_tbd:
-                        continue
-                    continue
-                lineup = config["lineup"]
-                lineup_status = config["lineup_status"]
-                if lineup is None or lineup.empty:
-                    lineup = infer_recent_lineup(prepared, str(config["opponent_team"]))
-                    lineup_status = "Recent fallback" if not lineup.empty else "Not posted"
-                try:
-                    row, detail = build_pitcher_projection(
-                        prepared, league, game, int(config["pitcher_id"]), str(config["pitcher_name"]),
-                        str(config["pitcher_team"]), str(config["opponent_team"]), str(config["opponent_side"]),
-                        lineup, lineup_status, weather, int(pd.Timestamp(slate_date).year),
-                    )
-                    if row["Starts"] < min_starts:
-                        row["Confidence"] *= 0.82
-                        row["Confidence_Level"] = "Low" if row["Confidence"] < 45 else "Medium"
-                    key = f"{row['GamePK']}:{row['PitcherID']}"
-                    row["DetailKey"] = key
-                    details[key] = detail
-                    rows.append(row)
-                except Exception as exc:
-                    st.warning(f"Skipped {config['pitcher_name']}: {type(exc).__name__}: {exc}")
-            progress.progress((game_index + 1) / total_games, text=f"Processed {game_index + 1} of {total_games} games")
-        progress.empty()
-        if rows:
-            raw_board = pd.DataFrame(rows)
-            calibrated_board = apply_projection_calibration(raw_board, active_calibration)
-            board = assign_scores(calibrated_board)
-            st.session_state["pitcher_board"] = board
-            st.session_state["pitcher_details"] = details
-            st.session_state["pitcher_window"] = f"{start_date.date()} to {end_date.date()}"
-            st.session_state["pitcher_lookback_days"] = int(lookback_days)
-            st.session_state["pitcher_generated_at"] = pd.Timestamp.now(tz="UTC").isoformat()
-        else:
-            st.warning("No probable pitchers could be projected from the selected slate.")
-
-base_board = st.session_state.get("pitcher_board", pd.DataFrame())
-details = st.session_state.get("pitcher_details", {})
-
-if base_board.empty:
-    st.info("Choose a slate date and press **Build / refresh pitcher board**.")
-    st.stop()
-
-loaded_quotes = st.session_state.get("pitcher_odds_quotes", pd.DataFrame())
-board = apply_odds_quotes_to_board(base_board, loaded_quotes, odds_source_mode) if loaded_quotes is not None and not loaded_quotes.empty else base_board.copy()
-
-with st.expander("Automatic sportsbook / PrizePicks pitcher lines", expanded=loaded_quotes is None or loaded_quotes.empty):
-    unique_games = board[["GamePK", "Game"]].drop_duplicates().copy()
-    unique_games["GamePK"] = pd.to_numeric(unique_games["GamePK"], errors="coerce")
-    unique_games = unique_games.dropna(subset=["GamePK"])
-    game_label_to_pk = {
-        str(row.Game): int(row.GamePK)
-        for row in unique_games.itertuples(index=False)
-    }
-    game_labels = list(game_label_to_pk.keys())
-    selected_odds_games = st.multiselect(
-        "Games to fetch",
-        game_labels,
-        default=game_labels,
-        key=f"pitcher_odds_games_{slate_date}",
-        help="Each game request asks for strikeouts, earned runs and outs. Selecting fewer games preserves API credits.",
-    )
-    estimated_credits = 3 * len(selected_odds_games)
-    st.caption(
-        f"Maximum expected cost: about {estimated_credits} credits ({len(selected_odds_games)} games × 3 markets). "
-        "The actual cost can be lower when a requested market is unavailable. Responses are cached for five minutes."
-    )
-    fetch_col, clear_col = st.columns([2, 1])
-    with fetch_col:
-        fetch_odds_button = st.button("Fetch / refresh selected prop lines", type="primary", width="stretch")
-    with clear_col:
-        clear_loaded_button = st.button("Clear loaded lines", width="stretch", key="clear_loaded_pitcher_lines")
-    if clear_loaded_button:
-        st.session_state.pop("pitcher_odds_quotes", None)
-        st.session_state.pop("pitcher_odds_meta", None)
-        st.session_state.pop("pitcher_odds_errors", None)
-        st.rerun()
-    if fetch_odds_button:
-        if not odds_api_key:
-            st.error("Add THE_ODDS_API_KEY in Streamlit Secrets or enter the key in the sidebar.")
-        elif not selected_odds_games:
-            st.warning("Select at least one game.")
-        else:
-            selected_game_pks = [game_label_to_pk[label] for label in selected_odds_games]
-            with st.spinner("Matching MLB events and loading pitcher props..."):
-                new_quotes, odds_meta, odds_errors = fetch_pitcher_prop_quotes(odds_api_key, schedule, selected_game_pks)
-            combined_quotes = combine_odds_quote_frames(loaded_quotes, new_quotes, slate_date)
-            st.session_state["pitcher_odds_quotes"] = combined_quotes
-            st.session_state["pitcher_odds_meta"] = odds_meta
-            st.session_state["pitcher_odds_errors"] = odds_errors
-            st.session_state["pitcher_odds_last_fetch"] = pd.Timestamp.now(tz="UTC").isoformat()
+    if hits_calibration_upload is not None:
+        calibration_signature = (
+            getattr(hits_calibration_upload, "name", "calibration.json"),
+            getattr(hits_calibration_upload, "size", None),
+        )
+        signature_key = "hits_calibration_upload_signature"
+        if st.session_state.get(signature_key) != calibration_signature:
+            uploaded_calibration, calibration_error = parse_binary_calibration_upload(hits_calibration_upload)
+            if calibration_error:
+                st.error(calibration_error)
+            elif uploaded_calibration:
+                st.session_state["hits_probability_calibration"] = uploaded_calibration
+                st.session_state[signature_key] = calibration_signature
+    if st.session_state.get("hits_probability_calibration"):
+        loaded_calibration = st.session_state["hits_probability_calibration"]
+        st.caption(
+            f"Calibration active · n={int(loaded_calibration.get('n', 0)):,} · "
+            f"slope {float(loaded_calibration.get('slope', 1.0)):.3f}"
+        )
+        if st.button("Clear hits calibration", key="clean_hits_clear_calibration"):
+            st.session_state.pop("hits_probability_calibration", None)
             st.rerun()
 
-    odds_meta = st.session_state.get("pitcher_odds_meta", {})
-    odds_errors = st.session_state.get("pitcher_odds_errors", [])
-    if odds_meta:
-        meta_cols = st.columns(4)
-        meta_cols[0].metric("Events queried", odds_meta.get("events_queried", "—"))
-        meta_cols[1].metric("Credits this fetch", odds_meta.get("estimated_credits_used_this_fetch", "—"))
-        meta_cols[2].metric("Credits remaining", odds_meta.get("requests_remaining", "—"))
-        meta_cols[3].metric("Current source", odds_source_mode)
-    if odds_errors:
-        with st.expander(f"Unavailable or unmatched lines ({len(odds_errors)})"):
-            for error in odds_errors:
-                st.write(f"• {error}")
-    if loaded_quotes is not None and not loaded_quotes.empty:
-        line_columns = [
-            "Pitcher", "Game", "K_Line", "K_Over_Odds", "K_Under_Odds", "K_Line_Source",
-            "ER_Line", "ER_Over_Odds", "ER_Under_Odds", "ER_Line_Source",
-            "Outs_Line", "Outs_Over_Odds", "Outs_Under_Odds", "Outs_Line_Source",
-        ]
-        line_columns = [column for column in line_columns if column in board.columns]
-        line_preview = board[line_columns].copy()
-        for column in ["K_Over_Odds", "K_Under_Odds", "ER_Over_Odds", "ER_Under_Odds", "Outs_Over_Odds", "Outs_Under_Odds"]:
-            if column in line_preview.columns:
-                line_preview[column] = line_preview[column].map(format_american_odds)
-        st.dataframe(line_preview, width="stretch", hide_index=True, height=min(480, 38 * (len(line_preview) + 1)))
-        if odds_source_mode == "PrizePicks":
-            st.caption("PrizePicks odds/multipliers returned by the provider are indicative. The projection line is the main field used by this model.")
 
-window_text = st.session_state.get("pitcher_window", "")
-calibration_note = " · Saved calibration applied" if bool(board.get("Calibration_Applied", pd.Series(False, index=board.index)).any()) else ""
-st.caption(f"Statcast sample: {window_text}{calibration_note}. Scores are relative comparisons within the current slate; projections are estimates, not guarantees.")
-
-leaders = st.columns(4)
-with leaders[0]:
-    render_leader(board.sort_values("Proj_K", ascending=False).iloc[0], "Top K projection", f"{board['Proj_K'].max():.1f} K", "Ranked by projected strikeouts")
-with leaders[1]:
-    er_row = board.sort_values("Proj_ER").iloc[0]
-    render_leader(er_row, "Best run prevention", f"{er_row['Proj_ER']:.2f} ER", f"Score {er_row['Run_Prevention_Score']:.0f}")
-with leaders[2]:
-    outs_row = board.sort_values("Proj_Outs", ascending=False).iloc[0]
-    render_leader(outs_row, "Deepest outing", f"{outs_row['Proj_Outs']:.1f} outs", f"{outs_row['Proj_Innings']:.1f} projected innings")
-with leaders[3]:
-    overall_row = board.iloc[0]
-    render_leader(overall_row, "Best overall", f"{overall_row['Overall_Score']:.0f}", score_label(overall_row["Overall_Score"]))
-
-(
-    board_tab, k_tab, er_tab, outs_tab, lineup_tab, pitch_tab, logs_tab, lines_tab, backtest_tab, notes_tab
-) = st.tabs([
-    "Pitcher board", "Strikeouts", "Earned runs", "Outs / innings", "Opponent lineup",
-    "Pitch-type matchup", "Recent starts", "Line comparison", "Backtest & calibration", "Model notes",
-])
-
-with board_tab:
-    render_color_legend('main board')
-    columns = [
-        "Rank", "Pitcher", "Team", "Opponent", "Game", "Proj_K", "Proj_ER", "Proj_Outs",
-        "K_Score", "Run_Prevention_Score", "Outs_Score", "Overall_Score", "Confidence_Level", "Lineup_Status",
-    ]
-    automatic_columns = [
-        "K_Line", "K_Projection_Edge", "ER_Line", "ER_Projection_Edge",
-        "Outs_Line", "Outs_Projection_Edge", "K_Line_Source",
-    ]
-    for automatic_column in automatic_columns:
-        if automatic_column in board.columns:
-            values = board[automatic_column]
-            if values.astype(str).str.strip().ne("").any() and not (pd.api.types.is_numeric_dtype(values) and values.isna().all()):
-                columns.append(automatic_column)
-    display = board[columns].copy().rename(
-        columns={
-            "Proj_K": "Proj K", "Proj_ER": "Proj ER", "Proj_Outs": "Proj Outs",
-            "K_Score": "K Score", "Run_Prevention_Score": "Run Prevention",
-            "Outs_Score": "Outs Score", "Overall_Score": "Overall", "Confidence_Level": "Confidence",
-            "Lineup_Status": "Lineup", "K_Line": "K Line", "K_Projection_Edge": "K Edge",
-            "ER_Line": "ER Line", "ER_Projection_Edge": "ER Edge", "Outs_Line": "Outs Line",
-            "Outs_Projection_Edge": "Outs Edge", "K_Line_Source": "Line Source",
-        }
-    )
-    styled = style_board(display, ["Proj K", "K Score", "Run Prevention", "Outs Score", "Overall"], ["Proj ER"])
-    formatters = {"Proj K": "{:.2f}", "Proj ER": "{:.2f}", "Proj Outs": "{:.1f}", "K Score": "{:.0f}", "Run Prevention": "{:.0f}", "Outs Score": "{:.0f}", "Overall": "{:.0f}", "K Conf": "{:.0f}", "Workload": "{:.0f}", "Command": "{:.0f}"}
-    for column in ["K Line", "K Edge", "ER Line", "ER Edge", "Outs Line", "Outs Edge"]:
-        if column in display.columns:
-            formatters[column] = "{:.2f}"
-    styled = styled.format(formatters)
-    st.dataframe(styled, width="stretch", hide_index=True, height=650)
-
-with k_tab:
-    render_color_legend('strikeouts')
-    columns = ["K_Rank", "Pitcher", "Opponent", "Proj_K", "Proj_BF", "Adj_K_Rate", "Pitcher_K_Rate", "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate", "PitchMix_Opp_Whiff", "Whiff_Pct", "CSW_Pct", "Recent_Whiff_Pct", "Recent_CSW_Pct", "Fastball_Velo_Trend", "PitchTypeScore", "K_Score", "Confidence_Level"]
-    display = board.sort_values("Proj_K", ascending=False)[columns].copy().rename(columns={
-        "K_Rank": "Rank", "Proj_K": "Proj K", "Proj_BF": "Proj BF", "Adj_K_Rate": "Game K%",
-        "Pitcher_K_Rate": "Pitcher K%", "Opponent_K_Rate": "Opponent K%", "Whiff_Pct": "Whiff%",
-        "CSW_Pct": "CSW%", "Top6_K_Rate": "Top6 K%", "PitchMix_Opp_Whiff": "Pitch-Mix Whiff%",
-        "Arsenal_Form_Score": "Arsenal Form", "K_Confidence_Score": "K Conf",
-        "PitchTypeScore": "Pitch Match", "K_Score": "K Score", "Projection_Risk_Note": "Risk Note", "Confidence_Level": "Confidence",
-    })
-    styled = style_board(display, ["Proj K", "Game K%", "Pitcher K%", "Opponent K%", "Top6 K%", "Pitch-Mix Whiff%", "Whiff%", "CSW%", "Arsenal Form", "K Conf", "Pitch Match", "K Score"])
-    styled = styled.format({"Proj K": "{:.2f}", "Proj BF": "{:.1f}", "Game K%": "{:.1%}", "Pitcher K%": "{:.1%}", "Opponent K%": "{:.1%}", "Top6 K%": "{:.1%}", "Pitch-Mix Whiff%": "{:.1%}", "Whiff%": "{:.1%}", "CSW%": "{:.1%}", "Arsenal Form": "{:.0f}", "K Conf": "{:.0f}", "Pitch Match": "{:.0f}", "K Score": "{:.0f}"})
-    st.dataframe(styled, width="stretch", hide_index=True, height=650)
-
-with er_tab:
-    render_color_legend('earned runs / damage risk')
-    columns = ["ER_Rank", "Pitcher", "Opponent", "Proj_ER", "P_0_1_ER", "P_2_3_ER", "P_4plus_ER", "xwOBA_Allowed", "BB_Rate", "Command_Score", "Barrel_Allowed", "PitchMix_Opp_xwOBA", "Opp_xwOBA", "Run_Environment_Risk", "Park_Run_Factor", "Weather_Factor", "Run_Prevention_Score", "Projection_Risk_Note"]
-    display = board.sort_values("Proj_ER")[columns].copy().rename(columns={
-        "ER_Rank": "Rank", "Proj_ER": "Proj ER", "P_0_1_ER": "0–1 ER", "P_2_3_ER": "2–3 ER", "P_4plus_ER": "4+ ER",
-        "xwOBA_Allowed": "xwOBA Allowed", "BB_Rate": "BB%", "Barrel_Allowed": "Barrel% Allowed",
-        "Opp_xwOBA": "Opp xwOBA", "Park_Run_Factor": "Park", "Weather_Factor": "Weather", "Run_Prevention_Score": "Run Prevention",
-    })
-    styled = style_board(display, ["0–1 ER", "Run Prevention"], ["Proj ER", "4+ ER", "xwOBA Allowed", "BB%", "Barrel% Allowed", "Opp xwOBA", "Park", "Weather"])
-    styled = styled.format({"Proj ER": "{:.2f}", "0–1 ER": "{:.1%}", "2–3 ER": "{:.1%}", "4+ ER": "{:.1%}", "xwOBA Allowed": "{:.3f}", "BB%": "{:.1%}", "Barrel% Allowed": "{:.1%}", "Opp xwOBA": "{:.3f}", "Park": "{:.0f}", "Weather": "{:.3f}", "Run Prevention": "{:.0f}"})
-    st.dataframe(styled, width="stretch", hide_index=True, height=650)
-
-with outs_tab:
-    render_color_legend('outs / workload')
-    columns = ["Outs_Rank", "Pitcher", "Opponent", "Proj_Outs", "Proj_Innings", "Proj_BF", "Proj_Pitches", "Last_Start_Pitches", "Pitch_Count_Trend", "Recent_Outs", "Workload_Confidence_Score", "Short_Hook_Rate", "BB_Rate", "Outs_Score", "Projection_Risk_Note", "Confidence_Level"]
-    display = board.sort_values("Proj_Outs", ascending=False)[columns].copy().rename(columns={
-        "Outs_Rank": "Rank", "Proj_Outs": "Proj Outs", "Proj_Innings": "Proj IP", "Proj_BF": "Proj BF",
-        "Proj_Pitches": "Proj Pitches", "Last_Start_Pitches": "Last Start Pitches", "Pitch_Count_Trend": "Pitch Trend", "Recent_Outs": "Recent Outs",
-        "Workload_Confidence_Score": "Workload", "Short_Hook_Rate": "Short Hook%", "BB_Rate": "BB%", "Outs_Score": "Outs Score", "Projection_Risk_Note": "Risk Note", "Confidence_Level": "Confidence",
-    })
-    styled = style_board(display, ["Proj Outs", "Proj IP", "Proj BF", "Proj Pitches", "Last Start Pitches", "Recent Outs", "Workload", "Outs Score"], ["Pitch Trend", "Short Hook%", "BB%"])
-    styled = styled.format({"Proj Outs": "{:.1f}", "Proj IP": "{:.2f}", "Proj BF": "{:.1f}", "Proj Pitches": "{:.0f}", "Last Start Pitches": "{:.0f}", "Pitch Trend": "{:+.1f}", "Recent Outs": "{:.1f}", "Workload": "{:.0f}", "Short Hook%": "{:.1%}", "BB%": "{:.1%}", "Outs Score": "{:.0f}"})
-    st.dataframe(styled, width="stretch", hide_index=True, height=650)
-
-pitcher_options = board["Pitcher"].tolist()
-
-with lineup_tab:
-    render_color_legend('opponent lineup')
-    selected = st.selectbox("Pitcher", pitcher_options, key="lineup_pitcher")
-    row = board[board["Pitcher"].eq(selected)].iloc[0]
-    detail = details.get(row["DetailKey"], {})
-    st.markdown(f"### {selected} vs {row['Opponent']} · {row['Lineup_Status']} lineup")
-    lineup_frame = detail.get("lineup", pd.DataFrame())
-    if lineup_frame is None or lineup_frame.empty:
-        st.info("No opponent lineup profile was available.")
+    st.divider()
+    st.subheader("Automatic odds")
+    if odds_api_key:
+        st.caption("THE_ODDS_API_KEY loaded from this app's Streamlit Secrets.")
     else:
-        display = lineup_frame.rename(columns={"LineupSpot": "Order", "EffectiveStand": "Bats", "K_Pct": "K%", "BB_Pct": "BB%", "HR_Pct": "HR%", "Brl_BBE": "Barrel%", "HH_BBE": "Hard Hit%", "Whiff_Pct": "Whiff%"})
-        styled = style_board(display, ["K%", "Whiff%"], ["BB%", "HR%", "xwOBA", "Barrel%", "Hard Hit%"])
-        styled = styled.format({"Order": "{:.0f}", "PA": "{:.0f}", "K%": "{:.1%}", "BB%": "{:.1%}", "HR%": "{:.1%}", "xwOBA": "{:.3f}", "Barrel%": "{:.1%}", "Hard Hit%": "{:.1%}", "Whiff%": "{:.1%}"})
-        st.dataframe(styled, width="stretch", hide_index=True)
-
-with pitch_tab:
-    render_color_legend('pitch-type matchup')
-    selected = st.selectbox("Pitcher", pitcher_options, key="pitch_match_pitcher")
-    row = board[board["Pitcher"].eq(selected)].iloc[0]
-    detail = details.get(row["DetailKey"], {})
-    st.metric("Overall pitch-type matchup", f"{row['PitchTypeScore']:.0f}", score_label(row["PitchTypeScore"]))
-    pitch_frame = detail.get("pitch_types", pd.DataFrame())
-    if pitch_frame is None or pitch_frame.empty:
-        st.info("No pitch-type matchup table was available.")
-    else:
-        styled = style_board(pitch_frame, ["Pitcher Whiff%", "Pitcher CSW%", "Opponent K%", "Opponent Whiff%", "Match Score"], ["Pitcher xwOBA", "Opponent xwOBA"])
-        styled = styled.format({"Usage": "{:.1%}", "Velocity": "{:.1f}", "Pitcher Whiff%": "{:.1%}", "Pitcher CSW%": "{:.1%}", "Pitcher xwOBA": "{:.3f}", "Opponent K%": "{:.1%}", "Opponent Whiff%": "{:.1%}", "Opponent xwOBA": "{:.3f}", "Match Score": "{:.0f}"})
-        st.dataframe(styled, width="stretch", hide_index=True)
-
-with logs_tab:
-    selected = st.selectbox("Pitcher", pitcher_options, key="logs_pitcher")
-    row = board[board["Pitcher"].eq(selected)].iloc[0]
-    detail = details.get(row["DetailKey"], {})
-    logs = detail.get("game_log", pd.DataFrame())
-    if logs is None or logs.empty:
-        st.info("No starter game log was returned.")
-        if detail.get("log_error"):
-            st.code(str(detail["log_error"]))
-    else:
-        display = logs[[column for column in ["Date", "Opponent", "IP", "Outs", "K", "ER", "BF", "Pitches", "Hits", "BB", "HR"] if column in logs.columns]].sort_values("Date", ascending=False)
-        st.dataframe(display.style.format({"Date": lambda value: value.strftime("%Y-%m-%d") if not pd.isna(value) else "", "Outs": "{:.0f}", "K": "{:.0f}", "ER": "{:.0f}", "BF": "{:.0f}", "Pitches": "{:.0f}"}), width="stretch", hide_index=True)
-
-with lines_tab:
-    selected = st.selectbox("Pitcher", pitcher_options, key="lines_pitcher")
-    row = board[board["Pitcher"].eq(selected)].iloc[0]
-    st.markdown(f"### {selected} · {row['Game']}")
-    st.caption(
-        "Automatic values come from the selected source above. You can still overwrite any line manually for comparison. "
-        "A positive projection edge means the model projects above the line."
-    )
-
-    def render_prop_comparison(
-        prefix: str,
-        title: str,
-        projection_column: str,
-        minimum: float,
-        maximum: float,
-        default_step: float = 0.5,
-    ) -> None:
-        projection = float(row[projection_column])
-        auto_line = pd.to_numeric(pd.Series([row.get(f"{prefix}_Line")]), errors="coerce").iloc[0]
-        default_line = float(auto_line) if not pd.isna(auto_line) else float(np.clip(round(projection * 2) / 2, minimum, maximum))
-        source = str(row.get(f"{prefix}_Line_Source", "") or "")
-        over_odds = row.get(f"{prefix}_Over_Odds", np.nan)
-        under_odds = row.get(f"{prefix}_Under_Odds", np.nan)
-        line_key_value = f"{default_line:.2f}".replace(".", "_")
-        prop_line = st.number_input(
-            f"{title} line",
-            min_value=minimum,
-            max_value=maximum,
-            value=float(np.clip(default_line, minimum, maximum)),
-            step=default_step,
-            key=f"{prefix}_manual_line_{row['PitcherID']}_{line_key_value}_{normalize_lookup_text(odds_source_mode)}",
+        temporary_odds_key = st.text_input(
+            "Temporary The Odds API key", type="password", key=f"{MODEL_KEY}_temporary_odds_key",
+            help="Recommended: store THE_ODDS_API_KEY in this app's Streamlit Secrets.",
         )
-        if prefix == "Outs":
-            over_probability = 1.0 - normal_cdf(prop_line, projection, max(float(row.get("Outs_SD", 2.5)), 0.75))
+        odds_api_key = str(temporary_odds_key or "").strip()
+        st.caption("This temporary field resets when the app session ends.")
+
+start_date_value = end_date_value - timedelta(days=lookback_days - 1)
+if refresh or "clean_hit_statcast_data" not in st.session_state:
+    with st.spinner(
+        f"Loading Statcast from {start_date_value} through {end_date_value}..."
+    ):
+        raw = load_statcast(
+            start_date_value.strftime("%Y-%m-%d"),
+            end_date_value.strftime("%Y-%m-%d"),
+        )
+        st.session_state["clean_hit_statcast_data"] = prepare_data(raw)
+        st.session_state["clean_hit_loaded_dates"] = (
+            start_date_value,
+            end_date_value,
+        )
+
+df = st.session_state.get("clean_hit_statcast_data", pd.DataFrame())
+if df.empty:
+    st.warning("No Statcast data was returned. Use completed dates and try again.")
+    st.stop()
+
+loaded_start, loaded_end = st.session_state["clean_hit_loaded_dates"]
+st.caption(
+    f"Using {len(df):,} pitches from {loaded_start} through {loaded_end}. "
+    "The slate selector can use a later game date because model statistics stop at the date above."
+)
+
+pitcher_summary = (
+    df.groupby("pitcher")
+    .agg(
+        Pitches=("pitcher", "size"),
+        Player_Name=("player_name", "first"),
+        Pitcher_Team=("pitcher_team", "last"),
+        Hand=("p_throws", lambda x: most_common(x, "?")),
+    )
+    .reset_index()
+)
+pitcher_summary = pitcher_summary[pitcher_summary["Pitches"].ge(80)].copy()
+pitcher_summary["pitcher"] = pd.to_numeric(
+    pitcher_summary["pitcher"], errors="coerce"
+).astype("Int64")
+pitcher_summary = pitcher_summary.dropna(subset=["pitcher"])
+pitcher_summary["Display"] = (
+    pitcher_summary["Player_Name"].fillna("Unknown pitcher")
+    + " — "
+    + pitcher_summary["Pitcher_Team"].fillna("?")
+    + " — "
+    + pitcher_summary["Hand"].fillna("?")
+    + " ("
+    + pitcher_summary["Pitches"].astype(str)
+    + " pitches)"
+)
+pitcher_summary = pitcher_summary.sort_values("Display")
+if pitcher_summary.empty:
+    st.warning("No pitcher met the sample threshold. Increase the lookback period.")
+    st.stop()
+
+available_teams = sorted(df["batter_team"].dropna().astype(str).unique().tolist())
+matchup = matchup_selector(pitcher_summary, available_teams, key_prefix=MODEL_KEY)
+selected_pitcher = int(matchup["pitcher_id"])
+selected_display = str(matchup["pitcher_display"])
+selected_team = str(matchup["batting_team"])
+home_away = str(matchup["home_away"])
+
+active_roster, roster_error = fetch_active_roster(
+    matchup.get("batting_team_id"), matchup.get("slate_date")
+)
+if roster_error:
+    st.caption(
+        f"Active roster could not be fully loaded ({roster_error}). "
+        "The app will fall back to hitters found in the Statcast sample."
+    )
+
+attack_profile = pitcher_attack_profile_hits(df, selected_pitcher)
+render_pitcher_attack_panel(attack_profile, matchup["pitcher_name"], "hits")
+
+park_year = pd.Timestamp(matchup.get("slate_date") or loaded_end).year
+auto_park = fetch_savant_park_factors(matchup.get("venue", ""), park_year, "Hits")
+
+with st.expander("Game context and model adjustments", expanded=True):
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        team_runs = st.number_input(
+            "Team implied runs", 1.0, 9.0, 4.5, 0.1, key="clean_hits_runs"
+        )
+        starter_innings = st.number_input(
+            "Expected starter innings", 2.0, 8.0, 5.5, 0.5, key="clean_hits_ip"
+        )
+    with c2:
+        manual_park_override = st.checkbox(
+            "Manual park-factor override",
+            value=False,
+            key=f"clean_hits_manual_park_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            help="Leave this off to use the automatic Baseball Savant 3-year factors.",
+        )
+        if manual_park_override:
+            park_hit_factor_lhb = st.number_input(
+                "Park hit factor — LHB", 70.0, 140.0, float(auto_park["L"]), 1.0,
+                key=f"clean_hits_park_l_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            )
+            park_hit_factor_rhb = st.number_input(
+                "Park hit factor — RHB", 70.0, 140.0, float(auto_park["R"]), 1.0,
+                key=f"clean_hits_park_r_{matchup.get('game_pk')}_{normalize_name(matchup.get('venue'))}",
+            )
+            park_source = "Manual override"
         else:
-            over_probability = probability_over_line(projection, prop_line)
-        fair_market_over = no_vig_over_probability(over_odds, under_odds)
-        projection_edge = projection - prop_line
-        st.metric(f"Projected {title.lower()}", f"{projection:.2f}", delta=f"{projection_edge:+.2f} vs line")
-        st.metric("Model over probability", f"{over_probability:.1%}")
-        st.metric("Model under probability", f"{1.0 - over_probability:.1%}")
-        if source:
-            st.caption(
-                f"Auto source: **{source}** · Over {format_american_odds(over_odds)} · "
-                f"Under {format_american_odds(under_odds)}"
+            park_hit_factor_lhb = float(auto_park["L"])
+            park_hit_factor_rhb = float(auto_park["R"])
+            park_source = str(auto_park["source"])
+            st.markdown(
+                f"""
+                <div class="park-grid">
+                    <div class="park-chip"><div class="side">LHB HITS</div><div class="factor">{park_hit_factor_lhb:.0f}</div></div>
+                    <div class="park-chip"><div class="side">RHB HITS</div><div class="factor">{park_hit_factor_rhb:.0f}</div></div>
+                </div>
+                <div class="park-source">{escape(park_source)}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if not auto_park["ok"]:
+                st.warning("Local park_factors.csv was unavailable or could not be matched, so neutral 100 values are being used. Turn on the manual override to change them.")
+        if st.button("Refresh park factors", key=f"clean_hits_refresh_park_{matchup.get('game_pk')}"):
+            fetch_savant_park_factors.clear()
+            st.rerun()
+    with c3:
+        bullpen_multiplier = st.number_input(
+            "Bullpen hit multiplier",
+            0.75,
+            1.30,
+            1.00,
+            0.01,
+            key="clean_hits_bullpen",
+            help="Above 1.00 means an easier-than-average bullpen for hits.",
+        )
+        sprint_upload = st.file_uploader(
+            "Optional sprint-speed CSV",
+            type=["csv"],
+            key="clean_hits_sprint_upload",
+        )
+    with c4:
+        st.markdown(
+            f"""
+            <div class="context-note">
+            <b>{matchup['away_abbr']} @ {matchup['home_abbr']}</b><br>
+            {matchup['venue']}<br>
+            Batting team: {selected_team} ({home_away})<br>
+            Park LHB: ×{park_hit_factor_lhb / 100:.2f}<br>
+            Park RHB: ×{park_hit_factor_rhb / 100:.2f}<br>
+            Source: {escape(park_source)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        template = "player_id,Player,sprint_speed\n660271,Shohei Ohtani,\n"
+        st.download_button(
+            "Sprint-speed CSV template",
+            template,
+            "sprint_speed_template.csv",
+            "text/csv",
+            key="clean_hits_sprint_template",
+        )
+
+preview_profile, preview_hand = selected_pitcher_profile(df, selected_pitcher)
+
+preview_recent_lineup = infer_recent_lineup(df, selected_team)
+lineup_seed = preview_recent_lineup.copy()
+lineup_source_label = "Latest observed lineup from the loaded Statcast sample"
+lineup_result = None
+lineup_game_pk = matchup.get("game_pk")
+lineup_side = "away" if home_away == "Away" else "home"
+
+with st.expander("Automatic MLB lineup", expanded=True):
+    use_mlb_lineup = st.checkbox(
+        "Use the posted MLB lineup automatically",
+        value=bool(lineup_game_pk),
+        disabled=not bool(lineup_game_pk),
+        key=f"clean_hits_use_mlb_lineup_{lineup_game_pk}_{selected_team}",
+        help="When all nine hitters are posted, they replace the recent-lineup fallback and set batting order automatically.",
+    )
+
+    if lineup_game_pk and use_mlb_lineup:
+        lineup_result = fetch_mlb_confirmed_lineup(lineup_game_pk, lineup_side)
+        posted_lineup = _clean_lineup_seed(lineup_result.get("lineup"))
+        if lineup_result.get("ok") and len(posted_lineup) >= 9:
+            lineup_seed = posted_lineup
+            lineup_source_label = f"Confirmed MLB lineup · {lineup_result.get('source', '')}"
+            st.success(
+                f"Confirmed lineup loaded: {len(posted_lineup)} hitters · "
+                f"{lineup_result.get('game_state') or matchup.get('status', '')}"
+            )
+            lineup_display = lineup_result["lineup"].copy()
+            lineup_display = lineup_display.rename(columns={
+                "LineupSpot": "Order", "Player_MLB": "Player", "Position_MLB": "Pos",
+                "LineupRole": "Role",
+            })
+            st.dataframe(
+                lineup_display[[column for column in ["Order", "Player", "Pos", "Role"] if column in lineup_display.columns]],
+                hide_index=True,
+                use_container_width=True,
+                height=360,
+            )
+        elif lineup_result.get("status") == "Partial":
+            st.warning(
+                f"MLB currently shows only {len(posted_lineup)} lineup spots. "
+                "The recent observed lineup remains the default until all nine are posted."
             )
         else:
-            st.caption("No automatic line was matched for this pitcher and market; the model-rounded line is shown.")
-        if np.isfinite(fair_market_over):
-            st.metric("No-vig market over", f"{fair_market_over:.1%}", delta=f"{over_probability - fair_market_over:+.1%} model edge")
-        if source.lower().startswith("prizepicks"):
-            st.caption("PrizePicks prices are indicative; use the line and model probability as the primary comparison.")
+            st.info(
+                "The confirmed lineup has not been posted yet. "
+                "The most recent observed lineup remains the default."
+            )
+            if lineup_result.get("error"):
+                with st.expander("Lineup connection details"):
+                    st.code(str(lineup_result["error"]))
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        render_prop_comparison("K", "Strikeouts", "Proj_K", 0.5, 14.5)
-    with c2:
-        render_prop_comparison("ER", "Earned runs", "Proj_ER", 0.5, 7.5)
-    with c3:
-        render_prop_comparison("Outs", "Outs", "Proj_Outs", 8.5, 23.5)
+        if st.button(
+            "Refresh MLB lineup",
+            key=f"clean_hits_refresh_lineup_{lineup_game_pk}_{selected_team}",
+        ):
+            fetch_mlb_confirmed_lineup.clear()
+            st.rerun()
+    elif not lineup_game_pk:
+        st.caption("Automatic lineups require a game selected from the MLB slate. Manual matchups use the recent-lineup fallback.")
 
+st.caption(f"Lineup source: {lineup_source_label}")
+preview_board = aggregate_hitters(df, preview_hand, 0)
+preview_board = add_roster_candidates(
+    preview_board, selected_team, active_roster, lineup_seed, min_pa, include_low_sample
+)
+if preview_board.empty:
+    st.warning(
+        "No roster or Statcast hitters were available. Increase the lookback or disable the PA filter."
+    )
+    st.stop()
+preview_names = lookup_names(
+    tuple(preview_board["player_id"].dropna().astype(int).unique().tolist())
+)
+preview_board = preview_board.merge(preview_names, on="player_id", how="left", suffixes=("", "_Lookup"))
+preview_board["Player"] = preview_board["Player"].replace("", np.nan).fillna(preview_board.get("Player_Lookup"))
+preview_board["Player"] = preview_board["Player"].fillna(
+    "MLB ID " + preview_board["player_id"].astype("Int64").astype(str)
+)
+preview_board = preview_board.drop(columns=["Player_Lookup"], errors="ignore")
+preview_board = preview_board.merge(lineup_seed, on="player_id", how="left")
+lineup_input = preview_board[["player_id", "Player", "Position", "Bats", "PA", "SampleStatus", "LineupSpot"]].copy()
+default_selected = lineup_input["LineupSpot"].notna()
+if not default_selected.any():
+    default_selected = pd.Series(True, index=lineup_input.index)
+lineup_input.insert(0, "Selected", default_selected)
+lineup_input = lineup_input.sort_values(["LineupSpot", "Player"], na_position="last")
+
+with st.expander("Confirm lineup", expanded=False):
     st.caption(
-        "K and ER probabilities use a Poisson approximation. Outs use the pitcher's recent-start variance with a normal approximation. "
-        "Use the Backtest & calibration tab to measure projection accuracy first; prop-line probability calibration is optional."
+        f"Default order: {lineup_source_label}. "
+        "You can still edit the order or remove a late scratch below."
+    )
+    lineup_edits = st.data_editor(
+        lineup_input,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["player_id", "Player", "Position", "Bats", "PA", "SampleStatus"],
+        column_config={
+            "Selected": st.column_config.CheckboxColumn("Use", default=True),
+            "LineupSpot": st.column_config.NumberColumn(
+                "Lineup spot", min_value=1, max_value=9, step=1
+            ),
+        },
+        key=f"clean_hits_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
+    )
+
+rankings, pitch_mix = build_hit_board(
+    df=df,
+    pitcher_id=selected_pitcher,
+    team=selected_team,
+    min_pa=min_pa,
+    end_date=pd.Timestamp(loaded_end),
+    park_hit_factor_lhb=park_hit_factor_lhb,
+    park_hit_factor_rhb=park_hit_factor_rhb,
+    team_runs=team_runs,
+    is_away=home_away == "Away",
+    starter_innings=starter_innings,
+    bullpen_multiplier=bullpen_multiplier,
+    lineup_override=lineup_seed,
+    lineup_edits=lineup_edits,
+    sprint_upload=sprint_upload,
+    active_roster=active_roster,
+    include_low_sample=include_low_sample,
+)
+
+if rankings.empty:
+    st.warning("No selected hitters remain after filtering.")
+    st.stop()
+
+rankings = apply_binary_probability_calibration(
+    rankings, st.session_state.get("hits_probability_calibration")
+)
+rankings, loaded_odds_quotes, odds_source_mode = render_batter_odds_section(
+    rankings, matchup, odds_api_key, "clean_hits"
+)
+saved_hit_model = load_saved_hit_model()
+rankings = add_ml_hit_predictions(rankings, saved_hit_model)
+lineup_status_for_persistence = (
+    str(lineup_result.get("status")) if isinstance(lineup_result, dict)
+    else ("Manual" if not lineup_game_pk else "Recent lineup fallback")
+)
+saved_prediction_rows = save_pregame_predictions(
+    rankings, matchup, lineup_status_for_persistence
+)
+automatic_grade_hour = pd.Timestamp.now(tz="UTC").floor("h").isoformat()
+if st.session_state.get("hits_automatic_grade_hour") != automatic_grade_hour:
+    st.session_state["hits_automatic_grade_summary"] = grade_pending_predictions()
+    st.session_state["hits_automatic_grade_hour"] = automatic_grade_hour
+
+render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HIT BOARD")
+render_leader_cards(rankings, "Model_1plus_Hit", "HitScore", "model 1+ hit")
+if saved_hit_model:
+    st.caption(
+        f"ML model {saved_hit_model.get('model_version')} · trained "
+        f"{str(saved_hit_model.get('trained_at_utc', ''))[:10]} · "
+        f"{saved_prediction_rows:,} pregame rows persisted for this matchup."
+    )
+else:
+    st.caption(f"{saved_prediction_rows:,} pregame rows persisted. Train the chronological ML model in Backtest & calibration to add ML probabilities.")
+
+quick_tab, contact_tab, matchup_tab, bvp_tab, pitcher_tab, slate_tab, backtest_tab, notes_tab = st.tabs(
+    [
+        "Quick board", "Contact profile", "Matchup detail", "Batter vs pitcher",
+        "Pitcher profile", "Slate Top 10 & pairings", "Backtest & calibration", "Model notes"
+    ]
+)
+
+with quick_tab:
+    quick_columns = [
+        "Rank", "Player", "LineupSpot", "Projected_PA", "Projected_Hits", "Model_1plus_Hit", "Model_2plus_Hit",
+        "Raw_Model_1plus_Hit", "Raw_ML_Hit_Probability", "Calibrated_ML_Hit_Probability", "ML_Fair_Odds",
+        "ML_Model_Version", "ML_Training_Date", "HitScore", "Confidence_Level", "Adj_xHit_PA", "Contact_Pct", "K_Pct",
+        "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
+        "PitchMatchScore", "ZoneFitScore", "ParkFactor", "Market_Line",
+        "Over_Odds", "Under_Odds", "Market_Over_Prob", "Model_Market_Edge", "Line_Source",
+    ]
+    quick = rankings[[column for column in quick_columns if column in rankings.columns]].copy()
+    if not bool(rankings.get("Calibration_Applied", pd.Series(False, index=rankings.index)).fillna(False).any()):
+        quick = quick.drop(columns=["Raw_Model_1plus_Hit"], errors="ignore")
+    quick = quick.rename(columns={
+        "LineupSpot": "Order", "Projected_PA": "Proj PA", "Projected_Hits": "Proj Hits", "Model_1plus_Hit": "1+ Hit",
+        "Model_2plus_Hit": "2+ Hit", "Raw_Model_1plus_Hit": "Raw 1+ Hit", "HitScore": "Hit Score", "Confidence_Level": "Confidence",
+        "Raw_ML_Hit_Probability": "Raw ML Hit", "Calibrated_ML_Hit_Probability": "Calibrated ML Hit",
+        "ML_Fair_Odds": "ML Fair Odds", "ML_Model_Version": "Model Version", "ML_Training_Date": "Training Date",
+        "Adj_xHit_PA": "Adj xHit/PA", "Contact_Pct": "Contact%", "K_Pct": "K%",
+        "EffectiveStand": "Bats vs SP", "PitcherSideRead": "Pitcher Read",
+        "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
+        "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
+        "ParkFactor": "Park Factor", "Market_Line": "Line",
+        "Over_Odds": "Over Odds", "Under_Odds": "Under Odds",
+        "Market_Over_Prob": "No-vig Market", "Model_Market_Edge": "Model Edge",
+        "Line_Source": "Line Source",
+    })
+    styler = quick.style.background_gradient(
+        cmap="RdYlGn", subset=["Hit Score", "Side Attack", "Pitch Match", "Zone Fit"], vmin=0, vmax=100
+    ).format({
+        "Order": "{:.0f}", "Proj PA": "{:.2f}", "Proj Hits": "{:.2f}", "1+ Hit": "{:.1%}", "2+ Hit": "{:.1%}", "Raw 1+ Hit": "{:.1%}",
+        "Raw ML Hit": "{:.1%}", "Calibrated ML Hit": "{:.1%}", "ML Fair Odds": "{:+.0f}",
+        "Hit Score": "{:.1f}", "Adj xHit/PA": "{:.1%}", "Contact%": "{:.1%}",
+        "K%": "{:.1%}", "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}",
+        "Park Factor": "{:.0f}", "Line": "{:.1f}", "Over Odds": "{:+.0f}",
+        "Under Odds": "{:+.0f}", "No-vig Market": "{:.1%}", "Model Edge": "{:+.1%}",
+    })
+    st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
+
+with contact_tab:
+    columns = [
+        "Player", "PA", "Hits", "Hit_PA", "xHit_PA", "Avg_xBA_Contact",
+        "Contact_Pct", "Zone_Contact_Pct", "Whiff_Pct", "K_Pct", "LD_Pct",
+        "HH_Pct", "SweetSpot_Pct", "Barrel_Range_Pct", "Dynamic_Barrel_Pct",
+        "LA_Optimization_Score", "Sprint_Speed",
+    ]
+    contact = rankings[[column for column in columns if column in rankings.columns]].copy()
+    contact = contact.rename(columns={
+        "Hit_PA": "H/PA", "xHit_PA": "xHit/PA", "Avg_xBA_Contact": "xBA Contact",
+        "Contact_Pct": "Contact%", "Zone_Contact_Pct": "Zone Contact%",
+        "Whiff_Pct": "Whiff%", "K_Pct": "K%", "LD_Pct": "LD%",
+        "HH_Pct": "Hard Hit%", "SweetSpot_Pct": "Sweet Spot%",
+        "Barrel_Range_Pct": "Barrel Range%",
+        "Dynamic_Barrel_Pct": "Dynamic Barrel%",
+        "LA_Optimization_Score": "LA Opt Score",
+        "Sprint_Speed": "Sprint Speed",
+    })
+    st.caption(
+        "Green highlights stronger hit-probability ingredients within the selected offense. "
+        "Whiff% and K% are reversed, so lower swing-and-miss risk appears greener."
+    )
+    positive_columns = [
+        column for column in [
+            "H/PA", "xHit/PA", "xBA Contact", "Contact%", "Zone Contact%",
+            "LD%", "Hard Hit%", "Sweet Spot%", "Barrel Range%",
+            "Dynamic Barrel%", "LA Opt Score", "Sprint Speed"
+        ] if column in contact.columns
+    ]
+    risk_columns = [column for column in ["Whiff%", "K%"] if column in contact.columns]
+    contact_style = contact.style
+    if positive_columns:
+        contact_style = contact_style.background_gradient(
+            cmap="RdYlGn", subset=positive_columns, axis=0
+        )
+    if risk_columns:
+        contact_style = contact_style.background_gradient(
+            cmap="RdYlGn_r", subset=risk_columns, axis=0
+        )
+    contact_style = contact_style.set_properties(
+        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+    ).format({
+        "H/PA": "{:.1%}", "xHit/PA": "{:.1%}", "xBA Contact": "{:.3f}",
+        "Contact%": "{:.1%}", "Zone Contact%": "{:.1%}", "Whiff%": "{:.1%}",
+        "K%": "{:.1%}", "LD%": "{:.1%}", "Hard Hit%": "{:.1%}",
+        "Sweet Spot%": "{:.1%}", "Barrel Range%": "{:.1%}",
+        "Dynamic Barrel%": "{:.1%}", "LA Opt Score": "{:.1f}",
+        "Sprint Speed": "{:.1f}",
+    })
+    st.dataframe(
+        contact_style,
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
+
+with matchup_tab:
+    columns = [
+        "Player", "PitchMatchScore", "ZoneFitScore", "PitcherHitScore",
+        "RecentFormScore", "BvP_PA", "BvP_H", "BvPScore", "MatchSample",
+        "Platoon_PA", "Pitcher_PA",
+    ]
+    detail = rankings[[column for column in columns if column in rankings.columns]].copy()
+    detail = detail.rename(columns={
+        "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
+        "PitcherHitScore": "Pitcher Vulnerability", "RecentFormScore": "Recent Form",
+        "BvP_PA": "BvP PA", "BvP_H": "BvP Hits", "BvPScore": "BvP Score",
+        "MatchSample": "Matched Pitches", "Platoon_PA": "Platoon PA",
+        "Pitcher_PA": "Pitcher Split PA",
+    })
+    score_cols = ["Pitch Match", "Zone Fit", "Pitcher Vulnerability", "Recent Form", "BvP Score"]
+    st.dataframe(
+        detail.style.background_gradient(cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100).format(
+            {column: "{:.1f}" for column in score_cols}
+        ),
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
+
+
+with bvp_tab:
+    st.caption(
+        "Direct history against the selected starting pitcher. BvP Score is heavily "
+        "shrunk toward 50 until the hitter reaches a meaningful sample; treat very small "
+        "samples as context rather than a standalone reason to bet."
+    )
+    bvp_columns = [
+        "Player", "BvP_PA", "BvP_H", "BvP_Hit_PA", "BvP_xHit_PA",
+        "BvP_K", "BvP_K_Pct", "BvP_BBE", "BvP_Avg_EV", "BvP_HH_Pct",
+        "BvPScore", "BvP_Last_Date",
+    ]
+    bvp_view = rankings[[column for column in bvp_columns if column in rankings.columns]].copy()
+    bvp_view = bvp_view.rename(columns={
+        "BvP_PA": "PA", "BvP_H": "Hits", "BvP_Hit_PA": "H/PA",
+        "BvP_xHit_PA": "xH/PA", "BvP_K": "K", "BvP_K_Pct": "K%",
+        "BvP_BBE": "BBE", "BvP_Avg_EV": "Avg EV", "BvP_HH_Pct": "Hard Hit%",
+        "BvPScore": "BvP Score", "BvP_Last_Date": "Last Faced",
+    })
+    if "Last Faced" in bvp_view.columns:
+        bvp_view["Last Faced"] = pd.to_datetime(bvp_view["Last Faced"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+    bvp_view = bvp_view.sort_values(["PA", "BvP Score"], ascending=[False, False])
+    positive_bvp = [column for column in ["H/PA", "xH/PA", "Avg EV", "Hard Hit%", "BvP Score"] if column in bvp_view.columns]
+    risk_bvp = [column for column in ["K%"] if column in bvp_view.columns]
+    bvp_style = bvp_view.style
+    if positive_bvp:
+        bvp_style = bvp_style.background_gradient(cmap="RdYlGn", subset=positive_bvp, axis=0)
+    if risk_bvp:
+        bvp_style = bvp_style.background_gradient(cmap="RdYlGn_r", subset=risk_bvp, axis=0)
+    bvp_style = bvp_style.set_properties(
+        subset=["Player"], **{"font-weight": "700", "background-color": "#f8fafc"}
+    ).format({
+        "PA": "{:.0f}", "Hits": "{:.0f}", "H/PA": "{:.1%}", "xH/PA": "{:.1%}",
+        "K": "{:.0f}", "K%": "{:.1%}", "BBE": "{:.0f}", "Avg EV": "{:.1f}",
+        "Hard Hit%": "{:.1%}", "BvP Score": "{:.1f}",
+    }, na_rep="—")
+    st.dataframe(
+        bvp_style,
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+    )
+
+with pitcher_tab:
+    if pitch_mix.empty:
+        st.info("No pitch profile was available.")
+    else:
+        st.dataframe(
+            pitch_mix.sort_values("Usage", ascending=False).style.format({
+                "Usage": "{:.1%}", "Avg_Speed": "{:.1f}", "Avg_PFX_X": "{:.2f}",
+                "Avg_PFX_Z": "{:.2f}", "Avg_Extension": "{:.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+with slate_tab:
+    render_slate_tools(
+        df=df, matchup=matchup, available_teams=available_teams, min_pa=min_pa,
+        loaded_end=loaded_end, include_low_sample=include_low_sample,
+        calibration=st.session_state.get("hits_probability_calibration"),
+        odds_quotes=loaded_odds_quotes, odds_source_mode=odds_source_mode,
+        widget_prefix="clean_hits_slate",
     )
 
 with backtest_tab:
-    st.markdown("### Save the current slate before first pitch")
-    st.caption(
-        "Enter any available prop lines, then download the snapshot. Keep these CSV files and upload them here after games finish. "
-        "The app flags snapshots generated after first pitch so they can be excluded from testing."
+    lineup_status_for_backtest = (
+        str(lineup_result.get("status")) if isinstance(lineup_result, dict)
+        else ("Manual" if not lineup_game_pk else "Recent lineup fallback")
     )
-    snapshot_generated = st.session_state.get("pitcher_generated_at", pd.Timestamp.now(tz="UTC").isoformat())
-    snapshot_lookback = int(st.session_state.get("pitcher_lookback_days", lookback_days))
-    full_snapshot = build_projection_snapshot(board, slate_date, snapshot_lookback, snapshot_generated)
-    editor_columns = [
-        "SlateDate", "Pitcher", "Team", "Opponent", "Lineup_Status", "Proj_K", "Proj_ER", "Proj_Outs",
-        "K_Score", "Run_Prevention_Score", "Outs_Score", "K_Line", "ER_Line", "Outs_Line",
-        "K_Line_Source", "ER_Line_Source", "Outs_Line_Source",
-        "K_Closing_Line", "ER_Closing_Line", "Outs_Closing_Line", "Notes",
-    ]
-    editor_columns = [column for column in editor_columns if column in full_snapshot.columns]
-    editable = full_snapshot[editor_columns].copy()
-    disabled_columns = [column for column in editor_columns if column not in {"K_Line", "ER_Line", "Outs_Line", "K_Closing_Line", "ER_Closing_Line", "Outs_Closing_Line", "Notes"}]
-    edited = st.data_editor(
-        editable,
-        disabled=disabled_columns,
-        width="stretch",
-        hide_index=True,
-        key=f"pitcher_snapshot_editor_{slate_date}_{snapshot_generated}",
-        column_config={
-            "K_Line": st.column_config.NumberColumn("K line", min_value=0.0, step=0.5, format="%.1f"),
-            "ER_Line": st.column_config.NumberColumn("ER line", min_value=0.0, step=0.5, format="%.1f"),
-            "Outs_Line": st.column_config.NumberColumn("Outs line", min_value=0.0, step=0.5, format="%.1f"),
-            "K_Closing_Line": st.column_config.NumberColumn("K close", min_value=0.0, step=0.5, format="%.1f"),
-            "ER_Closing_Line": st.column_config.NumberColumn("ER close", min_value=0.0, step=0.5, format="%.1f"),
-            "Outs_Closing_Line": st.column_config.NumberColumn("Outs close", min_value=0.0, step=0.5, format="%.1f"),
+    render_binary_backtest_tab(
+        rankings=rankings,
+        matchup=matchup,
+        lookback_days=lookback_days,
+        loaded_start=loaded_start,
+        loaded_end=loaded_end,
+        lineup_status=lineup_status_for_backtest,
+        calibration_state_key="hits_probability_calibration",
+        widget_prefix="clean_hits_backtest",
+        extra_context={
+            "ParkSource": park_source,
+            "TeamImpliedRuns": team_runs,
+            "StarterInnings": starter_innings,
+            "BullpenMultiplier": bullpen_multiplier,
         },
+        whole_slate_board=st.session_state.get(
+            f"clean_hits_slate_whole_slate_board_{str(pd.Timestamp(matchup.get('slate_date') or date.today()).date())}",
+            pd.DataFrame(),
+        ),
+        odds_api_key=odds_api_key,
+        odds_widget_prefix="clean_hits",
+        odds_source_mode=odds_source_mode,
+        slate_builder_context={
+            "df": df,
+            "available_teams": available_teams,
+            "min_pa": min_pa,
+            "loaded_end": loaded_end,
+            "include_low_sample": include_low_sample,
+            "team_runs": team_runs,
+            "starter_innings": starter_innings,
+            "bullpen_multiplier": bullpen_multiplier,
+            "use_confirmed_lineups": True,
+        },
+        whole_slate_state_key=(
+            f"clean_hits_slate_whole_slate_board_{str(pd.Timestamp(matchup.get('slate_date') or date.today()).date())}"
+        ),
     )
-    export_snapshot = full_snapshot.copy()
-    for column in ["K_Line", "ER_Line", "Outs_Line", "K_Closing_Line", "ER_Closing_Line", "Outs_Closing_Line", "Notes"]:
-        if column in edited.columns:
-            export_snapshot[column] = edited[column].to_numpy()
-    snapshot_filename = f"pitcher_predictions_{pd.Timestamp(slate_date).strftime('%Y-%m-%d')}.csv"
-    st.download_button(
-        "Download pregame projection snapshot",
-        export_snapshot.to_csv(index=False).encode("utf-8"),
-        file_name=snapshot_filename,
-        mime="text/csv",
-        width="stretch",
-    )
-
-    st.divider()
-    st.markdown("### Upload prediction history")
-    uploaded_history = st.file_uploader(
-        "Upload one or more pitcher prediction CSV files",
-        type=["csv"],
-        accept_multiple_files=True,
-        key="pitcher_history_uploads",
-    )
-    if uploaded_history:
-        upload_signature = tuple((uploaded.name, len(uploaded.getvalue())) for uploaded in uploaded_history)
-        if st.session_state.get("pitcher_history_signature") != upload_signature:
-            combined_history, upload_errors = combine_history_uploads(uploaded_history)
-            st.session_state["pitcher_backtest_history"] = combined_history
-            st.session_state["pitcher_history_signature"] = upload_signature
-            st.session_state["pitcher_history_upload_errors"] = upload_errors
-    history = normalize_backtest_history(st.session_state.get("pitcher_backtest_history", pd.DataFrame()))
-    upload_errors = st.session_state.get("pitcher_history_upload_errors", [])
-    if upload_errors:
-        with st.expander("Files that could not be read"):
-            for error in upload_errors:
-                st.code(error)
-
-    action_columns = st.columns(2)
-    with action_columns[0]:
-        if st.button(
-            "Add current snapshot to session master",
-            width="stretch",
-            key="pitcher_add_current_snapshot",
-        ):
-            history = append_snapshot_to_history(history, export_snapshot)
-            st.session_state["pitcher_backtest_history"] = history
-            st.success(
-                "Current pitcher snapshot added to the session master. "
-                "Download the updated master CSV before leaving or rebooting."
-            )
-    with action_columns[1]:
-        if st.button(
-            "Fetch official completed-game results",
-            type="primary",
-            width="stretch",
-            key="pitcher_fetch_completed_results",
-            disabled=history.empty,
-        ):
-            history, result_summary = fill_actual_results(history)
-            st.session_state["pitcher_backtest_history"] = history
-            st.session_state["pitcher_result_summary"] = result_summary
-
-    result_summary = st.session_state.get("pitcher_result_summary", {})
-    if result_summary:
-        st.caption(
-            f"Result update: {result_summary.get('matched', 0)} rows matched · "
-            f"{result_summary.get('not_final', 0)} games not final · "
-            f"{result_summary.get('unmatched', 0)} unmatched/scratched pitchers"
-            + (
-                f" · {result_summary.get('fallback_matched', 0)} date-fallback matches"
-                if result_summary.get('fallback_matched', 0)
-                else ""
-            )
-            + (
-                f" · {result_summary.get('missing_game_pk', 0)} rows missing GamePK"
-                if result_summary.get('missing_game_pk', 0)
-                else ""
-            )
-        )
-        if result_summary.get("errors"):
-            with st.expander("Result-fetch details"):
-                for error in result_summary["errors"][:50]:
-                    st.code(error)
-
-    if history.empty:
-        st.info(
-            "Add the current snapshot to the session master or upload a saved snapshot/master CSV. "
-            "Then fetch official results after the games finish."
-        )
-    else:
-        option_columns = st.columns(3)
-        with option_columns[0]:
-            latest_only = st.checkbox("Use latest pregame snapshot per pitcher/game", value=True)
-        with option_columns[1]:
-            exclude_after_start = st.checkbox("Exclude snapshots created after first pitch", value=True)
-        with option_columns[2]:
-            minimum_calibration_rows = st.number_input("Minimum starts for calibration", min_value=20, max_value=250, value=30, step=10)
-
-        analysis_history = deduplicate_history(history, latest_only=latest_only, exclude_after_start=exclude_after_start)
-        completed_any = analysis_history[["Actual_K", "Actual_ER", "Actual_Outs"]].notna().any(axis=1)
-        completed_history = analysis_history[completed_any].copy()
-
-        counts = st.columns(4)
-        counts[0].metric("Master rows", f"{len(history):,}")
-        counts[1].metric("Analysis rows", f"{len(analysis_history):,}")
-        counts[2].metric("Rows with results", f"{len(completed_history):,}")
-        counts[3].metric("After-start snapshots", f"{int(history['SnapshotAfterStart'].fillna(False).sum()):,}")
-
-        st.download_button(
-            "Download updated master history",
-            normalize_backtest_history(history).to_csv(index=False).encode("utf-8"),
-            file_name="pitcher_backtest_master.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-        if completed_history.empty:
-            st.warning("No completed results are available yet. Use the result-fetch button after the games are final.")
-        else:
-            st.markdown("### Model projection accuracy — no prop lines required")
-            st.caption(
-                "This section compares each model projection directly to the official result. "
-                "Rows are included even when K/ER/Outs prop lines are blank."
-            )
-            metric_rows: list[dict] = []
-            for target_name, config in BACKTEST_TARGETS.items():
-                metrics = projection_metrics(completed_history, config["projection"], config["actual"], config["baseline"])
-                baseline_mae = metrics.get("Baseline_MAE", np.nan)
-                mae = metrics.get("MAE", np.nan)
-                improvement = baseline_mae - mae if np.isfinite(baseline_mae) and np.isfinite(mae) else np.nan
-                improvement_pct = improvement / baseline_mae if np.isfinite(improvement) and baseline_mae else np.nan
-                metric_rows.append({
-                    "Target": target_name,
-                    **metrics,
-                    "MAE_Edge_vs_Baseline": improvement,
-                    "MAE_Improvement_Pct": improvement_pct,
-                })
-            metric_table = pd.DataFrame(metric_rows)
-            st.dataframe(
-                metric_table.style.format({
-                    "MAE": "{:.3f}", "RMSE": "{:.3f}", "Bias": "{:+.3f}",
-                    "Correlation": "{:.3f}", "Baseline_MAE": "{:.3f}",
-                    "MAE_Edge_vs_Baseline": "{:+.3f}", "MAE_Improvement_Pct": "{:+.1%}",
-                }),
-                width="stretch",
-                hide_index=True,
-            )
-            st.caption(
-                "Bias is projection minus actual. Positive bias means the model is projecting too high. "
-                "MAE edge vs baseline is positive when the model beats the simple baseline."
-            )
-
-            target_for_scatter = st.selectbox("Projection chart target", list(BACKTEST_TARGETS), key="pitcher_scatter_target")
-            scatter_config = BACKTEST_TARGETS[target_for_scatter]
-            scatter = completed_history[[scatter_config["projection"], scatter_config["actual"]]].dropna().rename(
-                columns={scatter_config["projection"]: "Projection", scatter_config["actual"]: "Actual"}
-            )
-            if not scatter.empty:
-                st.scatter_chart(scatter, x="Projection", y="Actual", width="stretch")
-
-            st.markdown("### Projection buckets — no prop lines required")
-            projection_bucket_target = st.selectbox(
-                "Projection bucket target",
-                list(BACKTEST_TARGETS),
-                key="pitcher_projection_bucket_target",
-            )
-            projection_buckets = model_projection_bucket_table(completed_history, projection_bucket_target)
-            if projection_buckets.empty:
-                st.info("No completed projections are available for this target yet.")
-            else:
-                st.dataframe(
-                    projection_buckets.style.format({
-                        "Average_Projection": "{:.2f}", "Average_Actual": "{:.2f}",
-                        "MAE": "{:.3f}", "RMSE": "{:.3f}", "Bias": "{:+.3f}",
-                        "Actual_Above_Projection_Rate": "{:.1%}",
-                    }),
-                    width="stretch",
-                    hide_index=True,
-                )
-            st.caption(
-                "These buckets show where the model is too high or too low by projection range, without using sportsbook lines."
-            )
-
-            st.markdown("### Score accuracy buckets — no prop lines required")
-            bucket_target = st.selectbox("Score target", list(BACKTEST_TARGETS), key="pitcher_score_bucket_target")
-            bucket_table = score_bucket_table(completed_history, bucket_target)
-            if not bucket_table.empty:
-                st.dataframe(
-                    bucket_table.style.format({
-                        "Average_Projection": "{:.2f}", "Average_Actual": "{:.2f}",
-                        "MAE": "{:.3f}", "RMSE": "{:.3f}", "Bias": "{:+.3f}",
-                        "Actual_Above_Projection_Rate": "{:.1%}", "Average_Score": "{:.1f}",
-                    }),
-                    width="stretch",
-                    hide_index=True,
-                )
-            st.caption(
-                "Score buckets grade whether higher model scores are producing tighter projections, not whether they beat a prop line."
-            )
-
-            st.markdown("### Linear calibration")
-            calibration_bundle, calibration_table = make_calibration_bundle(completed_history, int(minimum_calibration_rows))
-            display_calibration = calibration_table.copy()
-            if not display_calibration.empty:
-                st.dataframe(
-                    display_calibration.style.format({
-                        "slope": "{:.4f}", "intercept": "{:+.4f}", "raw_mae": "{:.3f}",
-                        "calibrated_mae": "{:.3f}", "holdout_raw_mae": "{:.3f}",
-                        "holdout_calibrated_mae": "{:.3f}",
-                    }),
-                    width="stretch",
-                    hide_index=True,
-                )
-            st.caption(
-                "The holdout columns fit coefficients on the earlier 70% of starts and test them on the later 30%. "
-                "Use holdout improvement—not only in-sample improvement—before applying calibration."
-            )
-            if calibration_bundle.get("targets"):
-                calibration_json = json.dumps(calibration_bundle, indent=2).encode("utf-8")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.download_button(
-                        "Download calibration JSON",
-                        calibration_json,
-                        file_name="pitcher_calibration.json",
-                        mime="application/json",
-                        width="stretch",
-                    )
-                with c2:
-                    if st.button("Apply fitted calibration to current board", width="stretch"):
-                        st.session_state["pitcher_calibration"] = calibration_bundle
-                        recalibrated = apply_projection_calibration(st.session_state["pitcher_board"], calibration_bundle)
-                        st.session_state["pitcher_board"] = assign_scores(recalibrated)
-                        st.rerun()
-
-            with st.expander("Optional prop-line calibration — requires saved pregame lines", expanded=False):
-                st.caption(
-                    "This is only for betting-line decisions. It uses rows where a valid pregame prop line was saved, "
-                    "so it can be biased if only some pitchers/books have lines. It does not measure pure projection accuracy."
-                )
-                prop_target = st.selectbox("Prop target", list(BACKTEST_TARGETS), key="pitcher_prop_calibration_target")
-                prop_config = BACKTEST_TARGETS[prop_target]
-                target_completed = completed_history[[prop_config["projection"], prop_config["actual"]]].dropna().shape[0]
-                prop_records = prop_calibration_records(completed_history, prop_target)
-                if prop_records.empty:
-                    st.info(f"Enter {BACKTEST_TARGETS[prop_target]['line']} values in your saved snapshots to evaluate probabilities.")
-                else:
-                    prop_table, brier_score = probability_calibration_table(prop_records)
-                    p1, p2, p3 = st.columns(3)
-                    p1.metric("Decisions", f"{len(prop_records):,}")
-                    p2.metric("Brier score", f"{brier_score:.3f}", help="Lower is better; 0 is perfect.")
-                    coverage = len(prop_records) / target_completed if target_completed else np.nan
-                    p3.metric("Line coverage", f"{coverage:.1%}" if np.isfinite(coverage) else "N/A")
-                    st.dataframe(
-                        prop_table.style.format({
-                            "Average_Probability": "{:.1%}", "Actual_Win_Rate": "{:.1%}", "Calibration_Gap": "{:+.1%}",
-                        }),
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-            st.markdown("### Segment and lookback checks")
-            segment_choice = st.selectbox(
-                "Break results down by",
-                [column for column in ["LookbackDays", "Lineup_Status", "Confidence_Level", "PitcherLocation", "Hand", "ModelVersion"] if column in completed_history.columns],
-                key="pitcher_segment_choice",
-            )
-            segment_table = grouped_accuracy(completed_history, segment_choice)
-            if not segment_table.empty:
-                st.dataframe(
-                    segment_table.style.format({
-                        "MAE": "{:.3f}", "RMSE": "{:.3f}", "Bias": "{:+.3f}",
-                        "Correlation": "{:.3f}", "Baseline_MAE": "{:.3f}",
-                    }),
-                    width="stretch",
-                    hide_index=True,
-                )
-
-            with st.expander("Completed history used in this report"):
-                st.dataframe(completed_history, width="stretch", hide_index=True, height=500)
+    render_persistent_ml_section()
 
 with notes_tab:
     st.markdown(
         """
-        ### How to read the Pitcher Lab
+        ### Reading the board
+        - **1+ Hit** remains the primary target and combines the modeled hit rate per plate appearance with projected plate appearances.
+        - **2+ Hit** estimates the chance of a multi-hit game from the same per-PA rate and projected opportunities. It is currently uncalibrated and should be treated as a supplemental signal.
+        - **Projected Hits** is the expected event count: modeled rate per PA × projected PA. It is not itself a probability.
+        - **Hit Score** is a 0–100 comparison score within the selected offense, not a literal probability.
+        - **Pitcher Read / Side Attack** grades whether the starter has been more attackable or avoidable for LHB or RHB, with small samples shrunk toward neutral.
+        - **Pitch Match** compares the hitter with the starter's pitch types, velocity, movement and extension.
+        - **Zone Fit** weights hitter production by the locations the starter uses.
+        - **Park Factor** is automatically matched to the selected venue from Baseball Savant when its live table is available; 105 means ×1.05 and 95 means ×0.95. A neutral/manual fallback remains available.
+        - **Sample** marks hitters below the selected PA threshold. Active-roster players with no history use league-average priors and remain Low confidence.
+        - **Confidence** reflects sample size and matchup-data depth, not certainty that the outcome will occur.
 
-        - **Projected K** combines the pitcher's recent/season strikeout rate, Statcast K/whiff/CSW skills, projected batters faced, confirmed-lineup K profile, top-six lineup K%, pitch-mix whiff fit and recent arsenal form.
-        - **Projected ER** blends recent and season ER rates with xwOBA, walks, barrels, opponent quality, park factor and first-pitch weather.
-        - **Projected outs** starts with recent workload and now adds leash context: last-start pitch count, last-three pitch trend, stable workload rate, quality-start rate, short-hook risk and command risk.
-        - **K Score**, **Run Prevention Score** and **Outs Score** are 0–100 relative scores within the selected slate. They are not probabilities.
-        - **Overall Score** is 40% K Score, 35% Run Prevention Score and 25% Outs Score.
-        - Confirmed lineups are preferred. Before posting, the app uses the opponent's most recent observed lineup from Statcast.
-        - Small samples are shrunk toward league averages, and the confidence label falls when a pitcher has few starts or little Statcast history.
+        - **Automatic odds** can populate current-game or whole-slate lines, no-vig probability and model edge from The Odds API.
+        - **Slate Top 10 & pairings** builds both offenses across the slate, grades hitters from probability, model score and confidence, and creates multiple diversified three-person suggestions.
+        - **Backtest & calibration** exports timestamped pregame snapshots, retrieves official results, checks Brier score/log loss, validates Hit Score buckets and creates a probability-calibration JSON.
+        - **Persistent SQLite + ML** automatically stores pregame predictions, grades completed MLB results, supports historical Statcast backfills, uses chronological train/calibration/holdout splits, saves the hit model and calibration, and tracks forward performance without a daily master CSV.
 
-        - The **Backtest & calibration** tab exports timestamped pregame snapshots, fills official K/ER/outs results, measures MAE/RMSE/bias, compares simple recent-form baselines, checks score buckets and tests probability calibration.
-        - Use **Add current snapshot to session master** to append today's edited pregame board without uploading it first. Download the updated master-history CSV before leaving because Streamlit Community Cloud storage is temporary.
-        - A calibration JSON can be downloaded after a sufficient sample and loaded from the sidebar on future slates. Prefer coefficients that improve the chronological holdout sample.
-
-        This remains a projection framework. Use several hundred completed starts before making large weight changes, and never include snapshots generated after first pitch in a fair backtest.
+        The original dashboard probability and Hit Score remain unchanged. Raw ML Hit and Calibrated ML Hit are separate learned signals, and the newest chronological holdout plus forward results should determine how much trust to place in them.
         """
     )
