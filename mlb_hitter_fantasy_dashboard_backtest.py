@@ -3461,13 +3461,26 @@ def _seed_for_player(player_id: object, extra: str = "") -> int:
 
 
 def simulate_fantasy_scores(
-    row: pd.Series,
+    row: pd.Series | pd.DataFrame,
     scoring: dict[str, float],
     simulations: int = 3000,
     seed_extra: str = "",
 ) -> np.ndarray:
+    # A slate can occasionally contain more than one board row for the same
+    # player (for example after a lineup/odds merge).  Keep this function
+    # defensive so DataFrame.get() never returns a Series of multiple rows.
+    if isinstance(row, pd.DataFrame):
+        if row.empty:
+            return np.zeros(simulations, dtype=float)
+        row = row.iloc[0]
+    if row.index.has_duplicates:
+        row = row.loc[~row.index.duplicated(keep="first")]
+
     rng = np.random.default_rng(_seed_for_player(row.get("player_id"), seed_extra))
-    projected_pa = float(np.clip(row.get("Projected_PA", 4.1), 3.0, 5.5))
+    projected_pa_value = pd.to_numeric(row.get("Projected_PA", 4.1), errors="coerce")
+    if pd.isna(projected_pa_value):
+        projected_pa_value = 4.1
+    projected_pa = float(np.clip(projected_pa_value, 3.0, 5.5))
     floor_pa = int(math.floor(projected_pa))
     n_pa = floor_pa + (rng.random(simulations) < (projected_pa - floor_pa)).astype(int)
     max_pa = max(int(n_pa.max()), 1)
@@ -5358,7 +5371,6 @@ with pp_tab:
         key=f"fs_pp_lines_{pd.Timestamp(slate_date).date()}_{quote_signature}",
     )
 
-    model_lookup = board.set_index("player_id")
     over_probs, under_probs, push_probs = [], [], []
     for _, line_row in comparison.iterrows():
         line = pd.to_numeric(pd.Series([line_row.get("PP Line")]), errors="coerce").iloc[0]
@@ -5367,7 +5379,31 @@ with pp_tab:
             under_probs.append(np.nan)
             push_probs.append(np.nan)
             continue
-        model_row = model_lookup.loc[int(line_row["player_id"])]
+        player_id = pd.to_numeric(line_row.get("player_id"), errors="coerce")
+        if pd.isna(player_id):
+            over_probs.append(np.nan)
+            under_probs.append(np.nan)
+            push_probs.append(np.nan)
+            continue
+
+        # Resolve the model row by player and, when duplicates exist, by the
+        # team displayed in this exact comparison row.  This prevents .loc
+        # from returning a multi-row DataFrame for duplicate player IDs.
+        board_player_ids = pd.to_numeric(board["player_id"], errors="coerce")
+        candidates = board.loc[board_player_ids.eq(int(player_id))]
+        if len(candidates) > 1 and "Team" in candidates.columns:
+            team = str(line_row.get("Team", "")).strip().upper()
+            team_matches = candidates.loc[
+                candidates["Team"].astype(str).str.strip().str.upper().eq(team)
+            ]
+            if not team_matches.empty:
+                candidates = team_matches
+        if candidates.empty:
+            over_probs.append(np.nan)
+            under_probs.append(np.nan)
+            push_probs.append(np.nan)
+            continue
+        model_row = candidates.iloc[0]
         scores = simulate_fantasy_scores(
             model_row,
             scoring,
