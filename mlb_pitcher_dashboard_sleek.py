@@ -20,7 +20,7 @@ import streamlit as st
 from pybaseball import cache, playerid_reverse_lookup, statcast
 
 
-st.set_page_config(page_title="MLB Pitcher Lab", page_icon="âš¾", layout="wide")
+st.set_page_config(page_title="MLB Pitcher Lab", page_icon="⚾", layout="wide")
 cache.enable()
 
 HIT_EVENTS = {"single", "double", "triple", "home_run"}
@@ -53,7 +53,19 @@ OUTS_BY_EVENT = {
     "sac_fly_double_play": 2,
 }
 
-MODEL_VERSION = "pitcher-lab-backtest-odds-v2"
+MODEL_VERSION = "pitcher-lab-two-stage-k-v6"
+K_MODEL_VERSION = "two-stage-k-v6"
+K_BACKFILL_VERSION = "historical-lineup-pitch-fit-v3"
+SUPPORTED_K_MODEL_VERSIONS = {"two-stage-k-v5", K_MODEL_VERSION}
+BF_MODEL_FEATURES = [
+    "Season_BF", "Recent_BF", "Last_Start_Pitches", "Last3_Pitches",
+    "Recent_Outs", "Outs_SD", "Short_Hook_Rate", "Prior_Starts",
+]
+K_RATE_MODEL_FEATURES = [
+    "Pitcher_K_Rate", "Recent_K_Rate", "Whiff_Pct", "CSW_Pct",
+    "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate",
+    "PitchMix_Opp_Whiff", "Hand_L",
+]
 ODDS_API_SPORT = "baseball_mlb"
 ODDS_API_MARKETS = {
     "pitcher_strikeouts": {"prefix": "K", "label": "Strikeouts", "projection": "Proj_K"},
@@ -623,7 +635,7 @@ def select_prop_quote(candidates: pd.DataFrame, source_mode: str) -> dict | None
         subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
         subset["_Price"] = pd.to_numeric(subset["OverOdds"], errors="coerce").fillna(-100000)
         row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
-        row["SelectedSource"] = f"Best over Â· {row.get('Bookmaker')}"
+        row["SelectedSource"] = f"Best over | {row.get('Bookmaker')}"
         row["BookCount"] = int(books["BookmakerKey"].nunique())
         return row
     if source_mode == "Best sportsbook under line":
@@ -631,7 +643,7 @@ def select_prop_quote(candidates: pd.DataFrame, source_mode: str) -> dict | None
         subset = books[pd.to_numeric(books["Line"], errors="coerce").eq(best_line)].copy()
         subset["_Price"] = pd.to_numeric(subset["UnderOdds"], errors="coerce").fillna(-100000)
         row = subset.sort_values("_Price").iloc[-1].drop(labels="_Price").to_dict()
-        row["SelectedSource"] = f"Best under Â· {row.get('Bookmaker')}"
+        row["SelectedSource"] = f"Best under | {row.get('Bookmaker')}"
         row["BookCount"] = int(books["BookmakerKey"].nunique())
         return row
     return None
@@ -658,13 +670,20 @@ def no_vig_over_probability(over_odds: object, under_odds: object) -> float:
 def format_american_odds(value: object) -> str:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     if pd.isna(numeric):
-        return "â€”"
+        return "—"
     rounded = int(round(float(numeric)))
     return f"+{rounded}" if rounded > 0 else str(rounded)
 
 
-def apply_odds_quotes_to_board(board: pd.DataFrame, quotes: pd.DataFrame, source_mode: str) -> pd.DataFrame:
+def apply_odds_quotes_to_board(
+    board: pd.DataFrame,
+    quotes: pd.DataFrame,
+    source_mode: str,
+    independent_model_weight: float = 0.35,
+    minimum_bet_edge: float = 0.75,
+) -> pd.DataFrame:
     result = board.copy()
+    result["Independent_Proj_K"] = pd.to_numeric(result.get("Proj_K"), errors="coerce")
     for market_key, config in ODDS_API_MARKETS.items():
         prefix = config["prefix"]
         for column, default in {
@@ -711,6 +730,31 @@ def apply_odds_quotes_to_board(board: pd.DataFrame, quotes: pd.DataFrame, source
             result.at[index, f"{prefix}_Model_Over_Prob"] = float(model_over)
             result.at[index, f"{prefix}_Probability_Edge"] = float(model_over - market_over) if np.isfinite(market_over) else np.nan
             result.at[index, f"{prefix}_Projection_Edge"] = float(projection - float(line))
+    result["Market_Blend_K"] = np.nan
+    valid_k_line = pd.to_numeric(result.get("K_Line"), errors="coerce").notna()
+    weight = float(np.clip(independent_model_weight, 0.0, 1.0))
+    result.loc[valid_k_line, "Market_Blend_K"] = (
+        weight * pd.to_numeric(result.loc[valid_k_line, "Independent_Proj_K"], errors="coerce")
+        + (1.0 - weight) * pd.to_numeric(result.loc[valid_k_line, "K_Line"], errors="coerce")
+    )
+    result["Final_Proj_K"] = result["Market_Blend_K"].where(valid_k_line, result["Independent_Proj_K"])
+    result["Blended_K_Edge"] = result["Final_Proj_K"] - pd.to_numeric(result.get("K_Line"), errors="coerce")
+    for index in result.index[valid_k_line]:
+        line = float(result.at[index, "K_Line"])
+        final_projection = float(result.at[index, "Final_Proj_K"])
+        result.at[index, "K_Model_Over_Prob"] = probability_over_line(final_projection, line)
+        market_probability = pd.to_numeric(pd.Series([result.at[index, "K_Market_Over_Prob"]]), errors="coerce").iloc[0]
+        result.at[index, "K_Probability_Edge"] = (
+            float(result.at[index, "K_Model_Over_Prob"] - market_probability)
+            if pd.notna(market_probability) else np.nan
+        )
+    role_ok = result.get("Role_Eligible", pd.Series(False, index=result.index)).fillna(False).astype(bool)
+    confirmed = result.get("Lineup_Status", pd.Series("", index=result.index)).astype(str).eq("Confirmed")
+    edge_ok = result["Blended_K_Edge"].abs().ge(float(minimum_bet_edge)).fillna(False)
+    result["Bet_Eligible"] = role_ok & confirmed & valid_k_line & edge_ok
+    result["K_Bet_Signal"] = np.where(
+        result["Bet_Eligible"], np.where(result["Blended_K_Edge"].gt(0), "OVER", "UNDER"), "PASS"
+    )
     result["OddsSourceMode"] = source_mode
     return result
 
@@ -852,6 +896,345 @@ def league_context(df: pd.DataFrame) -> dict:
         "CSW": float((df["is_whiff"].sum() + df["is_called_strike"].sum()) / pitches),
         "ER9": 4.30,
     }
+
+
+# -----------------------------------------------------------------------------
+# Chronological two-stage strikeout model
+# -----------------------------------------------------------------------------
+
+def _mode_text(series: pd.Series, default: str = "") -> str:
+    values = series.dropna().astype(str)
+    return str(values.mode().iloc[0]) if not values.empty else default
+
+
+def build_historical_start_summaries(df: pd.DataFrame) -> pd.DataFrame:
+    """Create one leakage-safe result row per starting pitcher/game from Statcast."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df[df["game_date"].notna() & df["game_pk"].notna() & df["pitcher"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["at_bat_number"] = pd.to_numeric(work["at_bat_number"], errors="coerce")
+    first_ab = (
+        work.groupby(["game_pk", "pitcher_team", "pitcher"], dropna=False)["at_bat_number"]
+        .min().reset_index(name="FirstAB")
+    )
+    starters = (
+        first_ab.sort_values(["game_pk", "pitcher_team", "FirstAB"])
+        .drop_duplicates(["game_pk", "pitcher_team"], keep="first")
+        [["game_pk", "pitcher_team", "pitcher"]]
+    )
+    work = work.merge(starters.assign(IsStarter=True), on=["game_pk", "pitcher_team", "pitcher"], how="left")
+    work = work[work["IsStarter"].fillna(False)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    summaries = (
+        work.groupby(["game_date", "game_pk", "pitcher", "pitcher_team"], dropna=False)
+        .agg(
+            Opponent=("batter_team", lambda s: _mode_text(s, "")),
+            Hand=("p_throws", lambda s: _mode_text(s, "R")),
+            Actual_BF=("pa_key", lambda s: int(s[work.loc[s.index, "is_pa_end"]].nunique())),
+            Actual_K=("is_k", "sum"),
+            Actual_Outs=("outs_recorded", "sum"),
+            Actual_Pitches=("pitcher", "size"),
+            Swings=("is_swing", "sum"),
+            Whiffs=("is_whiff", "sum"),
+            CalledStrikes=("is_called_strike", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"game_date": "Date", "game_pk": "GamePK", "pitcher": "PitcherID", "pitcher_team": "Team"})
+    )
+    for column in ["Actual_BF", "Actual_K", "Actual_Outs", "Actual_Pitches", "Swings", "Whiffs", "CalledStrikes"]:
+        summaries[column] = pd.to_numeric(summaries[column], errors="coerce").fillna(0.0)
+    # Remove openers and scoring artifacts from the training target. These are
+    # still useful later as examples for the live role-risk gate.
+    summaries["StarterLengthOK"] = summaries["Actual_Pitches"].ge(40) | summaries["Actual_Outs"].ge(9)
+    return summaries.sort_values(["Date", "GamePK", "Team"]).reset_index(drop=True)
+
+
+def build_chronological_k_backfill(df: pd.DataFrame, target_start: object, target_end: object) -> pd.DataFrame:
+    """Build pregame features using only games strictly before each target start."""
+    starts = build_historical_start_summaries(df)
+    if starts.empty:
+        return starts
+    target_start = pd.Timestamp(target_start).normalize()
+    target_end = pd.Timestamp(target_end).normalize()
+    rows: list[dict] = []
+    for current in starts.itertuples(index=False):
+        current_date = pd.Timestamp(current.Date).normalize()
+        if current_date < target_start or current_date > target_end or not bool(current.StarterLengthOK):
+            continue
+        prior = starts[starts["Date"].lt(current_date) & starts["StarterLengthOK"]].copy()
+        pitcher_prior = prior[prior["PitcherID"].eq(current.PitcherID)].sort_values("Date")
+        if len(pitcher_prior) < 2:
+            continue
+        recent = pitcher_prior.tail(5)
+        league_bf = max(float(prior["Actual_BF"].sum()), 1.0)
+        league_k_rate = float(prior["Actual_K"].sum() / league_bf)
+        league_whiff = float(prior["Whiffs"].sum() / max(prior["Swings"].sum(), 1.0))
+        league_csw = float((prior["Whiffs"].sum() + prior["CalledStrikes"].sum()) / max(prior["Actual_Pitches"].sum(), 1.0))
+        pitcher_bf = float(pitcher_prior["Actual_BF"].sum())
+        recent_bf = float(recent["Actual_BF"].sum())
+        pitcher_k = (float(pitcher_prior["Actual_K"].sum()) + league_k_rate * 120.0) / (pitcher_bf + 120.0)
+        recent_k = (float(recent["Actual_K"].sum()) + pitcher_k * 55.0) / (recent_bf + 55.0)
+        whiff = (float(pitcher_prior["Whiffs"].sum()) + league_whiff * 180.0) / (float(pitcher_prior["Swings"].sum()) + 180.0)
+        csw = (float(pitcher_prior["Whiffs"].sum() + pitcher_prior["CalledStrikes"].sum()) + league_csw * 300.0) / (float(pitcher_prior["Actual_Pitches"].sum()) + 300.0)
+        # Opponent is the batting team in each historical start. Filtering on
+        # Team here would measure the opponent club's pitchers instead of the
+        # opposing hitters' strikeout tendency.
+        opponent_prior = prior[
+            prior["Opponent"].eq(current.Opponent) & prior["Hand"].eq(current.Hand)
+        ]
+        opponent_bf = float(opponent_prior["Actual_BF"].sum())
+        opponent_k = (float(opponent_prior["Actual_K"].sum()) + league_k_rate * 220.0) / (opponent_bf + 220.0)
+        outs = pd.to_numeric(pitcher_prior["Actual_Outs"], errors="coerce").dropna()
+        recent_outs = float(recent["Actual_Outs"].mean())
+        short_hook = float(pitcher_prior["Actual_Outs"].lt(15).mean())
+        rows.append({
+            # The in-app builder intentionally remains marked legacy because
+            # it does not retain the compact hitter/pitch histories required
+            # for the v3 lineup matchup. Use the Colab runner for v3 training.
+            "BackfillVersion": "streamlit-legacy-team-k-v2",
+            "Date": str(current_date.date()), "GamePK": int(current.GamePK), "PitcherID": int(current.PitcherID),
+            "Team": str(current.Team), "Opponent": str(current.Opponent), "Hand": str(current.Hand),
+            "Season_BF": float(pitcher_prior["Actual_BF"].mean()),
+            "Recent_BF": float(recent["Actual_BF"].mean()),
+            "Last_Start_Pitches": float(pitcher_prior.iloc[-1]["Actual_Pitches"]),
+            "Last3_Pitches": float(pitcher_prior.tail(3)["Actual_Pitches"].mean()),
+            "Recent_Outs": recent_outs,
+            "Outs_SD": float(outs.tail(8).std(ddof=0)) if len(outs) > 1 else 3.0,
+            "Short_Hook_Rate": short_hook,
+            "Prior_Starts": int(len(pitcher_prior)),
+            "Pitcher_K_Rate": pitcher_k, "Recent_K_Rate": recent_k,
+            "Whiff_Pct": whiff, "CSW_Pct": csw,
+            "Opponent_K_Rate": opponent_k, "Hand_L": 1.0 if str(current.Hand) == "L" else 0.0,
+            "Actual_BF": float(current.Actual_BF), "Actual_K": float(current.Actual_K),
+            "Actual_K_Rate": float(current.Actual_K / max(current.Actual_BF, 1.0)),
+            "Actual_Outs": float(current.Actual_Outs), "Actual_Pitches": float(current.Actual_Pitches),
+        })
+    return pd.DataFrame(rows).sort_values(["Date", "GamePK", "PitcherID"]).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def _fit_ridge_payload(frame: pd.DataFrame, features: list[str], target: str, alpha: float = 8.0) -> dict:
+    clean = frame[features + [target]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(clean) < max(40, len(features) * 5):
+        return {}
+    x = clean[features].to_numpy(float)
+    y = clean[target].to_numpy(float)
+    means = x.mean(axis=0)
+    scales = x.std(axis=0)
+    scales = np.where(scales < 1e-8, 1.0, scales)
+    z = (x - means) / scales
+    design = np.column_stack([np.ones(len(z)), z])
+    penalty = np.eye(design.shape[1]) * float(alpha)
+    penalty[0, 0] = 0.0
+    coefficients = np.linalg.pinv(design.T @ design + penalty) @ design.T @ y
+    return {
+        "features": features, "means": means.tolist(), "scales": scales.tolist(),
+        "intercept": float(coefficients[0]), "coefficients": coefficients[1:].tolist(),
+    }
+
+
+def _ridge_predict(payload: dict, values: dict, default: float) -> float:
+    if not isinstance(payload, dict) or not payload.get("features"):
+        return float(default)
+    try:
+        x = np.array([float(values.get(name, np.nan)) for name in payload["features"]], dtype=float)
+        means = np.array(payload["means"], dtype=float)
+        scales = np.array(payload["scales"], dtype=float)
+        x = np.where(np.isfinite(x), x, means)
+        return float(payload["intercept"] + np.dot((x - means) / scales, np.array(payload["coefficients"], dtype=float)))
+    except Exception:
+        return float(default)
+
+
+def train_two_stage_k_model(backfill: pd.DataFrame, alpha: float = 8.0) -> tuple[dict, dict]:
+    """Tune with expanding time-series folds, then grade once on untouched future starts."""
+    if backfill is None or len(backfill) < 150:
+        return {}, {"ok": False, "message": "At least 150 chronological starts are required."}
+    if "BackfillVersion" not in backfill.columns:
+        return {}, {
+            "ok": False,
+            "message": (
+                "This is a legacy backfill with the old opponent K-rate calculation. "
+                "Rebuild the chronological backfill with this dashboard before training."
+            ),
+        }
+    versions = set(backfill["BackfillVersion"].dropna().astype(str).unique())
+    if versions != {K_BACKFILL_VERSION}:
+        return {}, {
+            "ok": False,
+            "message": (
+                f"Backfill version mismatch. Expected {K_BACKFILL_VERSION}; "
+                f"found {', '.join(sorted(versions)) or 'missing values'}."
+            ),
+        }
+    missing_features = [
+        column for column in BF_MODEL_FEATURES + K_RATE_MODEL_FEATURES + ["Actual_BF", "Actual_K", "Actual_K_Rate"]
+        if column not in backfill.columns
+    ]
+    if missing_features:
+        return {}, {
+            "ok": False,
+            "message": "Backfill is missing required v3 fields: " + ", ".join(missing_features),
+        }
+    data = backfill.sort_values(["Date", "GamePK", "PitcherID"]).reset_index(drop=True)
+    development_end = int(len(data) * 0.80)
+    development = data.iloc[:development_end].copy()
+    test = data.iloc[development_end:].copy()
+    if min(len(development), len(test)) < 60:
+        return {}, {"ok": False, "message": "Development and final-test blocks each require at least 60 starts."}
+
+    def predict_rows(frame: pd.DataFrame, bf_model: dict, rate_model: dict) -> np.ndarray:
+        predictions = []
+        for row in frame.to_dict("records"):
+            bf = np.clip(_ridge_predict(bf_model, row, row.get("Recent_BF", 22.0)), 12.0, 31.0)
+            rate = np.clip(_ridge_predict(rate_model, row, row.get("Pitcher_K_Rate", 0.22)), 0.08, 0.42)
+            predictions.append(float(bf * rate))
+        return np.array(predictions)
+
+    alpha_candidates = sorted({1.0, 2.0, 4.0, 8.0, 12.0, 20.0, 30.0, float(alpha)})
+    # Four expanding-window folds live entirely inside the first 80%. Each
+    # validation row is later in time than every row used to fit that fold.
+    fold_count = 4
+    initial_train_end = int(len(development) * 0.50)
+    remaining = len(development) - initial_train_end
+    fold_size = remaining // fold_count
+    folds: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    for fold_index in range(fold_count):
+        fold_train_end = initial_train_end + fold_index * fold_size
+        fold_validation_end = (
+            len(development) if fold_index == fold_count - 1 else fold_train_end + fold_size
+        )
+        fold_train = development.iloc[:fold_train_end]
+        fold_validation = development.iloc[fold_train_end:fold_validation_end]
+        if min(len(fold_train), len(fold_validation)) >= 30:
+            folds.append((fold_train, fold_validation))
+    if len(folds) < 3:
+        return {}, {"ok": False, "message": "The development sample could not form at least three chronological folds."}
+
+    validation_results: list[dict] = []
+    for candidate in alpha_candidates:
+        fold_predictions: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for fold_train, fold_validation in folds:
+            candidate_bf = _fit_ridge_payload(fold_train, BF_MODEL_FEATURES, "Actual_BF", candidate)
+            candidate_rate = _fit_ridge_payload(fold_train, K_RATE_MODEL_FEATURES, "Actual_K_Rate", candidate)
+            if not candidate_bf or not candidate_rate:
+                fold_predictions = []
+                break
+            actual = fold_validation["Actual_K"].to_numpy(float)
+            baseline = (fold_validation["Recent_BF"] * fold_validation["Pitcher_K_Rate"]).to_numpy(float)
+            fold_predictions.append((predict_rows(fold_validation, candidate_bf, candidate_rate), baseline, actual))
+        if not fold_predictions:
+            continue
+        for model_weight in np.linspace(0.0, 1.0, 11):
+            fold_mae: list[float] = []
+            fold_baseline_mae: list[float] = []
+            for ml_prediction, baseline, actual in fold_predictions:
+                blended = model_weight * ml_prediction + (1.0 - model_weight) * baseline
+                fold_mae.append(float(np.mean(np.abs(blended - actual))))
+                fold_baseline_mae.append(float(np.mean(np.abs(baseline - actual))))
+            improvements = [base - model for base, model in zip(fold_baseline_mae, fold_mae)]
+            validation_results.append({
+                "alpha": float(candidate), "model_weight": float(model_weight),
+                "mae": float(np.mean(fold_mae)),
+                "baseline_mae": float(np.mean(fold_baseline_mae)),
+                "mean_improvement": float(np.mean(improvements)),
+                "positive_folds": int(sum(value > 0.0 for value in improvements)),
+                "fold_mae": fold_mae,
+                "fold_baseline_mae": fold_baseline_mae,
+                "fold_improvements": improvements,
+            })
+    if not validation_results:
+        return {}, {"ok": False, "message": "The backfill did not contain enough complete feature rows."}
+    best_validation = min(
+        validation_results,
+        key=lambda item: (item["mae"], -item["positive_folds"], item["model_weight"], item["alpha"]),
+    )
+    selected_alpha = float(best_validation["alpha"])
+    selected_model_weight = float(best_validation["model_weight"])
+
+    # Refit on the complete first 80%. The last 20% remains untouched until
+    # this one final evaluation.
+    bf_model = _fit_ridge_payload(development, BF_MODEL_FEATURES, "Actual_BF", selected_alpha)
+    rate_model = _fit_ridge_payload(development, K_RATE_MODEL_FEATURES, "Actual_K_Rate", selected_alpha)
+    if not bf_model or not rate_model:
+        return {}, {"ok": False, "message": "The selected model could not be refit on the development sample."}
+    development_ml_pred = predict_rows(development, bf_model, rate_model)
+    test_ml_pred = predict_rows(test, bf_model, rate_model)
+    holdout_actual = test["Actual_K"].to_numpy(float)
+    holdout_baseline = (test["Recent_BF"] * test["Pitcher_K_Rate"]).to_numpy(float)
+    development_baseline = (development["Recent_BF"] * development["Pitcher_K_Rate"]).to_numpy(float)
+    development_pred = selected_model_weight * development_ml_pred + (1.0 - selected_model_weight) * development_baseline
+    test_pred = selected_model_weight * test_ml_pred + (1.0 - selected_model_weight) * holdout_baseline
+    holdout_mae = float(np.mean(np.abs(test_pred - holdout_actual)))
+    holdout_baseline_mae = float(np.mean(np.abs(holdout_baseline - holdout_actual)))
+    improvement = float(holdout_baseline_mae - holdout_mae)
+    rolling_improvement = float(best_validation["mean_improvement"])
+    positive_folds = int(best_validation["positive_folds"])
+    required_positive_folds = max(3, len(folds) - 1)
+    # A model must improve by at least 0.005 K on both the rolling folds and
+    # untouched future test, and it must beat baseline in at least 3/4 folds.
+    accepted = bool(
+        improvement >= 0.005
+        and rolling_improvement >= 0.005
+        and positive_folds >= required_positive_folds
+    )
+    model = {
+        "version": K_MODEL_VERSION,
+        "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "training_rows": int(len(development)),
+        "validation_rows": int(sum(len(validation) for _, validation in folds)),
+        "holdout_rows": int(len(test)), "alpha": selected_alpha,
+        "ensemble_model_weight": selected_model_weight,
+        "rolling_fold_count": int(len(folds)),
+        "rolling_positive_folds": positive_folds,
+        "rolling_improvement": rolling_improvement,
+        "holdout_mae": holdout_mae, "holdout_baseline_mae": holdout_baseline_mae,
+        "bf_model": bf_model, "rate_model": rate_model,
+    }
+    metrics = {
+        "ok": True, "accepted": accepted,
+        "training_n": int(len(development)), "development_n": int(len(development)),
+        "validation_n": int(sum(len(validation) for _, validation in folds)), "holdout_n": int(len(test)),
+        "fold_count": int(len(folds)), "positive_folds": positive_folds,
+        "selected_alpha": selected_alpha, "selected_model_weight": selected_model_weight,
+        "validation_mae": float(best_validation["mae"]),
+        "rolling_baseline_mae": float(best_validation["baseline_mae"]),
+        "rolling_improvement": rolling_improvement,
+        "fold_improvements": [float(value) for value in best_validation["fold_improvements"]],
+        "training_mae": float(np.mean(np.abs(development_pred - development["Actual_K"].to_numpy(float)))),
+        "holdout_mae": holdout_mae,
+        "holdout_bias": float(np.mean(test_pred - holdout_actual)),
+        "holdout_baseline_mae": holdout_baseline_mae,
+        "holdout_improvement": improvement,
+        "message": (
+            "Model accepted: it improved across the rolling folds and the untouched final test."
+            if accepted else
+            "Model rejected: it must improve by at least 0.005 K on rolling validation and the untouched final test, while winning at least 3 of 4 folds."
+        ),
+    }
+    return (model if accepted else {}), metrics
+
+
+def parse_two_stage_k_model(payload: object) -> dict:
+    if not isinstance(payload, dict) or payload.get("version") not in SUPPORTED_K_MODEL_VERSIONS:
+        return {}
+    if not isinstance(payload.get("bf_model"), dict) or not isinstance(payload.get("rate_model"), dict):
+        return {}
+    return payload
+
+
+def validate_starter_role(log: dict) -> tuple[str, bool, str]:
+    starts = int(log.get("Starts", 0) or 0)
+    last_pitches = float(log.get("Last_Start_Pitches", 0.0) or 0.0)
+    last3 = float(log.get("Last3_Pitches", 0.0) or 0.0)
+    recent_bf = float(log.get("Recent_BF", 0.0) or 0.0)
+    if starts >= 3 and last_pitches >= 55 and last3 >= 55 and recent_bf >= 16:
+        return "Verified starter", True, "Recent starter workload is established."
+    if starts >= 1 and last_pitches >= 60 and recent_bf >= 15:
+        return "Emerging starter", True, "Limited start history; require a market line before betting."
+    return "Opener / role risk", False, "Recent workload does not verify a normal starter role."
 
 
 # -----------------------------------------------------------------------------
@@ -1356,7 +1739,7 @@ def build_lineup_profile(
         "Top6_K_Pct": float(np.average(base.loc[base["LineupSpot"].le(6), "K_Pct"], weights=base.loc[base["LineupSpot"].le(6), "Weight"])) if len(base.loc[base["LineupSpot"].le(6)]) else league["K_PA"],
         "Bottom3_K_Pct": float(np.average(base.loc[base["LineupSpot"].ge(7), "K_Pct"], weights=base.loc[base["LineupSpot"].ge(7), "Weight"])) if len(base.loc[base["LineupSpot"].ge(7)]) else league["K_PA"],
         "Lineup_Contact_Risk": float(1.0 - np.average(base["Whiff_Pct"], weights=weights)) if len(base) else 1.0 - league["Whiff"],
-        "Top_HR_Threat": str(base.loc[base["HR_Threat_Score"].idxmax(), "Player"]) if "HR_Threat_Score" in base and base["HR_Threat_Score"].notna().any() else "â€”",
+        "Top_HR_Threat": str(base.loc[base["HR_Threat_Score"].idxmax(), "Player"]) if "HR_Threat_Score" in base and base["HR_Threat_Score"].notna().any() else "—",
         "Top_HR_Threat_Score": float(base["HR_Threat_Score"].max()) if "HR_Threat_Score" in base and base["HR_Threat_Score"].notna().any() else 50.0,
         "Lineup_Zone_Fit": float(np.average(base["Zone_Fit_Score"], weights=weights)) if "Zone_Fit_Score" in base and len(base) else 50.0,
     }
@@ -1490,7 +1873,7 @@ def park_run_factor(venue: str, lineup_table: pd.DataFrame) -> tuple[float, str]
         hit_factor = float(np.average(hit_values, weights=weights))
         hr_factor = float(np.average(hr_values, weights=weights))
     factor = 0.68 * hit_factor + 0.32 * hr_factor
-    return float(factor), f"park_factors.csv Â· {int(row.get('rolling_years', 3))}-year"
+    return float(factor), f"park_factors.csv | {int(row.get('rolling_years', 3))}-year"
 
 
 def load_stadium_weather_metadata(venue: str) -> dict:
@@ -1714,6 +2097,7 @@ def build_pitcher_projection(
     lineup_status: str,
     weather: dict,
     season: int,
+    k_model: dict | None = None,
 ) -> tuple[dict, dict]:
     logs, log_error = fetch_pitcher_game_log(int(pitcher_id), int(season))
     log = game_log_profile(logs, league)
@@ -1748,18 +2132,61 @@ def build_pitcher_projection(
         0.55 * (log["Recent_BF"] / max(log["Recent_Outs"], 1.0))
         + 0.45 * (log["Season_BF"] / max(log["Season_Outs"], 1.0))
     )
-    projected_bf = float(np.clip(projected_outs * bf_per_out, 13.0, 31.0))
+    rule_projected_bf = float(np.clip(projected_outs * bf_per_out, 13.0, 31.0))
     projected_pitches = float(np.clip(0.60 * log["Recent_Pitches"] + 0.40 * log["Season_Pitches"], 65.0, 112.0))
 
-    base_k_rate = 0.35 * pitcher["K_PA"] + 0.35 * log["Recent_K_BF"] + 0.30 * log["Season_K_BF"]
-    matchup_factor = (
-        (opponent["Opp_K_PA"] / max(league["K_PA"], 0.001)) ** 0.36
-        * (opponent["Opp_Whiff"] / max(league["Whiff"], 0.001)) ** 0.16
-        * (pitcher["Whiff_Pct"] / max(league["Whiff"], 0.001)) ** 0.16
-        * (1.0 + (pitch_match_score - 50.0) / 320.0)
+    # Stable additive K-rate construction. Additive deltas avoid the runaway
+    # compounding that occurred when several noisy ratios were multiplied.
+    whiff_k_equivalent = league["K_PA"] + 0.72 * (pitcher["Whiff_Pct"] - league["Whiff"])
+    csw_k_equivalent = league["K_PA"] + 0.78 * (pitcher["CSW_Pct"] - league["CSW"])
+    skill_rate = (
+        0.46 * pitcher["K_PA"]
+        + 0.14 * log["Recent_K_BF"]
+        + 0.18 * log["Season_K_BF"]
+        + 0.12 * whiff_k_equivalent
+        + 0.10 * csw_k_equivalent
     )
-    adjusted_k_rate = float(np.clip(base_k_rate * matchup_factor, 0.075, 0.46))
-    projected_k = float(np.clip(projected_bf * adjusted_k_rate, 1.0, 13.5))
+    matchup_delta = (
+        0.52 * (opponent["Opp_K_PA"] - league["K_PA"])
+        + 0.12 * (opponent["Top6_K_Pct"] - opponent["Opp_K_PA"])
+        + 0.08 * (pitch_mix_whiff - league["Whiff"])
+        + 0.00018 * (pitch_match_score - 50.0)
+    )
+    hand_adjustment = -0.020 if pitcher["Hand"] == "L" else 0.0
+    rule_k_rate = float(np.clip(skill_rate + matchup_delta + hand_adjustment, 0.08, 0.42))
+
+    role_status, role_eligible, role_note = validate_starter_role(log)
+    model_payload = parse_two_stage_k_model(k_model or {})
+    feature_values = {
+        "Season_BF": log["Season_BF"], "Recent_BF": log["Recent_BF"],
+        "Last_Start_Pitches": log["Last_Start_Pitches"], "Last3_Pitches": log["Last3_Pitches"],
+        "Recent_Outs": log["Recent_Outs"], "Outs_SD": log["Outs_SD"],
+        "Short_Hook_Rate": log["Short_Hook_Rate"], "Prior_Starts": log["Starts"],
+        "Pitcher_K_Rate": pitcher["K_PA"], "Recent_K_Rate": log["Recent_K_BF"],
+        "Whiff_Pct": pitcher["Whiff_Pct"], "CSW_Pct": pitcher["CSW_Pct"],
+        "Opponent_K_Rate": opponent["Opp_K_PA"],
+        "Top6_K_Rate": opponent["Top6_K_Pct"],
+        "Bottom3_K_Rate": opponent["Bottom3_K_Pct"],
+        "PitchMix_Opp_Whiff": pitch_mix_whiff,
+        "Hand_L": 1.0 if pitcher["Hand"] == "L" else 0.0,
+    }
+    if model_payload:
+        learned_bf = float(np.clip(_ridge_predict(model_payload["bf_model"], feature_values, rule_projected_bf), 12.0, 31.0))
+        learned_rate = float(np.clip(_ridge_predict(model_payload["rate_model"], feature_values, rule_k_rate), 0.08, 0.42))
+        learned_k = learned_bf * learned_rate
+        rule_k = rule_projected_bf * rule_k_rate
+        ensemble_weight = float(np.clip(model_payload.get("ensemble_model_weight", 0.75), 0.0, 1.0))
+        projected_bf = float(ensemble_weight * learned_bf + (1.0 - ensemble_weight) * rule_projected_bf)
+        ensemble_k = float(ensemble_weight * learned_k + (1.0 - ensemble_weight) * rule_k)
+        adjusted_k_rate = float(np.clip(ensemble_k / max(projected_bf, 1.0), 0.08, 0.42))
+        k_model_source = f"Ensemble {ensemble_weight:.0%} ML | {model_payload.get('version', K_MODEL_VERSION)}"
+    else:
+        projected_bf = rule_projected_bf
+        adjusted_k_rate = rule_k_rate
+        k_model_source = "Stabilized rules"
+    if not role_eligible:
+        projected_bf = min(projected_bf, 16.0)
+    projected_k = float(np.clip(projected_bf * adjusted_k_rate, 0.5, 13.5))
 
     quality_er9 = (
         league["ER9"]
@@ -1828,7 +2255,7 @@ def build_pitcher_projection(
         "Team": pitcher_team,
         "Opponent": opponent_team,
         "Matchup": f"{game.get('away_abbr')} @ {game.get('home_abbr')}",
-        "Game": f"{game.get('away_abbr')} @ {game.get('home_abbr')} Â· {game.get('time_et')}",
+        "Game": f"{game.get('away_abbr')} @ {game.get('home_abbr')} | {game.get('time_et')}",
         "GamePK": game.get("game_pk"),
         "SlateDate": game.get("slate_date"),
         "GameDateTimeUTC": game.get("game_datetime_utc"),
@@ -1841,6 +2268,14 @@ def build_pitcher_projection(
         "Proj_Innings": projected_outs / 3.0,
         "Proj_BF": projected_bf,
         "Proj_Pitches": projected_pitches,
+        "Rule_Proj_BF": rule_projected_bf,
+        "Rule_K_Rate": rule_k_rate,
+        "K_Model_Source": k_model_source,
+        "Role_Status": role_status,
+        "Role_Eligible": role_eligible,
+        "Role_Note": role_note,
+        "Projection_Eligible": bool(role_eligible and lineup_status == "Confirmed"),
+        "Bet_Eligible": False,
         "Adj_K_Rate": adjusted_k_rate,
         "Pitcher_K_Rate": pitcher["K_PA"],
         "Opponent_K_Rate": opponent["Opp_K_PA"],
@@ -1962,6 +2397,9 @@ def apply_projection_calibration(board: pd.DataFrame, calibration: dict | None) 
             result[raw_col] = pd.to_numeric(result[projection_col], errors="coerce")
         else:
             result[raw_col] = pd.to_numeric(result[raw_col], errors="coerce")
+        if target_name == "Strikeouts":
+            result[projection_col] = result[raw_col]
+            continue
         coefficients = target_payload.get(target_name)
         if not coefficients:
             result[projection_col] = result[raw_col]
@@ -2041,6 +2479,10 @@ def assign_scores(board: pd.DataFrame) -> pd.DataFrame:
             notes.append("Workload caution")
         if pd.notna(row.get("Command_Score")) and float(row.get("Command_Score")) < 45:
             notes.append("Command risk")
+        if not bool(row.get("Role_Eligible", False)):
+            notes.append("Opener / role risk — no bet")
+        if str(row.get("Lineup_Status", "")) != "Confirmed":
+            notes.append("Lineup not confirmed")
         risk_notes.append("; ".join(notes) if notes else "Clean")
     result["Projection_Risk_Note"] = risk_notes
     result["K_Rank"] = result["Proj_K"].rank(method="min", ascending=False).astype(int)
@@ -2543,7 +2985,7 @@ def make_calibration_bundle(history: pd.DataFrame, min_rows: int = 30) -> tuple[
         fit = fit_linear_calibration(history, config["projection"], config["actual"], min_rows=min_rows)
         row = {"Target": target_name, **fit}
         rows.append(row)
-        if fit.get("ok"):
+        if fit.get("ok") and target_name != "Strikeouts":
             payload["targets"][target_name] = {
                 "projection_column": config["projection"],
                 "actual_column": config["actual"],
@@ -2619,7 +3061,7 @@ def probability_calibration_table(records: pd.DataFrame) -> tuple[pd.DataFrame, 
     if records is None or records.empty:
         return pd.DataFrame(), np.nan
     bins = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 1.001]
-    labels = ["50â€“54%", "55â€“59%", "60â€“64%", "65â€“69%", "70â€“74%", "75%+"]
+    labels = ["50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75%+"]
     frame = records.copy()
     frame["Probability_Bucket"] = pd.cut(frame["Preferred_Probability"], bins=bins, labels=labels, right=False, include_lowest=True)
     grouped = frame.groupby("Probability_Bucket", observed=False).agg(
@@ -2654,10 +3096,10 @@ def _bucket_accuracy_summary(frame: pd.DataFrame, bucket_col: str, projection_co
 
 def projection_bucket_edges(target_name: str) -> tuple[list[float], list[str]]:
     if target_name == "Strikeouts":
-        return [0, 3, 4, 5, 6, 7, 8, 30], ["0â€“2.9", "3.0â€“3.9", "4.0â€“4.9", "5.0â€“5.9", "6.0â€“6.9", "7.0â€“7.9", "8.0+"]
+        return [0, 3, 4, 5, 6, 7, 8, 30], ["0–2.9", "3.0–3.9", "4.0–4.9", "5.0–5.9", "6.0–6.9", "7.0–7.9", "8.0+"]
     if target_name == "Earned runs":
-        return [0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 20], ["0.0â€“1.4", "1.5â€“1.9", "2.0â€“2.4", "2.5â€“2.9", "3.0â€“3.4", "3.5â€“3.9", "4.0+"]
-    return [0, 12, 15, 18, 21, 24, 40], ["0â€“11", "12â€“14", "15â€“17", "18â€“20", "21â€“23", "24+"]
+        return [0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 20], ["0.0–1.4", "1.5–1.9", "2.0–2.4", "2.5–2.9", "3.0–3.4", "3.5–3.9", "4.0+"]
+    return [0, 12, 15, 18, 21, 24, 40], ["0–11", "12–14", "15–17", "18–20", "21–23", "24+"]
 
 
 def model_projection_bucket_table(history: pd.DataFrame, target_name: str) -> pd.DataFrame:
@@ -2690,7 +3132,7 @@ def score_bucket_table(history: pd.DataFrame, target_name: str) -> pd.DataFrame:
     if frame.empty:
         return frame
     bins = [-0.001, 30, 45, 55, 70, 85, 100.001]
-    labels = ["0â€“29", "30â€“44", "45â€“54", "55â€“69", "70â€“84", "85â€“100"]
+    labels = ["0–29", "30–44", "45–54", "55–69", "70–84", "85–100"]
     frame["Score_Bucket"] = pd.cut(frame[score_col], bins=bins, labels=labels, include_lowest=True, right=False)
     grouped = _bucket_accuracy_summary(frame, "Score_Bucket", projection_col, actual_col)
     if not grouped.empty:
@@ -2921,7 +3363,7 @@ def render_color_legend(location: str = "dashboard") -> None:
     st.markdown(
         f"""
         <div class="legend-card">
-            <div class="legend-title">Table Color Key Â· {escape(str(location).title())}</div>
+            <div class="legend-title">Table Color Key | {escape(str(location).title())}</div>
             <div class="legend-grid">
                 <div class="legend-item"><span class="legend-swatch favorable"></span><b>Green</b><span>Favorable for pitcher / strong support</span></div>
                 <div class="legend-item"><span class="legend-swatch warning"></span><b>Yellow</b><span>Caution or mixed signal</span></div>
@@ -3082,7 +3524,7 @@ def render_edge_header() -> None:
         """
         <div class="edge-topbar">
             <div class="edge-brand">
-                <div class="edge-logo">âš¾</div>
+                <div class="edge-logo">⚾</div>
                 <div>
                     <div class="edge-brand-title">PITCH EDGE</div>
                     <div class="edge-brand-subtitle">Pitcher prop projections & model accuracy</div>
@@ -3092,7 +3534,7 @@ def render_edge_header() -> None:
                 <span class="edge-nav-item active">Dashboard</span><span class="edge-nav-item">Matchups</span><span class="edge-nav-item">Pitchers</span><span class="edge-nav-item">Lineups</span><span class="edge-nav-item">Park Factors</span><span class="edge-nav-item">Backtest</span><span class="edge-nav-item">Settings</span>
             </div>
             <div class="edge-meta">
-                <span>â˜¾</span>
+                <span>☾</span>
                 <span>Data updated: session live</span>
                 <span class="edge-dot"></span>
             </div>
@@ -3106,7 +3548,7 @@ inject_edge_theme()
 render_edge_header()
 st.caption('Sleek model dashboard for strikeouts, earned runs, outs, score buckets, and projection accuracy.')
 render_color_legend('pitcher dashboard')
-st.caption("Projected strikeouts, earned runs, outs, opponent-lineup fit, pitch-type matchups and 0â€“100 category scores.")
+st.caption("Projected strikeouts, earned runs, outs, opponent-lineup fit, pitch-type matchups and 0–100 category scores.")
 
 with st.sidebar:
     st.header("Pitcher slate")
@@ -3114,6 +3556,26 @@ with st.sidebar:
     lookback_days = st.slider("Statcast lookback days", 21, 90, 45, 3)
     min_starts = st.slider("Minimum starts for full confidence", 1, 8, 3)
     include_tbd = st.checkbox("Show games with one probable pitcher TBD", value=False)
+    st.subheader("Two-stage K model")
+    k_model_upload = st.file_uploader("Optional trained K model JSON", type=["json"], key="pitcher_k_model_upload")
+    uploaded_k_model: dict = {}
+    if k_model_upload is not None:
+        try:
+            uploaded_k_model = parse_two_stage_k_model(json.loads(k_model_upload.getvalue().decode("utf-8-sig")))
+            if uploaded_k_model:
+                st.success(f"Two-stage K model loaded ({uploaded_k_model.get('training_rows', 0)} training starts).")
+            else:
+                st.warning("That JSON is not a compatible two-stage K model.")
+        except Exception as exc:
+            st.warning(f"K model could not be read: {type(exc).__name__}: {exc}")
+    session_k_model = parse_two_stage_k_model(st.session_state.get("two_stage_k_model", {}))
+    active_k_model = uploaded_k_model or session_k_model
+    market_model_weight = st.slider(
+        "Independent-model weight when K line exists", 0.0, 1.0, 0.35, 0.05,
+        help="Final K = this weight × independent model + remaining weight × market line.",
+    )
+    minimum_bet_edge = st.slider("Minimum blended K edge", 0.25, 2.0, 0.75, 0.25)
+    st.caption("K linear calibration is disabled because it did not improve the chronological holdout sample.")
     calibration_upload = st.file_uploader("Optional calibration JSON", type=["json"], key="pitcher_calibration_upload")
     uploaded_calibration: dict = {}
     if calibration_upload is not None:
@@ -3149,6 +3611,18 @@ with st.sidebar:
         key="pitcher_odds_source_mode",
     )
     st.caption("Props are fetched only when you press the fetch button, preventing accidental API-credit use on every Streamlit rerun.")
+    confirm_lineups_button = st.button(
+        "Confirm latest lineups",
+        type="secondary",
+        width="stretch",
+        help="Fetch the newest posted batting orders from MLB without rebuilding Statcast projections.",
+    )
+    if confirm_lineups_button:
+        # Force a live schedule and lineup request. The refreshed lineup cache
+        # is then reused when the pitcher board is rebuilt.
+        fetch_mlb_schedule.clear()
+        fetch_game_lineups.clear()
+        st.session_state.pop("lineup_confirmation", None)
     build_button = st.button("Build / refresh pitcher board", type="primary", width="stretch")
     if st.button("Clear odds cache and loaded lines", width="stretch"):
         fetch_odds_api_events.clear()
@@ -3175,12 +3649,55 @@ else:
     st.markdown(
         f"""
         <div class="hero">
-            <h2>{len(schedule)} games Â· {probable_count} probable starters</h2>
-            <p>{escape(str(slate_date))} Â· MLB schedule, posted lineups, park context and first-pitch weather.</p>
+            <h2>{len(schedule)} games | {probable_count} probable starters</h2>
+            <p>{escape(str(slate_date))} | MLB schedule, posted lineups, park context and first-pitch weather.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+if confirm_lineups_button and schedule:
+    with st.spinner("Checking MLB for the latest posted batting orders..."):
+        confirmation_rows: list[dict] = []
+        for game in schedule:
+            result = fetch_game_lineups(game.get("game_pk"))
+            confirmation_rows.append({
+                "Game": f"{game.get('away_abbr', 'Away')} @ {game.get('home_abbr', 'Home')}",
+                "Away lineup": result.get("away_status", "Not posted"),
+                "Home lineup": result.get("home_status", "Not posted"),
+                "Source": result.get("source", "MLB"),
+                "Game state": result.get("game_state", game.get("status", "")),
+            })
+        lineup_confirmation = {
+            "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "slate_date": str(slate_date),
+            "rows": confirmation_rows,
+        }
+        st.session_state["lineup_confirmation"] = lineup_confirmation
+
+lineup_confirmation = st.session_state.get("lineup_confirmation", {})
+if (
+    lineup_confirmation
+    and lineup_confirmation.get("slate_date") == str(slate_date)
+    and lineup_confirmation.get("rows")
+):
+    confirmation_frame = pd.DataFrame(lineup_confirmation["rows"])
+    status_values = confirmation_frame[["Away lineup", "Home lineup"]].stack()
+    confirmed_count = int(status_values.eq("Confirmed").sum())
+    partial_count = int(status_values.eq("Partial").sum())
+    total_count = int(len(status_values))
+    checked_at = pd.to_datetime(lineup_confirmation.get("checked_at"), utc=True, errors="coerce")
+    checked_label = checked_at.strftime("%I:%M:%S %p UTC").lstrip("0") if pd.notna(checked_at) else "just now"
+    if confirmed_count == total_count and total_count:
+        st.success(f"All {total_count} team lineups confirmed from MLB at {checked_label}. Rebuild the board to apply them.")
+    else:
+        st.warning(
+            f"Latest MLB check at {checked_label}: {confirmed_count}/{total_count} confirmed"
+            + (f", {partial_count} partial" if partial_count else "")
+            + ". Unposted teams will still use recent fallback lineups when you rebuild."
+        )
+    with st.expander("Latest lineup confirmation details", expanded=True):
+        st.dataframe(confirmation_frame, hide_index=True, width="stretch")
 
 if build_button and schedule:
     end_date = pd.Timestamp(slate_date) - pd.Timedelta(days=1)
@@ -3229,7 +3746,7 @@ if build_button and schedule:
                     row, detail = build_pitcher_projection(
                         prepared, league, game, int(config["pitcher_id"]), str(config["pitcher_name"]),
                         str(config["pitcher_team"]), str(config["opponent_team"]), str(config["opponent_side"]),
-                        lineup, lineup_status, weather, int(pd.Timestamp(slate_date).year),
+                        lineup, lineup_status, weather, int(pd.Timestamp(slate_date).year), active_k_model,
                     )
                     if row["Starts"] < min_starts:
                         row["Confidence"] *= 0.82
@@ -3254,15 +3771,131 @@ if build_button and schedule:
         else:
             st.warning("No probable pitchers could be projected from the selected slate.")
 
+with st.expander("Historical K backfill & two-stage training", expanded=False):
+    st.info(
+        f"Backfill schema: {K_BACKFILL_VERSION}. Build v3 backfills with pitcher_k_backfill_colab.py, "
+        "then upload the completed CSV here. Streamlit training remains available after upload."
+    )
+    st.markdown("### Chronological Statcast backfill")
+    st.caption(
+        "Every training row uses only games played before that start. The Colab runner uses warmup history, "
+        "not training targets. Download both the backfill CSV and trained JSON because Streamlit session storage is temporary."
+    )
+    default_backfill_end = pd.Timestamp.today().normalize() - pd.Timedelta(days=1)
+    default_backfill_start = max(pd.Timestamp(f"{default_backfill_end.year}-04-01"), default_backfill_end - pd.Timedelta(days=150))
+    backfill_cols = st.columns(2)
+    with backfill_cols[0]:
+        backfill_start = st.date_input("Backfill target start", value=default_backfill_start.date(), key="k_backfill_start")
+    with backfill_cols[1]:
+        backfill_end = st.date_input("Backfill target end", value=default_backfill_end.date(), key="k_backfill_end")
+    build_backfill = st.button(
+        "Build chronological K backfill in Colab",
+        key="build_k_backfill",
+        width="stretch",
+        disabled=True,
+        help="The v3 hitter and pitch-history backfill is intentionally disabled in Streamlit to prevent memory crashes.",
+    )
+    if build_backfill:
+        target_start = pd.Timestamp(backfill_start)
+        target_end = pd.Timestamp(backfill_end)
+        if target_end < target_start:
+            st.error("Backfill end must be on or after the start date.")
+        elif (target_end - target_start).days > 200:
+            st.error("Build at most 200 target days at once to keep a single-file Streamlit run manageable.")
+        else:
+            warmup_start = target_start - pd.Timedelta(days=60)
+            with st.spinner(f"Loading Statcast {warmup_start.date()} through {target_end.date()} and building leakage-safe starts..."):
+                try:
+                    historical_raw = load_statcast(str(warmup_start.date()), str(target_end.date()))
+                    historical_prepared = prepare_statcast(historical_raw)
+                    k_backfill = build_chronological_k_backfill(historical_prepared, target_start, target_end)
+                    st.session_state["k_backfill"] = k_backfill
+                except Exception as exc:
+                    st.error(f"Backfill failed: {type(exc).__name__}: {exc}")
+    uploaded_backfill = st.file_uploader("Or upload an existing K backfill CSV", type=["csv"], key="k_backfill_upload")
+    if uploaded_backfill is not None:
+        try:
+            uploaded_frame = pd.read_csv(StringIO(uploaded_backfill.getvalue().decode("utf-8-sig")))
+            if not uploaded_frame.empty:
+                st.session_state["k_backfill"] = uploaded_frame
+        except Exception as exc:
+            st.warning(f"Backfill CSV could not be read: {type(exc).__name__}: {exc}")
+    k_backfill = st.session_state.get("k_backfill", pd.DataFrame())
+    if k_backfill is not None and not k_backfill.empty:
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Training candidates", f"{len(k_backfill):,}")
+        b2.metric("Pitchers", f"{k_backfill['PitcherID'].nunique():,}" if "PitcherID" in k_backfill else "—")
+        b3.metric("Date range", f"{k_backfill['Date'].min()} to {k_backfill['Date'].max()}" if "Date" in k_backfill else "—")
+        st.download_button(
+            "Download chronological K backfill CSV", k_backfill.to_csv(index=False).encode("utf-8"),
+            file_name="pitcher_k_chronological_backfill.csv", mime="text/csv", width="stretch",
+        )
+        st.caption(
+            "Shrinkage and ML weight are selected across four expanding chronological folds. "
+            "The final 20% remains untouched until grading."
+        )
+        if st.button("Train two-stage K model", key="train_two_stage_k", width="stretch"):
+            trained_model, training_metrics = train_two_stage_k_model(k_backfill)
+            st.session_state["k_training_metrics"] = training_metrics
+            if trained_model:
+                st.session_state["two_stage_k_model"] = trained_model
+                st.success("Model passed rolling validation and the untouched final test. Rebuild the pitcher board to use it.")
+            elif training_metrics.get("ok"):
+                st.session_state.pop("two_stage_k_model", None)
+                st.warning(training_metrics.get("message", "Model rejected by the final test."))
+            else:
+                st.error(training_metrics.get("message", "Model training failed."))
+        training_metrics = st.session_state.get("k_training_metrics", {})
+        if training_metrics.get("ok"):
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Development starts", training_metrics["training_n"])
+            m2.metric("Rolling folds", training_metrics.get("fold_count", 0))
+            m3.metric("Final-test starts", training_metrics["holdout_n"])
+            m4.metric("Selected shrinkage", f"{training_metrics['selected_alpha']:.0f}")
+            m5.metric("Selected ML weight", f"{training_metrics['selected_model_weight']:.0%}")
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric(
+                "Winning folds",
+                f"{training_metrics.get('positive_folds', 0)}/{training_metrics.get('fold_count', 0)}",
+            )
+            q2.metric("Rolling improvement", f"{training_metrics.get('rolling_improvement', 0.0):+.3f}")
+            q3.metric("Final-test MAE", f"{training_metrics['holdout_mae']:.3f}")
+            q4.metric("Final improvement", f"{training_metrics['holdout_improvement']:+.3f}")
+            fold_improvements = training_metrics.get("fold_improvements", [])
+            if fold_improvements:
+                st.caption(
+                    "Fold improvements vs baseline: "
+                    + " · ".join(f"Fold {index}: {value:+.3f}" for index, value in enumerate(fold_improvements, 1))
+                )
+            if training_metrics.get("accepted"):
+                st.success(training_metrics.get("message", "Model accepted."))
+            else:
+                st.warning(training_metrics.get("message", "Model rejected."))
+            trained_model = parse_two_stage_k_model(st.session_state.get("two_stage_k_model", {}))
+            if trained_model and training_metrics.get("accepted"):
+                st.download_button(
+                    "Download trained K model JSON", json.dumps(trained_model, indent=2).encode("utf-8"),
+                    file_name="pitcher_two_stage_k_model.json", mime="application/json", width="stretch",
+                )
+
 base_board = st.session_state.get("pitcher_board", pd.DataFrame())
 details = st.session_state.get("pitcher_details", {})
+
+new_board_columns = {"K_Model_Source", "Role_Status", "Role_Eligible", "Rule_K_Rate"}
+if not base_board.empty and not new_board_columns.issubset(base_board.columns):
+    st.warning(
+        "This session still contains a pitcher board built by an older dashboard version. "
+        "Press **Build / refresh pitcher board** once to calculate the new two-stage K and role fields."
+    )
 
 if base_board.empty:
     st.info("Choose a slate date and press **Build / refresh pitcher board**.")
     st.stop()
 
 loaded_quotes = st.session_state.get("pitcher_odds_quotes", pd.DataFrame())
-board = apply_odds_quotes_to_board(base_board, loaded_quotes, odds_source_mode) if loaded_quotes is not None and not loaded_quotes.empty else base_board.copy()
+board = apply_odds_quotes_to_board(
+    base_board, loaded_quotes, odds_source_mode, market_model_weight, minimum_bet_edge
+) if loaded_quotes is not None and not loaded_quotes.empty else base_board.copy()
 
 with st.expander("Automatic sportsbook / PrizePicks pitcher lines", expanded=loaded_quotes is None or loaded_quotes.empty):
     unique_games = board[["GamePK", "Game"]].drop_duplicates().copy()
@@ -3282,7 +3915,7 @@ with st.expander("Automatic sportsbook / PrizePicks pitcher lines", expanded=loa
     )
     estimated_credits = 3 * len(selected_odds_games)
     st.caption(
-        f"Maximum expected cost: about {estimated_credits} credits ({len(selected_odds_games)} games Ã— 3 markets). "
+        f"Maximum expected cost: about {estimated_credits} credits ({len(selected_odds_games)} games × 3 markets). "
         "The actual cost can be lower when a requested market is unavailable. Responses are cached for five minutes."
     )
     fetch_col, clear_col = st.columns([2, 1])
@@ -3315,14 +3948,14 @@ with st.expander("Automatic sportsbook / PrizePicks pitcher lines", expanded=loa
     odds_errors = st.session_state.get("pitcher_odds_errors", [])
     if odds_meta:
         meta_cols = st.columns(4)
-        meta_cols[0].metric("Events queried", odds_meta.get("events_queried", "â€”"))
-        meta_cols[1].metric("Credits this fetch", odds_meta.get("estimated_credits_used_this_fetch", "â€”"))
-        meta_cols[2].metric("Credits remaining", odds_meta.get("requests_remaining", "â€”"))
+        meta_cols[0].metric("Events queried", odds_meta.get("events_queried", "—"))
+        meta_cols[1].metric("Credits this fetch", odds_meta.get("estimated_credits_used_this_fetch", "—"))
+        meta_cols[2].metric("Credits remaining", odds_meta.get("requests_remaining", "—"))
         meta_cols[3].metric("Current source", odds_source_mode)
     if odds_errors:
         with st.expander(f"Unavailable or unmatched lines ({len(odds_errors)})"):
             for error in odds_errors:
-                st.write(f"â€¢ {error}")
+                st.write(f"• {error}")
     if loaded_quotes is not None and not loaded_quotes.empty:
         line_columns = [
             "Pitcher", "Game", "K_Line", "K_Over_Odds", "K_Under_Odds", "K_Line_Source",
@@ -3339,7 +3972,7 @@ with st.expander("Automatic sportsbook / PrizePicks pitcher lines", expanded=loa
             st.caption("PrizePicks odds/multipliers returned by the provider are indicative. The projection line is the main field used by this model.")
 
 window_text = st.session_state.get("pitcher_window", "")
-calibration_note = " Â· Saved calibration applied" if bool(board.get("Calibration_Applied", pd.Series(False, index=board.index)).any()) else ""
+calibration_note = " | Saved calibration applied" if bool(board.get("Calibration_Applied", pd.Series(False, index=board.index)).any()) else ""
 st.caption(f"Statcast sample: {window_text}{calibration_note}. Scores are relative comparisons within the current slate; projections are estimates, not guarantees.")
 
 leaders = st.columns(4)
@@ -3367,22 +4000,25 @@ with board_tab:
     columns = [
         "Rank", "Pitcher", "Team", "Opponent", "Game", "Proj_K", "Proj_ER", "Proj_Outs",
         "Top_HR_Threat", "Top_HR_Threat_Score", "Lineup_Zone_Fit",
+        "K_Model_Source", "Role_Status", "Bet_Eligible",
         "K_Score", "Run_Prevention_Score", "Outs_Score", "Overall_Score", "Confidence_Level", "Lineup_Status",
     ]
     automatic_columns = [
         "K_Line", "K_Projection_Edge", "ER_Line", "ER_Projection_Edge",
-        "Outs_Line", "Outs_Projection_Edge", "K_Line_Source",
+        "Outs_Line", "Outs_Projection_Edge", "K_Line_Source", "Final_Proj_K", "Blended_K_Edge", "K_Bet_Signal",
     ]
     for automatic_column in automatic_columns:
         if automatic_column in board.columns:
             values = board[automatic_column]
             if values.astype(str).str.strip().ne("").any() and not (pd.api.types.is_numeric_dtype(values) and values.isna().all()):
                 columns.append(automatic_column)
+    columns = [column for column in columns if column in board.columns]
     display = board[columns].copy().rename(
         columns={
             "Proj_K": "Proj K", "Proj_ER": "Proj ER", "Proj_Outs": "Proj Outs",
             "Top_HR_Threat": "Top HR Threat", "Top_HR_Threat_Score": "Threat Score",
             "Lineup_Zone_Fit": "Lineup Zone Fit",
+            "Final_Proj_K": "Final K", "Blended_K_Edge": "Blended K Edge", "K_Bet_Signal": "K Signal",
             "K_Score": "K Score", "Run_Prevention_Score": "Run Prevention",
             "Outs_Score": "Outs Score", "Overall_Score": "Overall", "Confidence_Level": "Confidence",
             "Lineup_Status": "Lineup", "K_Line": "K Line", "K_Projection_Edge": "K Edge",
@@ -3392,15 +4028,17 @@ with board_tab:
     )
     styled = style_board(display, ["Proj K", "K Score", "Run Prevention", "Outs Score", "Overall"], ["Proj ER", "Threat Score", "Lineup Zone Fit"])
     formatters = {"Proj K": "{:.2f}", "Proj ER": "{:.2f}", "Proj Outs": "{:.1f}", "Threat Score": "{:.0f}", "Lineup Zone Fit": "{:.0f}", "K Score": "{:.0f}", "Run Prevention": "{:.0f}", "Outs Score": "{:.0f}", "Overall": "{:.0f}", "K Conf": "{:.0f}", "Workload": "{:.0f}", "Command": "{:.0f}"}
-    for column in ["K Line", "K Edge", "ER Line", "ER Edge", "Outs Line", "Outs Edge"]:
+    for column in ["K Line", "K Edge", "Final K", "Blended K Edge", "ER Line", "ER Edge", "Outs Line", "Outs Edge"]:
         if column in display.columns:
             formatters[column] = "{:.2f}"
+    formatters = {column: formatter for column, formatter in formatters.items() if column in display.columns}
     styled = styled.format(formatters)
     st.dataframe(styled, width="stretch", hide_index=True, height=650)
 
 with k_tab:
     render_color_legend('strikeouts')
-    columns = ["K_Rank", "Pitcher", "Opponent", "Proj_K", "Proj_BF", "Adj_K_Rate", "Pitcher_K_Rate", "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate", "PitchMix_Opp_Whiff", "Whiff_Pct", "CSW_Pct", "Recent_Whiff_Pct", "Recent_CSW_Pct", "Fastball_Velo_Trend", "PitchTypeScore", "K_Score", "Confidence_Level"]
+    columns = ["K_Rank", "Pitcher", "Opponent", "Proj_K", "Proj_BF", "Adj_K_Rate", "Pitcher_K_Rate", "Opponent_K_Rate", "Top6_K_Rate", "Bottom3_K_Rate", "PitchMix_Opp_Whiff", "Whiff_Pct", "CSW_Pct", "Recent_Whiff_Pct", "Recent_CSW_Pct", "Fastball_Velo_Trend", "PitchTypeScore", "K_Model_Source", "Role_Status", "Role_Note", "Bet_Eligible", "K_Score", "Confidence_Level"]
+    columns = [column for column in columns if column in board.columns]
     display = board.sort_values("Proj_K", ascending=False)[columns].copy().rename(columns={
         "K_Rank": "Rank", "Proj_K": "Proj K", "Proj_BF": "Proj BF", "Adj_K_Rate": "Game K%",
         "Pitcher_K_Rate": "Pitcher K%", "Opponent_K_Rate": "Opponent K%", "Whiff_Pct": "Whiff%",
@@ -3409,19 +4047,20 @@ with k_tab:
         "PitchTypeScore": "Pitch Match", "K_Score": "K Score", "Projection_Risk_Note": "Risk Note", "Confidence_Level": "Confidence",
     })
     styled = style_board(display, ["Proj K", "Game K%", "Pitcher K%", "Opponent K%", "Top6 K%", "Pitch-Mix Whiff%", "Whiff%", "CSW%", "Arsenal Form", "K Conf", "Pitch Match", "K Score"])
-    styled = styled.format({"Proj K": "{:.2f}", "Proj BF": "{:.1f}", "Game K%": "{:.1%}", "Pitcher K%": "{:.1%}", "Opponent K%": "{:.1%}", "Top6 K%": "{:.1%}", "Pitch-Mix Whiff%": "{:.1%}", "Whiff%": "{:.1%}", "CSW%": "{:.1%}", "Arsenal Form": "{:.0f}", "K Conf": "{:.0f}", "Pitch Match": "{:.0f}", "K Score": "{:.0f}"})
+    k_formatters = {"Proj K": "{:.2f}", "Proj BF": "{:.1f}", "Game K%": "{:.1%}", "Pitcher K%": "{:.1%}", "Opponent K%": "{:.1%}", "Top6 K%": "{:.1%}", "Pitch-Mix Whiff%": "{:.1%}", "Whiff%": "{:.1%}", "CSW%": "{:.1%}", "Arsenal Form": "{:.0f}", "K Conf": "{:.0f}", "Pitch Match": "{:.0f}", "K Score": "{:.0f}"}
+    styled = styled.format({column: formatter for column, formatter in k_formatters.items() if column in display.columns})
     st.dataframe(styled, width="stretch", hide_index=True, height=650)
 
 with er_tab:
     render_color_legend('earned runs / damage risk')
     columns = ["ER_Rank", "Pitcher", "Opponent", "Proj_ER", "P_0_1_ER", "P_2_3_ER", "P_4plus_ER", "xwOBA_Allowed", "BB_Rate", "Command_Score", "Barrel_Allowed", "PitchMix_Opp_xwOBA", "Opp_xwOBA", "Run_Environment_Risk", "Park_Run_Factor", "Weather_Factor", "Run_Prevention_Score", "Projection_Risk_Note"]
     display = board.sort_values("Proj_ER")[columns].copy().rename(columns={
-        "ER_Rank": "Rank", "Proj_ER": "Proj ER", "P_0_1_ER": "0â€“1 ER", "P_2_3_ER": "2â€“3 ER", "P_4plus_ER": "4+ ER",
+        "ER_Rank": "Rank", "Proj_ER": "Proj ER", "P_0_1_ER": "0–1 ER", "P_2_3_ER": "2–3 ER", "P_4plus_ER": "4+ ER",
         "xwOBA_Allowed": "xwOBA Allowed", "BB_Rate": "BB%", "Barrel_Allowed": "Barrel% Allowed",
         "Opp_xwOBA": "Opp xwOBA", "Park_Run_Factor": "Park", "Weather_Factor": "Weather", "Run_Prevention_Score": "Run Prevention",
     })
-    styled = style_board(display, ["0â€“1 ER", "Run Prevention"], ["Proj ER", "4+ ER", "xwOBA Allowed", "BB%", "Barrel% Allowed", "Opp xwOBA", "Park", "Weather"])
-    styled = styled.format({"Proj ER": "{:.2f}", "0â€“1 ER": "{:.1%}", "2â€“3 ER": "{:.1%}", "4+ ER": "{:.1%}", "xwOBA Allowed": "{:.3f}", "BB%": "{:.1%}", "Barrel% Allowed": "{:.1%}", "Opp xwOBA": "{:.3f}", "Park": "{:.0f}", "Weather": "{:.3f}", "Run Prevention": "{:.0f}"})
+    styled = style_board(display, ["0–1 ER", "Run Prevention"], ["Proj ER", "4+ ER", "xwOBA Allowed", "BB%", "Barrel% Allowed", "Opp xwOBA", "Park", "Weather"])
+    styled = styled.format({"Proj ER": "{:.2f}", "0–1 ER": "{:.1%}", "2–3 ER": "{:.1%}", "4+ ER": "{:.1%}", "xwOBA Allowed": "{:.3f}", "BB%": "{:.1%}", "Barrel% Allowed": "{:.1%}", "Opp xwOBA": "{:.3f}", "Park": "{:.0f}", "Weather": "{:.3f}", "Run Prevention": "{:.0f}"})
     st.dataframe(styled, width="stretch", hide_index=True, height=650)
 
 with outs_tab:
@@ -3443,10 +4082,14 @@ with lineup_tab:
     selected = st.selectbox("Pitcher", pitcher_options, key="lineup_pitcher")
     row = board[board["Pitcher"].eq(selected)].iloc[0]
     detail = details.get(row["DetailKey"], {})
-    st.markdown(f"### {selected} vs {row['Opponent']} Â· {row['Lineup_Status']} lineup")
+    st.markdown(f"### {selected} vs {row['Opponent']} | {row['Lineup_Status']} lineup")
     lineup_frame = detail.get("lineup", pd.DataFrame())
     if lineup_frame is None or lineup_frame.empty:
         st.info("No opponent lineup profile was available.")
+    elif not {"HR_Threat_Score", "HR_Threat", "Zone_Fit_Score", "Matched_HH_Pct"}.issubset(lineup_frame.columns):
+        st.info("This lineup was cached by an older version. Rebuild the pitcher board to calculate zone fit and HR threat.")
+        display = lineup_frame.rename(columns={"LineupSpot": "Order", "EffectiveStand": "Bats", "K_Pct": "K%", "BB_Pct": "BB%", "HR_Pct": "HR%", "Brl_BBE": "Barrel%", "HH_BBE": "Hard Hit%", "Whiff_Pct": "Whiff%"})
+        st.dataframe(display, width="stretch", hide_index=True)
     else:
         ranked = lineup_frame.sort_values("HR_Threat_Score", ascending=False)
         top = ranked.iloc[0]
@@ -3463,7 +4106,8 @@ with lineup_tab:
         preferred = ["Order", "Player", "Position", "Bats", "Alert", "HR Threat", "HR Threat Score", "Zone Fit", "Matched Hard Hit%", "Pitcher Zone HH%", "Zone BBE", "Hard Hit%", "Barrel%", "HR%", "xwOBA", "K%", "Whiff%", "PA"]
         display = display[[column for column in preferred if column in display.columns]]
         styled = style_board(display, ["K%", "Whiff%"], ["HR Threat Score", "Zone Fit", "Matched Hard Hit%", "Pitcher Zone HH%", "HR%", "xwOBA", "Barrel%", "Hard Hit%"])
-        styled = styled.format({"Order": "{:.0f}", "PA": "{:.0f}", "Zone BBE": "{:.0f}", "K%": "{:.1%}", "BB%": "{:.1%}", "HR%": "{:.1%}", "xwOBA": "{:.3f}", "Barrel%": "{:.1%}", "Hard Hit%": "{:.1%}", "Matched Hard Hit%": "{:.1%}", "Pitcher Zone HH%": "{:.1%}", "Zone Fit": "{:.0f}", "HR Threat Score": "{:.0f}", "Whiff%": "{:.1%}"})
+        lineup_formatters = {"Order": "{:.0f}", "PA": "{:.0f}", "Zone BBE": "{:.0f}", "K%": "{:.1%}", "BB%": "{:.1%}", "HR%": "{:.1%}", "xwOBA": "{:.3f}", "Barrel%": "{:.1%}", "Hard Hit%": "{:.1%}", "Matched Hard Hit%": "{:.1%}", "Pitcher Zone HH%": "{:.1%}", "Zone Fit": "{:.0f}", "HR Threat Score": "{:.0f}", "Whiff%": "{:.1%}"}
+        styled = styled.format({column: formatter for column, formatter in lineup_formatters.items() if column in display.columns})
         st.dataframe(styled, width="stretch", hide_index=True)
         st.caption("Zone Fit measures overlap between each hitter's hard-contact zones versus this pitcher's handedness and the selected pitcher's actual zone usage and hard-hit locations. HR Threat is a matchup score, not a projected home-run probability.")
 
@@ -3497,7 +4141,7 @@ with logs_tab:
 with lines_tab:
     selected = st.selectbox("Pitcher", pitcher_options, key="lines_pitcher")
     row = board[board["Pitcher"].eq(selected)].iloc[0]
-    st.markdown(f"### {selected} Â· {row['Game']}")
+    st.markdown(f"### {selected} | {row['Game']}")
     st.caption(
         "Automatic values come from the selected source above. You can still overwrite any line manually for comparison. "
         "A positive projection edge means the model projects above the line."
@@ -3537,7 +4181,7 @@ with lines_tab:
         st.metric("Model under probability", f"{1.0 - over_probability:.1%}")
         if source:
             st.caption(
-                f"Auto source: **{source}** Â· Over {format_american_odds(over_odds)} Â· "
+                f"Auto source: **{source}** | Over {format_american_odds(over_odds)} | "
                 f"Under {format_american_odds(under_odds)}"
             )
         else:
@@ -3656,16 +4300,16 @@ with backtest_tab:
     result_summary = st.session_state.get("pitcher_result_summary", {})
     if result_summary:
         st.caption(
-            f"Result update: {result_summary.get('matched', 0)} rows matched Â· "
-            f"{result_summary.get('not_final', 0)} games not final Â· "
+            f"Result update: {result_summary.get('matched', 0)} rows matched | "
+            f"{result_summary.get('not_final', 0)} games not final | "
             f"{result_summary.get('unmatched', 0)} unmatched/scratched pitchers"
             + (
-                f" Â· {result_summary.get('fallback_matched', 0)} date-fallback matches"
+                f" | {result_summary.get('fallback_matched', 0)} date-fallback matches"
                 if result_summary.get('fallback_matched', 0)
                 else ""
             )
             + (
-                f" Â· {result_summary.get('missing_game_pk', 0)} rows missing GamePK"
+                f" | {result_summary.get('missing_game_pk', 0)} rows missing GamePK"
                 if result_summary.get('missing_game_pk', 0)
                 else ""
             )
@@ -3710,7 +4354,7 @@ with backtest_tab:
         if completed_history.empty:
             st.warning("No completed results are available yet. Use the result-fetch button after the games are final.")
         else:
-            st.markdown("### Model projection accuracy â€” no prop lines required")
+            st.markdown("### Model projection accuracy — no prop lines required")
             st.caption(
                 "This section compares each model projection directly to the official result. "
                 "Rows are included even when K/ER/Outs prop lines are blank."
@@ -3743,6 +4387,38 @@ with backtest_tab:
                 "MAE edge vs baseline is positive when the model beats the simple baseline."
             )
 
+            st.markdown("### K error decomposition and betting gate")
+            k_components = completed_history.copy()
+            for column in ["Proj_K", "Actual_K", "Proj_BF", "Actual_BF", "Adj_K_Rate"]:
+                k_components[column] = pd.to_numeric(k_components.get(column), errors="coerce")
+            k_components = k_components.dropna(subset=["Proj_K", "Actual_K", "Proj_BF", "Actual_BF", "Adj_K_Rate"])
+            k_components = k_components[k_components["Actual_BF"].gt(0)].copy()
+            if not k_components.empty:
+                k_components["Actual_K_Rate"] = k_components["Actual_K"] / k_components["Actual_BF"]
+                k_components["K_Error"] = k_components["Proj_K"] - k_components["Actual_K"]
+                k_components["BF_Error"] = k_components["Proj_BF"] - k_components["Actual_BF"]
+                k_components["Rate_Error"] = k_components["Adj_K_Rate"] - k_components["Actual_K_Rate"]
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("K MAE", f"{k_components['K_Error'].abs().mean():.3f}")
+                d2.metric("BF MAE", f"{k_components['BF_Error'].abs().mean():.3f}")
+                d3.metric("K-rate MAE", f"{k_components['Rate_Error'].abs().mean():.3f}")
+                rate_corr = k_components[["Rate_Error", "K_Error"]].corr().iloc[0, 1] if len(k_components) > 2 else np.nan
+                d4.metric("Rate-error link", f"{rate_corr:.3f}" if np.isfinite(rate_corr) else "—")
+                hand_table = (
+                    k_components.groupby("Hand", dropna=False)
+                    .agg(N=("Actual_K", "size"), K_MAE=("K_Error", lambda s: s.abs().mean()), K_Bias=("K_Error", "mean"))
+                    .reset_index()
+                ) if "Hand" in k_components.columns else pd.DataFrame()
+                if not hand_table.empty:
+                    st.dataframe(hand_table.style.format({"K_MAE": "{:.3f}", "K_Bias": "{:+.3f}"}), width="stretch", hide_index=True)
+            line_check = completed_history.dropna(subset=["K_Line", "Proj_K", "Actual_K"]).copy()
+            if not line_check.empty:
+                line_check["Decision"] = np.where(line_check["Proj_K"].gt(line_check["K_Line"]), "Over", "Under")
+                line_check["Result"] = np.where(line_check["Actual_K"].gt(line_check["K_Line"]), "Over", np.where(line_check["Actual_K"].lt(line_check["K_Line"]), "Under", "Push"))
+                decisions = line_check[line_check["Result"].ne("Push")]
+                win_rate = float(decisions["Decision"].eq(decisions["Result"]).mean()) if not decisions.empty else np.nan
+                st.caption(f"Saved-line model-side accuracy: {win_rate:.1%} across {len(decisions):,} non-push decisions." if np.isfinite(win_rate) else "No non-push K-line decisions yet.")
+
             target_for_scatter = st.selectbox("Projection chart target", list(BACKTEST_TARGETS), key="pitcher_scatter_target")
             scatter_config = BACKTEST_TARGETS[target_for_scatter]
             scatter = completed_history[[scatter_config["projection"], scatter_config["actual"]]].dropna().rename(
@@ -3751,7 +4427,7 @@ with backtest_tab:
             if not scatter.empty:
                 st.scatter_chart(scatter, x="Projection", y="Actual", width="stretch")
 
-            st.markdown("### Projection buckets â€” no prop lines required")
+            st.markdown("### Projection buckets — no prop lines required")
             projection_bucket_target = st.selectbox(
                 "Projection bucket target",
                 list(BACKTEST_TARGETS),
@@ -3774,7 +4450,7 @@ with backtest_tab:
                 "These buckets show where the model is too high or too low by projection range, without using sportsbook lines."
             )
 
-            st.markdown("### Score accuracy buckets â€” no prop lines required")
+            st.markdown("### Score accuracy buckets — no prop lines required")
             bucket_target = st.selectbox("Score target", list(BACKTEST_TARGETS), key="pitcher_score_bucket_target")
             bucket_table = score_bucket_table(completed_history, bucket_target)
             if not bucket_table.empty:
@@ -3806,7 +4482,7 @@ with backtest_tab:
                 )
             st.caption(
                 "The holdout columns fit coefficients on the earlier 70% of starts and test them on the later 30%. "
-                "Use holdout improvementâ€”not only in-sample improvementâ€”before applying calibration."
+                "Use holdout improvement—not only in-sample improvement—before applying calibration."
             )
             if calibration_bundle.get("targets"):
                 calibration_json = json.dumps(calibration_bundle, indent=2).encode("utf-8")
@@ -3826,7 +4502,7 @@ with backtest_tab:
                         st.session_state["pitcher_board"] = assign_scores(recalibrated)
                         st.rerun()
 
-            with st.expander("Optional prop-line calibration â€” requires saved pregame lines", expanded=False):
+            with st.expander("Optional prop-line calibration — requires saved pregame lines", expanded=False):
                 st.caption(
                     "This is only for betting-line decisions. It uses rows where a valid pregame prop line was saved, "
                     "so it can be biased if only some pitchers/books have lines. It does not measure pure projection accuracy."
@@ -3877,17 +4553,21 @@ with notes_tab:
         """
         ### How to read the Pitcher Lab
 
-        - **Projected K** combines the pitcher's recent/season strikeout rate, Statcast K/whiff/CSW skills, projected batters faced, confirmed-lineup K profile, top-six lineup K%, pitch-mix whiff fit and recent arsenal form.
+        - **Projected K** is now a two-stage estimate: expected batters faced × stabilized K probability per batter. Recent form is deliberately limited, matchup adjustments are additive, and left-handed pitchers receive a conservative correction unless a trained model learns a better value.
+        - **Role validation** blocks normal bet eligibility when recent starts, pitch counts and batters faced do not verify a starter workload. Confirmed lineups and a saved K line are also required for a bet signal.
+        - **Market blend** uses 35% independent model and 65% sportsbook line by default. The independent projection remains visible, and a signal requires the selected minimum blended edge.
+        - **Historical K backfill** reconstructs starters from Statcast and creates every feature from games strictly before the target start. The later 20% is never used for fitting and becomes the chronological holdout.
         - **Projected ER** blends recent and season ER rates with xwOBA, walks, barrels, opponent quality, park factor and first-pitch weather.
         - **Projected outs** starts with recent workload and now adds leash context: last-start pitch count, last-three pitch trend, stable workload rate, quality-start rate, short-hook risk and command risk.
-        - **K Score**, **Run Prevention Score** and **Outs Score** are 0â€“100 relative scores within the selected slate. They are not probabilities.
+        - **K Score**, **Run Prevention Score** and **Outs Score** are 0–100 relative scores within the selected slate. They are not probabilities.
         - **Overall Score** is 40% K Score, 35% Run Prevention Score and 25% Outs Score.
         - Confirmed lineups are preferred. Before posting, the app uses the opponent's most recent observed lineup from Statcast.
         - Small samples are shrunk toward league averages, and the confidence label falls when a pitcher has few starts or little Statcast history.
 
         - The **Backtest & calibration** tab exports timestamped pregame snapshots, fills official K/ER/outs results, measures MAE/RMSE/bias, compares simple recent-form baselines, checks score buckets and tests probability calibration.
         - Use **Add current snapshot to session master** to append today's edited pregame board without uploading it first. Download the updated master-history CSV before leaving because Streamlit Community Cloud storage is temporary.
-        - A calibration JSON can be downloaded after a sufficient sample and loaded from the sidebar on future slates. Prefer coefficients that improve the chronological holdout sample.
+        - K linear calibration is disabled because it did not improve the supplied chronological holdout. ER and outs calibration remain optional.
+        - Download the two-stage K model JSON after training and upload it from the sidebar after a Streamlit restart or repository deployment.
 
         This remains a projection framework. Use several hundred completed starts before making large weight changes, and never include snapshots generated after first pitch in a fair backtest.
         """
