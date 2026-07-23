@@ -73,7 +73,7 @@ ODDS_API_MARKETS = {
     "pitcher_outs": {"prefix": "Outs", "label": "Outs", "projection": "Proj_Outs"},
 }
 ODDS_BOOKMAKERS = {
-    "hardrockbet_fl": "Hard Rock Bet FL",
+    "hardrockbet": "Hard Rock Bet",
     "prizepicks": "PrizePicks",
     "fanduel": "FanDuel",
     "draftkings": "DraftKings",
