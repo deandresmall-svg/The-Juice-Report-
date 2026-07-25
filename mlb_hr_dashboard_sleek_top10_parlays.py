@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from itertools import combinations
-from typing import Iterable
+from typing import Iterable, Any
+from dataclasses import asdict, dataclass
 import traceback
 import gc
+import io
+import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -16,6 +20,26 @@ except Exception:  # Streamlit internals moved across versions
         pass
     StopException = RerunException = _NoStreamlitInternalException
 from pybaseball import cache, playerid_reverse_lookup, statcast
+
+try:
+    import joblib
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    HRML_DEPENDENCIES_AVAILABLE = True
+    HRML_DEPENDENCY_ERROR = ""
+except Exception as _hrml_import_error:
+    joblib = None
+    ColumnTransformer = ExtraTreesClassifier = HistGradientBoostingClassifier = None
+    SimpleImputer = LogisticRegression = None
+    Pipeline = OneHotEncoder = StandardScaler = None
+    average_precision_score = brier_score_loss = log_loss = roc_auc_score = None
+    HRML_DEPENDENCIES_AVAILABLE = False
+    HRML_DEPENDENCY_ERROR = f"{type(_hrml_import_error).__name__}: {_hrml_import_error}"
 
 
 st.set_page_config(page_title="Advanced MLB Home Run Dashboard", layout="wide")
@@ -3287,7 +3311,13 @@ def build_hr_projection_snapshot(
     snapshot["RawProbability"] = pd.to_numeric(
         snapshot.get("Raw_Model_1plus_HR", snapshot.get("Model_1plus_HR")), errors="coerce"
     )
-    snapshot["ModelProbability"] = pd.to_numeric(snapshot.get("Model_1plus_HR"), errors="coerce")
+    snapshot["HeuristicProbability"] = pd.to_numeric(
+        snapshot.get("Heuristic_HR_Probability", snapshot.get("Model_1plus_HR")), errors="coerce"
+    )
+    snapshot["ModelProbability"] = pd.to_numeric(
+        snapshot.get("Active_HR_Probability", snapshot.get("Model_1plus_HR")), errors="coerce"
+    )
+    snapshot["ActiveModel"] = snapshot.get("Active_HR_Model", "Existing heuristic")
     snapshot["ModelScore"] = pd.to_numeric(snapshot.get("HRScore"), errors="coerce")
     snapshot["ModelPerPA"] = pd.to_numeric(snapshot.get("Model_HR_Per_PA"), errors="coerce")
     snapshot["ExpectedCount"] = pd.to_numeric(snapshot.get("Projected_PA"), errors="coerce") * snapshot["ModelPerPA"]
@@ -3318,7 +3348,7 @@ def build_hr_projection_snapshot(
         "LookbackDays", "StatcastStart", "StatcastEnd", "GamePK", "PlayerID", "Player",
         "Team", "Opponent", "HomeAway", "Venue", "StartingPitcherID", "StartingPitcher",
         "LineupStatus", "LineupSpot", "Projected_PA", "ModelPerPA", "ExpectedCount", "EffectiveStand", "SampleStatus",
-        "Confidence", "Confidence_Level", "ParkFactor", "WeatherMultiplier", "RawProbability", "ModelProbability",
+        "Confidence", "Confidence_Level", "ParkFactor", "WeatherMultiplier", "RawProbability", "HeuristicProbability", "Raw_ML_HR_Probability", "Calibrated_ML_HR_Probability", "ModelProbability", "ActiveModel",
         "ModelScore", "Calibration_Applied", "Calibration_Version", "Market_Line", "Over_Odds", "Under_Odds",
         "Line_Source", "SportsbookOdds", "MarketProbability", "ModelOverProbability", "ProjectionEdge",
         "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_HR", "Actual_PA", "ResultStatus", "Notes",
@@ -3851,6 +3881,16 @@ def render_hr_top10_parlay_tab(
         return
 
     slate_board = apply_slate_hr_probability_calibration(slate_board, calibration)
+    slate_board = hrml_apply_model_to_frame(
+        slate_board,
+        heuristic_column="ModelProbability",
+        update_model_probability=True,
+        rank_column=None,
+    )
+    st.caption(
+        "Whole-slate probability source: "
+        + str(slate_board.get("ActiveModel", pd.Series(["Existing heuristic"])).iloc[0])
+    )
     st.markdown("#### Ranking weights")
     weight_columns = st.columns(3)
     probability_weight = weight_columns[0].slider("Probability weight", 0, 100, 50, 5, key=f"{widget_prefix}_top10_prob_weight")
@@ -3868,7 +3908,7 @@ def render_hr_top10_parlay_tab(
     st.markdown("#### Whole-slate Top 10")
     top_columns = [
         "SlateRank", "Player", "Team", "Opponent", "StartingPitcher", "LineupSpot",
-        "Projected_PA", "ExpectedCount", "ModelProbability", "ModelScore", "Confidence",
+        "Projected_PA", "ExpectedCount", "ModelProbability", "HeuristicProbability", "Calibrated_ML_HR_Probability", "ActiveModel", "ModelScore", "Confidence",
         "SlateGrade", "TargetTier", "LineupStatus", "Venue",
     ]
     top10 = ranked_slate[[column for column in top_columns if column in ranked_slate.columns]].head(10).copy()
@@ -3880,6 +3920,9 @@ def render_hr_top10_parlay_tab(
             "Projected_PA": "Proj PA",
             "ExpectedCount": "Exp HR",
             "ModelProbability": "HR Prob",
+            "HeuristicProbability": "Heuristic Prob",
+            "Calibrated_ML_HR_Probability": "ML Prob",
+            "ActiveModel": "Probability Source",
             "ModelScore": "HR Score",
             "SlateGrade": "Slate Grade",
             "TargetTier": "Tier",
@@ -3897,6 +3940,8 @@ def render_hr_top10_parlay_tab(
                 "Proj PA": "{:.2f}",
                 "Exp HR": "{:.3f}",
                 "HR Prob": "{:.1%}",
+                "Heuristic Prob": "{:.1%}",
+                "ML Prob": "{:.1%}",
                 "HR Score": "{:.0f}",
                 "Confidence": "{:.0f}",
                 "Slate Grade": "{:.1f}",
@@ -4660,6 +4705,912 @@ def render_edge_header() -> None:
         unsafe_allow_html=True,
     )
 
+
+# ===== INTEGRATED TRAINER CORE =====
+TRAINER_VERSION = "hr_trainer_v1"
+TARGET_COLUMN = "Actual_Event"
+DEFAULT_MODEL_FILENAME = "hr_model_bundle.joblib"
+DEFAULT_METADATA_FILENAME = "hr_model_metadata.json"
+DEFAULT_HOLDOUT_FILENAME = "hr_holdout_predictions.csv"
+
+# Explicit allowlists prevent identifiers, timestamps, results, and future data
+# from silently entering the model when the snapshot schema grows.
+NUMERIC_BASEBALL_FEATURES = [
+    "LineupSpot", "Projected_PA", "Confidence", "ParkFactor", "WeatherMultiplier",
+    "PA", "HR", "Strikeouts", "xSLG_Total", "xISO_Total", "Pitches", "Swings",
+    "Contacts", "Whiffs", "BBE", "Barrels", "Hard_Hits", "Sweet_Spots",
+    "Barrel_Range", "Fly_Balls", "Air_Balls", "Pull_Air", "Avg_EV", "EV90",
+    "Max_EV", "Avg_LA", "xSLG_Contact", "xBA_Contact", "HR_PA", "Brl_PA",
+    "Brl_BIP", "xSLG_PA", "xISO_PA", "HH_Pct", "SweetSpot_Pct", "FB_Pct",
+    "Air_Pct", "PullAir_BIP", "PullAir_Air", "Contact_Pct", "Whiff_Pct", "K_Pct",
+    "Platoon_PA", "Platoon_HR", "Platoon_xSLG", "Platoon_xISO", "Platoon_Barrels",
+    "Recent_PA", "Recent_HR", "Recent_Barrels", "Recent_xSLG", "Recent_xISO",
+    "Pitcher_PA", "Pitcher_HR", "Pitcher_Barrels", "Pitcher_xSLG", "Pitcher_xISO",
+    "PitcherSideAttackScore", "PitchMatchRatio", "MatchSample", "ZoneFitRatio",
+    "BvP_PA", "BvP_HR", "BvP_Barrels", "BvP_xSLG", "Bat_Speed", "Fast_Swing_Rate", "Attack_Angle", "Attack_Direction",
+    "Blast_Contact_Rate", "Squared_Up_Contact_Rate", "BatTrackingMetricCount",
+    "BatTrackingScore", "Adj_HR_PA", "Adj_Brl_PA", "Adj_xSLG_PA", "Adj_xISO_PA",
+    "Adj_Platoon_HR_PA", "Adj_Platoon_Brl_PA", "Pitcher_HR_PA", "Pitcher_Brl_PA",
+    "Pitcher_xSLG_PA", "Recent_HR_PA", "Recent_Brl_PA", "Recent_xSLG_PA",
+    "LA_Power_Score", "LA_Optimization_Score", "Barrel_Range_BIP",
+    "TemperatureF", "HumidityPct", "WindMPH", "PressureHPA", "TeamImpliedRuns",
+    "StarterInnings", "BullpenMultiplier",
+]
+
+CATEGORICAL_BASEBALL_FEATURES = [
+    "HomeAway", "EffectiveStand", "SampleStatus", "Confidence_Level", "Position",
+    "PitcherSideRead", "AttackConfidence", "BatTrackingAvailable", "RoofStatus",
+    "WindDirection",
+]
+
+# These are intentionally excluded from the baseball-only model but may be used
+# by a separate market-assisted challenger.
+MARKET_FEATURE_PRIORITY = [
+    "MarketProbability", "Market_Over_Prob", "MarketImpliedProbability",
+    "SportsbookOdds", "Over_Odds", "Under_Odds",
+]
+
+BASELINE_PROBABILITY_PRIORITY = [
+    "HeuristicProbability", "ModelProbability", "RawProbability", "Model_1plus_HR", "Raw_Model_1plus_HR"
+]
+
+
+@dataclass
+class SplitInfo:
+    train_dates: list[str]
+    validation_dates: list[str]
+    holdout_dates: list[str]
+    train_rows: int
+    validation_rows: int
+    holdout_rows: int
+    train_positives: int
+    validation_positives: int
+    holdout_positives: int
+
+
+@dataclass
+class DataQualityReport:
+    input_rows: int
+    after_start_removed: int
+    incomplete_removed: int
+    duplicate_rows_removed: int
+    training_rows: int
+    positive_rows: int
+    positive_rate: float
+    unique_dates: int
+    market_rows: int
+    market_positive_rows: int
+
+
+@dataclass
+class CandidateResult:
+    name: str
+    validation_brier: float
+    validation_log_loss: float
+    validation_roc_auc: float | None
+    validation_pr_auc: float | None
+    validation_mean_probability: float
+    validation_actual_rate: float
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _to_bool(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    text = series.astype("object").where(series.notna(), False).astype(str).str.strip().str.lower()
+    return text.isin({"true", "1", "yes", "y", "t"})
+
+
+def american_to_implied(value: Any) -> float:
+    try:
+        odds = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    if not np.isfinite(odds) or odds == 0:
+        return math.nan
+    return 100.0 / (odds + 100.0) if odds > 0 else (-odds) / ((-odds) + 100.0)
+
+
+def _first_existing(frame: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in frame.columns and frame[column].notna().any():
+            return column
+    return None
+
+
+def _derive_market_probability(frame: pd.DataFrame) -> pd.Series:
+    result = pd.Series(np.nan, index=frame.index, dtype=float)
+    direct = _first_existing(frame, ["MarketProbability", "Market_Over_Prob"])
+    if direct:
+        result = pd.to_numeric(frame[direct], errors="coerce")
+
+    implied = _first_existing(frame, ["MarketImpliedProbability"])
+    if implied:
+        result = result.combine_first(pd.to_numeric(frame[implied], errors="coerce"))
+
+    over_col = _first_existing(frame, ["Over_Odds", "SportsbookOdds"])
+    under_col = _first_existing(frame, ["Under_Odds"])
+    if over_col:
+        yes = frame[over_col].map(american_to_implied)
+        if under_col:
+            no = frame[under_col].map(american_to_implied)
+            no_vig = yes / (yes + no)
+            result = result.combine_first(no_vig)
+        result = result.combine_first(yes)
+    return pd.to_numeric(result, errors="coerce").where(lambda x: x.between(0.001, 0.999))
+
+
+def prepare_training_data(raw: pd.DataFrame) -> tuple[pd.DataFrame, DataQualityReport]:
+    if raw is None or raw.empty:
+        raise ValueError("The uploaded snapshot is empty.")
+
+    frame = raw.copy()
+    input_rows = len(frame)
+
+    if "SnapshotAfterStart" in frame.columns:
+        after_start_mask = _to_bool(frame["SnapshotAfterStart"])
+    else:
+        generated = pd.to_datetime(frame.get("GeneratedAtUTC"), utc=True, errors="coerce")
+        first_pitch = pd.to_datetime(frame.get("GameDateTimeUTC"), utc=True, errors="coerce")
+        after_start_mask = generated.notna() & first_pitch.notna() & generated.gt(first_pitch)
+    after_start_removed = int(after_start_mask.sum())
+    frame = frame.loc[~after_start_mask].copy()
+
+    if TARGET_COLUMN not in frame.columns:
+        raise ValueError(f"The snapshot must contain {TARGET_COLUMN} with completed-game 0/1 outcomes.")
+    target = pd.to_numeric(frame[TARGET_COLUMN], errors="coerce")
+    complete_mask = target.isin([0, 1])
+    incomplete_removed = int((~complete_mask).sum())
+    frame = frame.loc[complete_mask].copy()
+    frame[TARGET_COLUMN] = target.loc[complete_mask].astype(int)
+
+    frame["_generated_at"] = pd.to_datetime(frame.get("GeneratedAtUTC"), utc=True, errors="coerce")
+    frame["_slate_date"] = pd.to_datetime(frame.get("SlateDate"), errors="coerce")
+    game_datetime = pd.to_datetime(frame.get("GameDateTimeUTC"), utc=True, errors="coerce")
+    if isinstance(game_datetime, pd.Series):
+        frame["_slate_date"] = frame["_slate_date"].combine_first(game_datetime.dt.tz_convert(None).dt.normalize())
+
+    if frame["_slate_date"].isna().all():
+        raise ValueError("No usable SlateDate or GameDateTimeUTC values were found for chronological splitting.")
+
+    game = pd.to_numeric(frame.get("GamePK"), errors="coerce")
+    player = pd.to_numeric(frame.get("PlayerID"), errors="coerce")
+    target_label = frame.get("Target", pd.Series("1+ HR", index=frame.index)).fillna("1+ HR").astype(str)
+    fallback = (
+        frame["_slate_date"].astype(str)
+        + "|" + frame.get("Team", pd.Series("", index=frame.index)).fillna("").astype(str)
+        + "|" + frame.get("StartingPitcherID", pd.Series("", index=frame.index)).fillna("").astype(str)
+        + "|" + player.astype("Int64").astype(str)
+        + "|" + target_label
+    )
+    frame["_dedupe_key"] = np.where(
+        game.notna() & player.notna(),
+        game.astype("Int64").astype(str) + "|" + player.astype("Int64").astype(str) + "|" + target_label,
+        fallback,
+    )
+    before_dedupe = len(frame)
+    frame = (
+        frame.sort_values(["_generated_at", "_slate_date"], na_position="first")
+        .drop_duplicates("_dedupe_key", keep="last")
+        .copy()
+    )
+    duplicate_rows_removed = before_dedupe - len(frame)
+
+    frame["_market_probability"] = _derive_market_probability(frame)
+    market_mask = frame["_market_probability"].between(0.001, 0.999)
+    market_rows = int(market_mask.sum())
+    market_positive_rows = int(frame.loc[market_mask, TARGET_COLUMN].sum())
+
+    frame = frame.sort_values(["_slate_date", "GamePK", "PlayerID"], na_position="last").reset_index(drop=True)
+    report = DataQualityReport(
+        input_rows=input_rows,
+        after_start_removed=after_start_removed,
+        incomplete_removed=incomplete_removed,
+        duplicate_rows_removed=duplicate_rows_removed,
+        training_rows=len(frame),
+        positive_rows=int(frame[TARGET_COLUMN].sum()),
+        positive_rate=float(frame[TARGET_COLUMN].mean()),
+        unique_dates=int(frame["_slate_date"].nunique()),
+        market_rows=market_rows,
+        market_positive_rows=market_positive_rows,
+    )
+    return frame, report
+
+
+def chronological_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, SplitInfo]:
+    dates = sorted(pd.Timestamp(value) for value in frame["_slate_date"].dropna().unique())
+    if len(dates) < 6:
+        raise ValueError(
+            f"At least 6 completed slate dates are required for train/validation/holdout splits; found {len(dates)}."
+        )
+
+    # Whole dates remain intact. With small histories, reserve at least one date
+    # for validation and two for the final holdout whenever possible.
+    holdout_count = max(2, int(round(len(dates) * 0.15)))
+    validation_count = max(1, int(round(len(dates) * 0.15)))
+    if len(dates) - holdout_count - validation_count < 3:
+        holdout_count = 1
+        validation_count = 1
+    train_dates = dates[: len(dates) - validation_count - holdout_count]
+    validation_dates = dates[len(train_dates): len(train_dates) + validation_count]
+    holdout_dates = dates[len(train_dates) + validation_count:]
+
+    train = frame[frame["_slate_date"].isin(train_dates)].copy()
+    validation = frame[frame["_slate_date"].isin(validation_dates)].copy()
+    holdout = frame[frame["_slate_date"].isin(holdout_dates)].copy()
+    for name, split in [("training", train), ("validation", validation), ("holdout", holdout)]:
+        if split.empty or split[TARGET_COLUMN].nunique() < 2:
+            raise ValueError(f"The {name} split does not contain both HR and non-HR outcomes. More dates are needed.")
+
+    info = SplitInfo(
+        train_dates=[str(d.date()) for d in train_dates],
+        validation_dates=[str(d.date()) for d in validation_dates],
+        holdout_dates=[str(d.date()) for d in holdout_dates],
+        train_rows=len(train),
+        validation_rows=len(validation),
+        holdout_rows=len(holdout),
+        train_positives=int(train[TARGET_COLUMN].sum()),
+        validation_positives=int(validation[TARGET_COLUMN].sum()),
+        holdout_positives=int(holdout[TARGET_COLUMN].sum()),
+    )
+    return train, validation, holdout, info
+
+
+def usable_features(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
+    numeric = [
+        c for c in NUMERIC_BASEBALL_FEATURES
+        if c in frame.columns and pd.to_numeric(frame[c], errors="coerce").notna().sum() >= 10
+    ]
+    categorical = [
+        c for c in CATEGORICAL_BASEBALL_FEATURES
+        if c in frame.columns and frame[c].notna().sum() >= 10 and frame[c].nunique(dropna=True) >= 2
+    ]
+    if len(numeric) < 8:
+        raise ValueError(f"Only {len(numeric)} usable baseball features were found; at least 8 are required.")
+    return numeric, categorical
+
+
+def probability_metrics(y_true: pd.Series | np.ndarray, probability: np.ndarray) -> dict[str, float | int | None]:
+    y = np.asarray(y_true, dtype=int)
+    p = np.clip(np.asarray(probability, dtype=float), 0.0001, 0.9999)
+    metrics: dict[str, float | int | None] = {
+        "n": int(len(y)),
+        "positives": int(y.sum()),
+        "actual_rate": float(y.mean()),
+        "mean_probability": float(p.mean()),
+        "bias": float(p.mean() - y.mean()),
+        "brier": float(brier_score_loss(y, p)),
+        "log_loss": float(log_loss(y, p, labels=[0, 1])),
+        "roc_auc": None,
+        "pr_auc": None,
+    }
+    if len(np.unique(y)) > 1:
+        metrics["roc_auc"] = float(roc_auc_score(y, p))
+        metrics["pr_auc"] = float(average_precision_score(y, p))
+    return metrics
+
+
+def _make_logistic_pipeline(numeric: list[str], categorical: list[str]) -> Pipeline:
+    transformers: list[tuple[str, Any, list[str]]] = [
+        (
+            "numeric",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+                ("scaler", StandardScaler()),
+            ]),
+            numeric,
+        )
+    ]
+    if categorical:
+        transformers.append(
+            (
+                "categorical",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                ]),
+                categorical,
+            )
+        )
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return Pipeline([
+        ("preprocessor", preprocessor),
+        ("model", LogisticRegression(C=0.08, max_iter=4000, solver="liblinear", random_state=42)),
+    ])
+
+
+def _make_numeric_pipeline(model: Any) -> Pipeline:
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+        ("model", model),
+    ])
+
+
+def candidate_models(numeric: list[str], categorical: list[str]) -> dict[str, tuple[Pipeline, list[str]]]:
+    all_features = numeric + categorical
+    return {
+        "logistic_regularized": (_make_logistic_pipeline(numeric, categorical), all_features),
+        "hist_gradient_boosting": (
+            _make_numeric_pipeline(
+                HistGradientBoostingClassifier(
+                    learning_rate=0.045,
+                    max_iter=180,
+                    max_leaf_nodes=15,
+                    min_samples_leaf=25,
+                    l2_regularization=3.0,
+                    random_state=42,
+                )
+            ),
+            numeric,
+        ),
+        "extra_trees": (
+            _make_numeric_pipeline(
+                ExtraTreesClassifier(
+                    n_estimators=500,
+                    min_samples_leaf=12,
+                    max_features=0.70,
+                    n_jobs=-1,
+                    random_state=42,
+                )
+            ),
+            numeric,
+        ),
+    }
+
+
+def _fit_platt_calibrator(probability: np.ndarray, target: pd.Series) -> LogisticRegression:
+    p = np.clip(np.asarray(probability, dtype=float), 0.001, 0.999)
+    x = np.log(p / (1.0 - p)).reshape(-1, 1)
+    calibrator = LogisticRegression(C=1.0, solver="lbfgs", max_iter=2000, random_state=42)
+    calibrator.fit(x, np.asarray(target, dtype=int))
+    return calibrator
+
+
+def apply_calibrator(calibrator: LogisticRegression, probability: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(probability, dtype=float), 0.001, 0.999)
+    x = np.log(p / (1.0 - p)).reshape(-1, 1)
+    return calibrator.predict_proba(x)[:, 1]
+
+
+def _baseline_probability(frame: pd.DataFrame) -> tuple[str | None, pd.Series]:
+    column = _first_existing(frame, BASELINE_PROBABILITY_PRIORITY)
+    if column is None:
+        return None, pd.Series(np.nan, index=frame.index, dtype=float)
+    probability = pd.to_numeric(frame[column], errors="coerce").where(lambda x: x.between(0.001, 0.999))
+    return column, probability
+
+
+def train_baseball_model(frame: pd.DataFrame) -> dict[str, Any]:
+    train, validation, holdout, split_info = chronological_split(frame)
+    numeric, categorical = usable_features(train)
+
+    validation_results: list[CandidateResult] = []
+    fitted: dict[str, dict[str, Any]] = {}
+    for name, (pipeline, features) in candidate_models(numeric, categorical).items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pipeline.fit(train[features], train[TARGET_COLUMN])
+        val_probability = pipeline.predict_proba(validation[features])[:, 1]
+        val_metrics = probability_metrics(validation[TARGET_COLUMN], val_probability)
+        validation_results.append(
+            CandidateResult(
+                name=name,
+                validation_brier=float(val_metrics["brier"]),
+                validation_log_loss=float(val_metrics["log_loss"]),
+                validation_roc_auc=val_metrics["roc_auc"],
+                validation_pr_auc=val_metrics["pr_auc"],
+                validation_mean_probability=float(val_metrics["mean_probability"]),
+                validation_actual_rate=float(val_metrics["actual_rate"]),
+            )
+        )
+        fitted[name] = {"pipeline": pipeline, "features": features, "validation_probability": val_probability}
+
+    validation_results.sort(key=lambda row: (row.validation_brier, row.validation_log_loss))
+    winner_name = validation_results[0].name
+    winner = fitted[winner_name]
+    calibrator = _fit_platt_calibrator(winner["validation_probability"], validation[TARGET_COLUMN])
+
+    raw_holdout_probability = winner["pipeline"].predict_proba(holdout[winner["features"]])[:, 1]
+    calibrated_holdout_probability = apply_calibrator(calibrator, raw_holdout_probability)
+    raw_holdout_metrics = probability_metrics(holdout[TARGET_COLUMN], raw_holdout_probability)
+    calibrated_holdout_metrics = probability_metrics(holdout[TARGET_COLUMN], calibrated_holdout_probability)
+
+    baseline_column, baseline_probability = _baseline_probability(holdout)
+    baseline_mask = baseline_probability.notna()
+    baseline_metrics = None
+    if baseline_mask.sum() >= 20 and holdout.loc[baseline_mask, TARGET_COLUMN].nunique() >= 2:
+        baseline_metrics = probability_metrics(
+            holdout.loc[baseline_mask, TARGET_COLUMN], baseline_probability.loc[baseline_mask].to_numpy(float)
+        )
+
+    holdout_export_columns = [
+        c for c in ["SlateDate", "GamePK", "PlayerID", "Player", "Team", "Opponent", "StartingPitcher"]
+        if c in holdout.columns
+    ]
+    holdout_predictions = holdout[holdout_export_columns].copy()
+    holdout_predictions["Actual_Event"] = holdout[TARGET_COLUMN].to_numpy(int)
+    holdout_predictions["Raw_ML_Probability"] = raw_holdout_probability
+    holdout_predictions["Calibrated_ML_Probability"] = calibrated_holdout_probability
+    if baseline_column:
+        holdout_predictions[f"Baseline_{baseline_column}"] = baseline_probability.to_numpy(float)
+
+    # Deployment gate: the calibrated ML model must beat the existing heuristic
+    # Brier score on the same holdout rows. If no baseline exists, deploy based on
+    # internal validation and report that no heuristic comparison was possible.
+    deploy_ml = True
+    deployment_reason = "No complete heuristic baseline was available on the holdout."
+    if baseline_metrics is not None:
+        deploy_ml = float(calibrated_holdout_metrics["brier"]) < float(baseline_metrics["brier"])
+        if deploy_ml:
+            deployment_reason = "Calibrated ML beat the existing heuristic Brier score on the chronological holdout."
+        else:
+            deployment_reason = "Existing heuristic retained: calibrated ML did not beat its holdout Brier score."
+
+    bundle = {
+        "trainer_version": TRAINER_VERSION,
+        "created_at_utc": utc_now_iso(),
+        "target": "1+ HR",
+        "model_name": winner_name,
+        "pipeline": winner["pipeline"],
+        "calibrator": calibrator,
+        "features": winner["features"],
+        "numeric_features": numeric,
+        "categorical_features": categorical,
+        "deploy_ml": deploy_ml,
+        "deployment_reason": deployment_reason,
+        "probability_method": "base_model_plus_platt_validation_calibration",
+    }
+
+    return {
+        "bundle": bundle,
+        "split_info": split_info,
+        "validation_results": validation_results,
+        "raw_holdout_metrics": raw_holdout_metrics,
+        "calibrated_holdout_metrics": calibrated_holdout_metrics,
+        "baseline_column": baseline_column,
+        "baseline_metrics": baseline_metrics,
+        "holdout_predictions": holdout_predictions,
+        "deploy_ml": deploy_ml,
+        "deployment_reason": deployment_reason,
+    }
+
+
+def train_market_assisted_model(
+    frame: pd.DataFrame,
+    minimum_rows: int = 500,
+    minimum_positives: int = 40,
+    minimum_dates: int = 6,
+) -> dict[str, Any] | None:
+    market = frame[frame["_market_probability"].between(0.001, 0.999)].copy()
+    if (
+        len(market) < minimum_rows
+        or int(market[TARGET_COLUMN].sum()) < minimum_positives
+        or market["_slate_date"].nunique() < minimum_dates
+    ):
+        return None
+
+    # Add only the cleaned no-vig/direct market probability, not raw bookmaker
+    # identifiers. This keeps the market signal interpretable and portable.
+    market["CleanMarketProbability"] = market["_market_probability"]
+    if "CleanMarketProbability" not in NUMERIC_BASEBALL_FEATURES:
+        NUMERIC_BASEBALL_FEATURES.append("CleanMarketProbability")
+    result = train_baseball_model(market)
+    result["market_rows"] = len(market)
+    return result
+
+
+def metadata_from_results(
+    quality: DataQualityReport,
+    baseball: dict[str, Any],
+    market: dict[str, Any] | None,
+) -> dict[str, Any]:
+    bundle = baseball["bundle"]
+    metadata: dict[str, Any] = {
+        "trainer_version": TRAINER_VERSION,
+        "created_at_utc": bundle["created_at_utc"],
+        "target": bundle["target"],
+        "selected_model": bundle["model_name"],
+        "deploy_ml": baseball["deploy_ml"],
+        "deployment_reason": baseball["deployment_reason"],
+        "data_quality": asdict(quality),
+        "split": asdict(baseball["split_info"]),
+        "validation_candidates": [asdict(row) for row in baseball["validation_results"]],
+        "holdout_raw_ml": baseball["raw_holdout_metrics"],
+        "holdout_calibrated_ml": baseball["calibrated_holdout_metrics"],
+        "baseline_column": baseball["baseline_column"],
+        "holdout_existing_heuristic": baseball["baseline_metrics"],
+        "feature_count": len(bundle["features"]),
+        "features": bundle["features"],
+        "market_assisted_status": "trained" if market else "insufficient timestamped odds history",
+    }
+    if market:
+        metadata["market_assisted"] = {
+            "selected_model": market["bundle"]["model_name"],
+            "holdout_calibrated_ml": market["calibrated_holdout_metrics"],
+            "market_rows": market.get("market_rows"),
+            "deploy_ml": market["deploy_ml"],
+        }
+    return metadata
+
+
+def train_from_dataframe(raw: pd.DataFrame, minimum_market_rows: int = 500) -> dict[str, Any]:
+    clean, quality = prepare_training_data(raw)
+    baseball = train_baseball_model(clean)
+    market = train_market_assisted_model(clean, minimum_rows=minimum_market_rows)
+    metadata = metadata_from_results(quality, baseball, market)
+    return {
+        "clean_data": clean,
+        "quality": quality,
+        "baseball": baseball,
+        "market": market,
+        "metadata": metadata,
+    }
+
+
+def save_training_outputs(results: dict[str, Any], output_dir: str | Path) -> dict[str, Path]:
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    model_path = directory / DEFAULT_MODEL_FILENAME
+    metadata_path = directory / DEFAULT_METADATA_FILENAME
+    holdout_path = directory / DEFAULT_HOLDOUT_FILENAME
+
+    joblib.dump(results["baseball"]["bundle"], model_path)
+    metadata_path.write_text(json.dumps(results["metadata"], indent=2, default=str), encoding="utf-8")
+    results["baseball"]["holdout_predictions"].to_csv(holdout_path, index=False)
+    return {"model": model_path, "metadata": metadata_path, "holdout": holdout_path}
+
+
+def predict_with_bundle(bundle: dict[str, Any], snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Apply a saved trainer bundle to current pregame snapshot rows."""
+    result = snapshot.copy()
+    features = list(bundle["features"])
+    for column in features:
+        if column not in result.columns:
+            result[column] = np.nan
+    raw_probability = bundle["pipeline"].predict_proba(result[features])[:, 1]
+    calibrated_probability = apply_calibrator(bundle["calibrator"], raw_probability)
+    result["Raw_ML_HR_Probability"] = raw_probability
+    result["Calibrated_ML_HR_Probability"] = calibrated_probability
+    result["ML_Model_Name"] = bundle.get("model_name", "")
+    result["ML_Trainer_Version"] = bundle.get("trainer_version", "")
+    result["ML_Deploy_Recommended"] = bool(bundle.get("deploy_ml", False))
+    return result
+
+
+def _metrics_table(baseball: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    if baseball["baseline_metrics"]:
+        rows.append({"Model": f"Existing heuristic ({baseball['baseline_column']})", **baseball["baseline_metrics"]})
+    rows.append({"Model": "ML raw", **baseball["raw_holdout_metrics"]})
+    rows.append({"Model": "ML calibrated", **baseball["calibrated_holdout_metrics"]})
+    return pd.DataFrame(rows)
+
+# -----------------------------------------------------------------------------
+# Integrated ML trainer, artifact persistence, and live-board model selection
+# -----------------------------------------------------------------------------
+HRML_ARTIFACT_FOLDER = "hr_model_artifacts"
+HRML_SESSION_BUNDLE_KEY = "clean_hr_ml_bundle"
+HRML_SESSION_RESULTS_KEY = "clean_hr_ml_training_results"
+HRML_PROBABILITY_MODE_KEY = "clean_hr_probability_source"
+
+
+def hrml_artifact_directory() -> Path:
+    return Path(__file__).resolve().parent / HRML_ARTIFACT_FOLDER
+
+
+def hrml_model_path() -> Path:
+    return hrml_artifact_directory() / DEFAULT_MODEL_FILENAME
+
+
+def hrml_metadata_path() -> Path:
+    return hrml_artifact_directory() / DEFAULT_METADATA_FILENAME
+
+
+def hrml_holdout_path() -> Path:
+    return hrml_artifact_directory() / DEFAULT_HOLDOUT_FILENAME
+
+
+def hrml_load_saved_bundle() -> dict | None:
+    session_bundle = st.session_state.get(HRML_SESSION_BUNDLE_KEY)
+    if isinstance(session_bundle, dict):
+        return session_bundle
+    if not HRML_DEPENDENCIES_AVAILABLE or joblib is None:
+        return None
+    path = hrml_model_path()
+    if not path.exists():
+        return None
+    try:
+        bundle = joblib.load(path)
+        if isinstance(bundle, dict):
+            st.session_state[HRML_SESSION_BUNDLE_KEY] = bundle
+            return bundle
+    except Exception as exc:
+        st.session_state["clean_hr_ml_load_error"] = f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def hrml_read_saved_metadata() -> dict:
+    path = hrml_metadata_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def hrml_render_sidebar_controls() -> dict | None:
+    bundle = hrml_load_saved_bundle()
+    with st.sidebar:
+        st.divider()
+        st.subheader("Trained HR model")
+        options = ["Auto guardrail", "Heuristic only"]
+        if bundle is not None:
+            options.append("ML challenger")
+        current = st.session_state.get(HRML_PROBABILITY_MODE_KEY, "Auto guardrail")
+        if current not in options:
+            current = "Auto guardrail"
+        st.selectbox(
+            "Probability source",
+            options,
+            index=options.index(current),
+            key=HRML_PROBABILITY_MODE_KEY,
+            help=(
+                "Auto uses ML only after it beats the existing heuristic on the chronological holdout. "
+                "ML challenger lets you inspect the trained model even when it has not passed deployment."
+            ),
+        )
+        if bundle is None:
+            st.caption("No saved ML bundle yet. Train one in the ML trainer tab.")
+        else:
+            recommended = bool(bundle.get("deploy_ml", False))
+            status = "Passed holdout guardrail" if recommended else "Challenger only"
+            st.caption(f"{bundle.get('model_name', 'Saved model')} · {status}")
+            created = str(bundle.get("created_at_utc", ""))
+            if created:
+                st.caption(f"Trained: {created[:19].replace('T', ' ')} UTC")
+        if not HRML_DEPENDENCIES_AVAILABLE:
+            st.warning("Trainer dependencies are missing. Add scikit-learn and joblib to requirements.txt.")
+    return bundle
+
+
+def hrml_apply_model_to_frame(
+    frame: pd.DataFrame,
+    context: dict | None = None,
+    heuristic_column: str = "Model_1plus_HR",
+    update_model_probability: bool = False,
+    rank_column: str | None = "Rank",
+) -> pd.DataFrame:
+    result = frame.copy() if frame is not None else pd.DataFrame()
+    if result.empty:
+        return result
+
+    heuristic = pd.to_numeric(result.get(heuristic_column), errors="coerce")
+    result["Heuristic_HR_Probability"] = heuristic
+    if context:
+        for column, value in context.items():
+            if column not in result.columns:
+                result[column] = value
+            else:
+                current = result[column]
+                missing = current.isna()
+                if current.dtype == object:
+                    missing = missing | current.astype(str).str.strip().eq("")
+                result[column] = current.where(~missing, value)
+
+    bundle = hrml_load_saved_bundle()
+    result["Raw_ML_HR_Probability"] = np.nan
+    result["Calibrated_ML_HR_Probability"] = np.nan
+    result["ML_Model_Name"] = ""
+    result["ML_Deploy_Recommended"] = False
+    if bundle is not None and HRML_DEPENDENCIES_AVAILABLE:
+        try:
+            result = predict_with_bundle(bundle, result)
+        except Exception as exc:
+            st.session_state["clean_hr_ml_prediction_error"] = f"{type(exc).__name__}: {exc}"
+
+    mode = st.session_state.get(HRML_PROBABILITY_MODE_KEY, "Auto guardrail")
+    ml_probability = pd.to_numeric(result.get("Calibrated_ML_HR_Probability"), errors="coerce")
+    has_ml = ml_probability.between(0.001, 0.999).any()
+    deploy_recommended = bool(bundle and bundle.get("deploy_ml", False))
+    use_ml = has_ml and (mode == "ML challenger" or (mode == "Auto guardrail" and deploy_recommended))
+
+    if use_ml:
+        result["Active_HR_Probability"] = ml_probability.combine_first(heuristic)
+        result["Active_HR_Model"] = "ML calibrated"
+    else:
+        result["Active_HR_Probability"] = heuristic
+        result["Active_HR_Model"] = "Existing heuristic"
+
+    if update_model_probability:
+        result["HeuristicProbability"] = heuristic
+        result["ModelProbability"] = pd.to_numeric(result["Active_HR_Probability"], errors="coerce")
+        result["ModelOverProbability"] = result["ModelProbability"]
+        result["ActiveModel"] = result["Active_HR_Model"]
+
+    if rank_column and rank_column in result.columns:
+        result = result.drop(columns=[rank_column], errors="ignore")
+        secondary = "HRScore" if "HRScore" in result.columns else "ModelScore"
+        sort_columns = ["Active_HR_Probability"] + ([secondary] if secondary in result.columns else [])
+        result = result.sort_values(sort_columns, ascending=False).reset_index(drop=True)
+        result.insert(0, rank_column, np.arange(1, len(result) + 1))
+    return result
+
+
+def hrml_training_source_from_ui(widget_prefix: str) -> pd.DataFrame:
+    session_master = st.session_state.get(f"{widget_prefix}_master_snapshot", pd.DataFrame())
+    uploaded = st.file_uploader(
+        "Upload or replace the HR master snapshot for training",
+        type=["csv"],
+        key=f"{widget_prefix}_ml_training_upload",
+        help="The trainer can also use the in-session master assembled in Backtest & calibration.",
+    )
+    uploaded_frame = pd.DataFrame()
+    if uploaded is not None:
+        try:
+            uploaded_frame = pd.read_csv(uploaded, low_memory=False)
+        except Exception as exc:
+            st.error(f"Could not read training CSV: {exc}")
+
+    choices = []
+    if isinstance(session_master, pd.DataFrame) and not session_master.empty:
+        choices.append("In-session master")
+    if not uploaded_frame.empty:
+        choices.append("Uploaded CSV")
+    if len(choices) == 2:
+        choices.append("Combine both")
+    if not choices:
+        return pd.DataFrame()
+    source_choice = st.radio(
+        "Training data source",
+        choices,
+        horizontal=True,
+        key=f"{widget_prefix}_ml_training_source",
+    )
+    if source_choice == "Uploaded CSV":
+        return uploaded_frame
+    if source_choice == "Combine both":
+        return pd.concat([session_master, uploaded_frame], ignore_index=True, sort=False)
+    return session_master.copy()
+
+
+def hrml_render_training_results(results: dict[str, Any]) -> None:
+    quality: DataQualityReport = results["quality"]
+    baseball = results["baseball"]
+    split: SplitInfo = baseball["split_info"]
+
+    q1, q2, q3, q4, q5 = st.columns(5)
+    q1.metric("Clean player-games", f"{quality.training_rows:,}")
+    q2.metric("Actual HR", f"{quality.positive_rows:,}")
+    q3.metric("HR rate", f"{quality.positive_rate:.1%}")
+    q4.metric("Completed dates", f"{quality.unique_dates:,}")
+    q5.metric("Rows with odds", f"{quality.market_rows:,}")
+
+    st.markdown("#### Chronological split")
+    st.caption(
+        f"Train {split.train_dates[0]}–{split.train_dates[-1]} ({split.train_rows:,}) · "
+        f"Validation {split.validation_dates[0]}–{split.validation_dates[-1]} ({split.validation_rows:,}) · "
+        f"Holdout {split.holdout_dates[0]}–{split.holdout_dates[-1]} ({split.holdout_rows:,})"
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Validation candidates")
+        candidates = pd.DataFrame([asdict(row) for row in baseball["validation_results"]])
+        st.dataframe(candidates, use_container_width=True, hide_index=True, height=260)
+    with right:
+        st.markdown("#### Untouched holdout")
+        st.dataframe(_metrics_table(baseball), use_container_width=True, hide_index=True, height=260)
+
+    if baseball["deploy_ml"]:
+        st.success(baseball["deployment_reason"])
+    else:
+        st.warning(baseball["deployment_reason"])
+
+    market = results.get("market")
+    if market is None:
+        st.info(
+            f"Odds-assisted model not trained yet: {quality.market_rows:,} usable completed pregame odds rows. "
+            "The baseball-only model remains independent of sportsbook prices."
+        )
+    else:
+        market_metrics = market["calibrated_holdout_metrics"]
+        st.success(
+            f"Odds-assisted challenger trained on {market.get('market_rows', 0):,} rows · "
+            f"holdout Brier {market_metrics.get('brier', float('nan')):.4f}."
+        )
+
+    model_buffer = io.BytesIO()
+    joblib.dump(baseball["bundle"], model_buffer)
+    metadata_bytes = json.dumps(results["metadata"], indent=2, default=str).encode("utf-8")
+    holdout_bytes = baseball["holdout_predictions"].to_csv(index=False).encode("utf-8")
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("Download model bundle", model_buffer.getvalue(), DEFAULT_MODEL_FILENAME, "application/octet-stream", use_container_width=True)
+    d2.download_button("Download model metadata", metadata_bytes, DEFAULT_METADATA_FILENAME, "application/json", use_container_width=True)
+    d3.download_button("Download holdout predictions", holdout_bytes, DEFAULT_HOLDOUT_FILENAME, "text/csv", use_container_width=True)
+
+
+def render_integrated_hr_model_trainer(widget_prefix: str = "clean_hr") -> None:
+    st.markdown("### ML trainer")
+    st.caption(
+        "Train and test the home-run model inside this dashboard. It removes post-start rows, keeps only the latest "
+        "pregame player-game snapshot, splits chronologically, calibrates on validation, and protects the live board "
+        "with an untouched-holdout deployment gate."
+    )
+    if not HRML_DEPENDENCIES_AVAILABLE:
+        st.error(
+            "The dashboard can still run, but training requires scikit-learn and joblib. "
+            f"Import error: {HRML_DEPENDENCY_ERROR}"
+        )
+        st.code("scikit-learn>=1.4,<2.0\njoblib>=1.3", language="text")
+        return
+
+    source = hrml_training_source_from_ui(widget_prefix)
+    if source.empty:
+        st.info("Upload your HR master snapshot here, or add it to the in-session master in Backtest & calibration.")
+    else:
+        st.write(f"Training source: **{len(source):,} rows** · **{len(source.columns):,} columns**")
+
+    c1, c2 = st.columns([1, 2])
+    minimum_market_rows = c1.number_input(
+        "Minimum odds rows",
+        min_value=200,
+        max_value=5000,
+        value=500,
+        step=50,
+        key=f"{widget_prefix}_minimum_market_rows",
+        help="The baseball-only model trains without odds. This threshold controls the separate odds-assisted challenger.",
+    )
+    c2.caption(
+        "Odds are used only in a separate market-assisted challenger. The main baseball-only model remains clean, "
+        "so you can measure whether sportsbook information truly improves prediction."
+    )
+
+    if st.button(
+        "Train, test, and save HR model",
+        type="primary",
+        use_container_width=True,
+        disabled=source.empty,
+        key=f"{widget_prefix}_train_integrated_hr_model",
+    ):
+        try:
+            with st.spinner("Cleaning snapshots, training candidates, calibrating, and evaluating the chronological holdout..."):
+                results = train_from_dataframe(source, minimum_market_rows=int(minimum_market_rows))
+                paths = save_training_outputs(results, hrml_artifact_directory())
+            st.session_state[HRML_SESSION_RESULTS_KEY] = results
+            st.session_state[HRML_SESSION_BUNDLE_KEY] = results["baseball"]["bundle"]
+            st.session_state["clean_hr_ml_saved_paths"] = {key: str(value) for key, value in paths.items()}
+            st.success(f"Training complete. Artifacts saved in {hrml_artifact_directory().name}/ beside the dashboard.")
+        except Exception as exc:
+            st.error(f"Training stopped: {type(exc).__name__}: {exc}")
+            with st.expander("Trainer technical details", expanded=False):
+                st.code(traceback.format_exc())
+
+    results = st.session_state.get(HRML_SESSION_RESULTS_KEY)
+    if isinstance(results, dict):
+        hrml_render_training_results(results)
+    else:
+        metadata = hrml_read_saved_metadata()
+        bundle = hrml_load_saved_bundle()
+        if bundle:
+            st.markdown("#### Saved model status")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Model", str(bundle.get("model_name", "Saved model")))
+            m2.metric("Features", f"{len(bundle.get('features', [])):,}")
+            m3.metric("Deployment", "Passed" if bundle.get("deploy_ml") else "Challenger")
+            reason = bundle.get("deployment_reason") or metadata.get("deployment_reason")
+            if reason:
+                st.caption(str(reason))
+        else:
+            st.caption("No saved model bundle is currently loaded.")
+
+
+# ===== END INTEGRATED TRAINER CORE =====
+
+
 try:
     inject_clean_css()
     inject_edge_theme()
@@ -5142,14 +6093,36 @@ try:
     rankings = apply_hr_probability_calibration(
         rankings, st.session_state.get(f"{MODEL_KEY}_probability_calibration")
     )
+    hrml_render_sidebar_controls()
+    rankings = hrml_apply_model_to_frame(
+        rankings,
+        context={
+            "HomeAway": home_away,
+            "WeatherMultiplier": weather_multiplier,
+            "TemperatureF": temperature_f,
+            "HumidityPct": humidity_pct,
+            "WindMPH": wind_mph,
+            "PressureHPA": pressure_hpa,
+            "WindDirection": wind_direction,
+            "RoofStatus": roof_status,
+            "TeamImpliedRuns": team_runs,
+            "StarterInnings": starter_innings,
+            "BullpenMultiplier": bullpen_multiplier,
+        },
+        heuristic_column="Model_1plus_HR",
+        update_model_probability=False,
+        rank_column="Rank",
+    )
 
     render_board_header(matchup, selected_team, matchup["pitcher_name"], "ADVANCED HOME RUN BOARD")
-    render_leader_cards(rankings, "Model_1plus_HR", "HRScore", "model 1+ HR")
+    render_leader_cards(rankings, "Active_HR_Probability", "HRScore", "active 1+ HR")
+    active_model_label = str(rankings.get("Active_HR_Model", pd.Series(["Existing heuristic"])).iloc[0])
+    st.caption(f"Active probability source: {active_model_label}. Both heuristic and ML probabilities remain visible for comparison.")
 
-    quick_tab, power_tab, matchup_tab, pitch_type_tab, tracking_tab, pitcher_tab, slate_tab, backtest_tab, notes_tab = st.tabs(
+    quick_tab, power_tab, matchup_tab, pitch_type_tab, tracking_tab, pitcher_tab, slate_tab, backtest_tab, trainer_tab, notes_tab = st.tabs(
         [
             "Quick board", "Power profile", "Matchup detail", "Batter vs pitch type",
-            "Bat tracking", "Pitcher profile", "Top 10 & 3-man", "Backtest & calibration", "Model notes"
+            "Bat tracking", "Pitcher profile", "Top 10 & 3-man", "Backtest & calibration", "ML trainer", "Model notes"
         ]
     )
 
@@ -5162,14 +6135,17 @@ try:
 
     with quick_tab:
         quick_columns = [
-            "Rank", "Player", "LineupSpot", "Projected_PA", "Model_1plus_HR",
+            "Rank", "Player", "LineupSpot", "Projected_PA", "Active_HR_Probability",
+            "Heuristic_HR_Probability", "Calibrated_ML_HR_Probability", "Active_HR_Model",
             "HRScore", "Confidence_Level", "Adj_Brl_PA", "Barrel_Range_BIP",
             "LA_Power_Score", "Adj_xISO_PA", "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
             "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore", "ParkFactor",
         ]
         quick = rankings[[column for column in quick_columns if column in rankings.columns]].copy()
         quick = quick.rename(columns={
-            "LineupSpot": "Order", "Projected_PA": "Proj PA", "Model_1plus_HR": "1+ HR",
+            "LineupSpot": "Order", "Projected_PA": "Proj PA",
+            "Active_HR_Probability": "1+ HR", "Heuristic_HR_Probability": "Heuristic",
+            "Calibrated_ML_HR_Probability": "ML", "Active_HR_Model": "Source",
             "HRScore": "HR Score", "Confidence_Level": "Confidence",
             "Adj_Brl_PA": "Adj Brl/PA", "Barrel_Range_BIP": "Barrel Range/BIP",
             "LA_Power_Score": "LA Power", "Adj_xISO_PA": "Adj xISO/PA",
@@ -5183,7 +6159,7 @@ try:
         styler = quick.style.background_gradient(
             cmap="RdYlGn", subset=score_cols, vmin=0, vmax=100
         ).format({
-            "Order": "{:.0f}", "Proj PA": "{:.2f}", "1+ HR": "{:.1%}",
+            "Order": "{:.0f}", "Proj PA": "{:.2f}", "1+ HR": "{:.1%}", "Heuristic": "{:.1%}", "ML": "{:.1%}",
             "HR Score": "{:.1f}", "Adj Brl/PA": "{:.2%}", "Barrel Range/BIP": "{:.1%}",
             "LA Power": "{:.1f}", "Adj xISO/PA": "{:.3f}",
             "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}", "Pitcher Power": "{:.1f}",
@@ -5464,6 +6440,9 @@ try:
             widget_prefix=MODEL_KEY,
         )
 
+    with trainer_tab:
+        render_integrated_hr_model_trainer(widget_prefix=MODEL_KEY)
+
     with notes_tab:
         st.markdown(
             """
@@ -5479,7 +6458,7 @@ try:
             - **Sample** marks hitters below the selected PA threshold. Active-roster players with no history use league-average priors and remain Low confidence.
             - **Confidence** reflects sample size and matchup-data depth, not certainty that the outcome will occur.
 
-            The probabilities remain heuristic until tested and calibrated on held-out historical games.
+            The ML trainer tests feature-based challengers on chronological holdout games. Auto guardrail keeps the heuristic active unless ML proves better on holdout Brier score.
             """
         )
 
