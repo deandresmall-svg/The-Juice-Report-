@@ -46,6 +46,7 @@ st.set_page_config(page_title="Advanced MLB Home Run Dashboard", layout="wide")
 cache.enable()
 
 RECENT_DAYS = 14
+INTELLIGENCE_FEATURE_VERSION = "hr_intelligence_v2"
 HIT_EVENTS = {"single", "double", "triple", "home_run"}
 STRIKEOUT_EVENTS = {"strikeout", "strikeout_double_play"}
 SWING_DESCRIPTIONS = {
@@ -143,7 +144,7 @@ def load_statcast(start_date: str, end_date: str) -> pd.DataFrame:
     """
     keep_columns = [
         "batter", "pitcher", "game_pk", "at_bat_number", "game_date", "player_name",
-        "home_team", "away_team", "inning_topbot", "description", "events", "bb_type",
+        "home_team", "away_team", "inning_topbot", "inning", "description", "events", "bb_type",
         "launch_speed", "launch_angle", "launch_speed_angle",
         "estimated_ba_using_speedangle", "estimated_slg_using_speedangle",
         "zone", "plate_x", "plate_z", "pitch_name", "release_speed", "pfx_x", "pfx_z",
@@ -259,6 +260,7 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
         "home_team",
         "away_team",
         "inning_topbot",
+        "inning",
         "description",
         "events",
         "bb_type",
@@ -289,6 +291,7 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
         "pitcher",
         "game_pk",
         "at_bat_number",
+        "inning",
         "launch_speed",
         "launch_angle",
         "launch_speed_angle",
@@ -1745,6 +1748,398 @@ def weather_carry_multiplier(
     )
 
 
+
+def _finite_float(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if np.isfinite(number) else float(default)
+
+
+def _minutes_to_first_pitch(game_datetime_utc: object, slate_date: object | None = None) -> float:
+    game_time = pd.to_datetime(game_datetime_utc, utc=True, errors="coerce")
+    if pd.isna(game_time):
+        return np.nan
+    slate_ts = pd.to_datetime(slate_date, errors="coerce")
+    # Historical snapshots in the backfill are reconstructed 30 minutes before
+    # first pitch. The notebook later stamps the exact synthetic timestamp.
+    if pd.notna(slate_ts) and slate_ts.date() < date.today():
+        return 30.0
+    now_utc = pd.Timestamp.now(tz="UTC")
+    return float((game_time - now_utc).total_seconds() / 60.0)
+
+
+def starter_intelligence_features(
+    df: pd.DataFrame,
+    pitcher_id: int,
+    end_date: object,
+) -> dict[str, float | int | str]:
+    """Create pregame-only starter form, rest, workload, and innings features."""
+    defaults: dict[str, float | int | str] = {
+        "StarterRecentStarts": 0,
+        "StarterRecentPitches": 0.0,
+        "StarterRecentBattersFaced": 0.0,
+        "StarterDaysRest": np.nan,
+        "StarterRecentHRPA": np.nan,
+        "StarterRecentBarrelPA": np.nan,
+        "StarterRecentxSLGPA": np.nan,
+        "StarterRecentWhiffPct": np.nan,
+        "StarterExpectedInningsAuto": 5.5,
+        "StarterRecentFormMultiplier": 1.0,
+        "StarterFatigueMultiplier": 1.0,
+        "StarterContextMultiplier": 1.0,
+        "StarterSamplePitches": 0,
+        "StarterSamplePA": 0,
+        "StarterIntelligenceStatus": "No prior sample",
+    }
+    if df is None or df.empty:
+        return defaults
+
+    cutoff = pd.to_datetime(end_date, errors="coerce")
+    pitcher_numeric = pd.to_numeric(df.get("pitcher"), errors="coerce")
+    game_dates = pd.to_datetime(df.get("game_date"), errors="coerce")
+    mask = pitcher_numeric.eq(int(pitcher_id))
+    if pd.notna(cutoff):
+        mask &= game_dates.le(cutoff)
+    history = df.loc[mask].copy()
+    if history.empty:
+        return defaults
+
+    history["_game_date"] = pd.to_datetime(history.get("game_date"), errors="coerce")
+    history["_game_pk"] = pd.to_numeric(history.get("game_pk"), errors="coerce")
+    history["_pa_key"] = history.get("pa_key", pd.Series(index=history.index, dtype=object))
+    per_game = (
+        history.groupby(["_game_pk", "_game_date"], dropna=False)
+        .agg(
+            Pitches=("pitcher", "size"),
+            PA=("_pa_key", "nunique"),
+            HR=("is_hr", "sum"),
+            Barrels=("is_barrel", "sum"),
+            xSLG=("xslg_value", "sum"),
+            Swings=("is_swing", "sum"),
+            Whiffs=("is_whiff", "sum"),
+        )
+        .reset_index()
+        .sort_values("_game_date")
+    )
+    per_game = per_game[per_game["Pitches"].gt(0)].copy()
+    if per_game.empty:
+        return defaults
+
+    recent = per_game.tail(5).copy()
+    recent_three = per_game.tail(3).copy()
+    recent_pa = max(float(recent["PA"].sum()), 0.0)
+    recent_pitches = float(recent_three["Pitches"].mean()) if not recent_three.empty else 0.0
+    recent_bf = float(recent_three["PA"].mean()) if not recent_three.empty else 0.0
+
+    pa_all = df[df.get("is_pa_end", pd.Series(False, index=df.index)).fillna(False)].copy()
+    league_pa = max(int(pa_all.get("pa_key", pd.Series(dtype=object)).nunique()), 1)
+    league_hr_pa = max(float(pd.to_numeric(pa_all.get("is_hr"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+    league_brl_pa = max(float(pd.to_numeric(pa_all.get("is_barrel"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+    league_xslg_pa = max(float(pd.to_numeric(pa_all.get("xslg_value"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+
+    recent_hr_pa = (float(recent["HR"].sum()) + league_hr_pa * 65.0) / (recent_pa + 65.0)
+    recent_brl_pa = (float(recent["Barrels"].sum()) + league_brl_pa * 65.0) / (recent_pa + 65.0)
+    recent_xslg_pa = (float(recent["xSLG"].sum()) + league_xslg_pa * 65.0) / (recent_pa + 65.0)
+    swings = max(float(recent["Swings"].sum()), 1.0)
+    recent_whiff_pct = float(recent["Whiffs"].sum()) / swings
+
+    hr_ratio = np.clip(recent_hr_pa / league_hr_pa, 0.45, 2.20)
+    brl_ratio = np.clip(recent_brl_pa / league_brl_pa, 0.45, 2.20)
+    xslg_ratio = np.clip(recent_xslg_pa / league_xslg_pa, 0.50, 1.90)
+    form_ratio = 0.45 * hr_ratio + 0.35 * brl_ratio + 0.20 * xslg_ratio
+    form_multiplier = float(np.clip(1.0 + (form_ratio - 1.0) * 0.24, 0.88, 1.14))
+
+    last_game_date = pd.to_datetime(per_game["_game_date"].max(), errors="coerce")
+    days_rest = float((cutoff.normalize() - last_game_date.normalize()).days) if pd.notna(cutoff) and pd.notna(last_game_date) else np.nan
+    last_pitches = float(per_game.iloc[-1]["Pitches"])
+    fatigue_multiplier = 1.0
+    if np.isfinite(days_rest):
+        if days_rest <= 3:
+            fatigue_multiplier += 0.045
+        elif days_rest == 4:
+            fatigue_multiplier += 0.018
+        elif days_rest >= 7:
+            fatigue_multiplier -= 0.012
+    if last_pitches >= 100 and np.isfinite(days_rest) and days_rest <= 4:
+        fatigue_multiplier += 0.018
+    fatigue_multiplier = float(np.clip(fatigue_multiplier, 0.96, 1.09))
+
+    expected_innings = float(np.clip(recent_bf / 4.25 if recent_bf > 0 else 5.5, 3.5, 7.2))
+    sample_pa_mask = history.get("is_pa_end", pd.Series(False, index=history.index)).fillna(False)
+    sample_pa = int(history.loc[sample_pa_mask, "pa_key"].nunique()) if "pa_key" in history.columns else int(recent_pa)
+
+    return {
+        "StarterRecentStarts": int(len(recent)),
+        "StarterRecentPitches": recent_pitches,
+        "StarterRecentBattersFaced": recent_bf,
+        "StarterDaysRest": days_rest,
+        "StarterRecentHRPA": recent_hr_pa,
+        "StarterRecentBarrelPA": recent_brl_pa,
+        "StarterRecentxSLGPA": recent_xslg_pa,
+        "StarterRecentWhiffPct": recent_whiff_pct,
+        "StarterExpectedInningsAuto": expected_innings,
+        "StarterRecentFormMultiplier": form_multiplier,
+        "StarterFatigueMultiplier": fatigue_multiplier,
+        "StarterContextMultiplier": float(np.clip(form_multiplier * fatigue_multiplier, 0.86, 1.18)),
+        "StarterSamplePitches": int(len(history)),
+        "StarterSamplePA": sample_pa,
+        "StarterIntelligenceStatus": "Prior five appearances",
+    }
+
+
+def build_bullpen_intelligence_table(df: pd.DataFrame, end_date: object) -> pd.DataFrame:
+    """Estimate bullpen HR quality and short-rest availability from prior Statcast rows."""
+    columns = [
+        "BullpenTeam", "BullpenRecentPA", "BullpenRecentHR", "BullpenRecentHRPA",
+        "BullpenRecentBarrelPA", "BullpenRecentxSLGPA", "BullpenRecentWhiffPct",
+        "BullpenPitchesLast1", "BullpenPitchesLast3", "BullpenRelieversLast3",
+        "BullpenAvailabilityScore", "BullpenQualityMultiplier", "BullpenWorkloadMultiplier",
+        "AutoBullpenMultiplier", "BullpenIntelligenceStatus",
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+
+    end_ts = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(end_ts):
+        end_ts = pd.to_datetime(df.get("game_date"), errors="coerce").max()
+    start_ts = end_ts - pd.Timedelta(days=21)
+    dates = pd.to_datetime(df.get("game_date"), errors="coerce")
+    work = df.loc[dates.between(start_ts, end_ts, inclusive="both")].copy()
+    if work.empty or not {"game_pk", "pitcher", "pitcher_team"}.issubset(work.columns):
+        return pd.DataFrame(columns=columns)
+
+    work["_game_date"] = pd.to_datetime(work.get("game_date"), errors="coerce")
+    work["_game_pk"] = pd.to_numeric(work.get("game_pk"), errors="coerce")
+    work["_pitcher"] = pd.to_numeric(work.get("pitcher"), errors="coerce")
+    work["_team"] = safe_text_series(work.get("pitcher_team"), "")
+
+    appearances = (
+        work.groupby(["_game_pk", "_game_date", "_team", "_pitcher"], dropna=False)
+        .size()
+        .rename("PitchCount")
+        .reset_index()
+    )
+    if appearances.empty:
+        return pd.DataFrame(columns=columns)
+    appearances["StarterRank"] = appearances.groupby(["_game_pk", "_team"])["PitchCount"].rank(method="first", ascending=False)
+    relief_appearances = appearances[appearances["StarterRank"].gt(1)].copy()
+    if relief_appearances.empty:
+        return pd.DataFrame(columns=columns)
+
+    relief_keys = relief_appearances[["_game_pk", "_team", "_pitcher"]].drop_duplicates()
+    relief = work.merge(relief_keys, on=["_game_pk", "_team", "_pitcher"], how="inner")
+    if relief.empty:
+        return pd.DataFrame(columns=columns)
+
+    pa_all = work[work.get("is_pa_end", pd.Series(False, index=work.index)).fillna(False)]
+    league_pa = max(int(pa_all.get("pa_key", pd.Series(dtype=object)).nunique()), 1)
+    league_hr = max(float(pd.to_numeric(pa_all.get("is_hr"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+    league_brl = max(float(pd.to_numeric(pa_all.get("is_barrel"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+    league_xslg = max(float(pd.to_numeric(pa_all.get("xslg_value"), errors="coerce").fillna(0).sum() / league_pa), 0.0001)
+
+    pa_relief = relief[relief.get("is_pa_end", pd.Series(False, index=relief.index)).fillna(False)].copy()
+    quality = (
+        pa_relief.groupby("_team", dropna=False)
+        .agg(
+            PA=("pa_key", "nunique"),
+            HR=("is_hr", "sum"),
+            Barrels=("is_barrel", "sum"),
+            xSLG=("xslg_value", "sum"),
+            Swings=("is_swing", "sum"),
+            Whiffs=("is_whiff", "sum"),
+        )
+        .reset_index()
+    )
+
+    one_day = relief_appearances[relief_appearances["_game_date"].ge(end_ts - pd.Timedelta(days=1))]
+    three_day = relief_appearances[relief_appearances["_game_date"].ge(end_ts - pd.Timedelta(days=3))]
+    load1 = one_day.groupby("_team")["PitchCount"].sum().rename("Pitches1")
+    load3 = three_day.groupby("_team")["PitchCount"].sum().rename("Pitches3")
+    relievers3 = three_day.groupby("_team")["_pitcher"].nunique().rename("Relievers3")
+
+    teams = sorted(set(work["_team"].dropna().astype(str)) - {""})
+    rows: list[dict[str, object]] = []
+    quality_by_team = quality.set_index("_team") if not quality.empty else pd.DataFrame()
+    for team in teams:
+        if not quality.empty and team in quality_by_team.index:
+            row = quality_by_team.loc[team]
+            pa = _finite_float(row.get("PA"), 0.0)
+            hr = _finite_float(row.get("HR"), 0.0)
+            barrels = _finite_float(row.get("Barrels"), 0.0)
+            xslg = _finite_float(row.get("xSLG"), 0.0)
+            swings = max(_finite_float(row.get("Swings"), 0.0), 1.0)
+            whiffs = _finite_float(row.get("Whiffs"), 0.0)
+        else:
+            pa = hr = barrels = xslg = whiffs = 0.0
+            swings = 1.0
+
+        hr_pa = (hr + league_hr * 120.0) / (pa + 120.0)
+        brl_pa = (barrels + league_brl * 120.0) / (pa + 120.0)
+        xslg_pa = (xslg + league_xslg * 120.0) / (pa + 120.0)
+        whiff_pct = whiffs / swings
+        quality_ratio = (
+            0.45 * np.clip(hr_pa / league_hr, 0.55, 1.80)
+            + 0.35 * np.clip(brl_pa / league_brl, 0.55, 1.80)
+            + 0.20 * np.clip(xslg_pa / league_xslg, 0.60, 1.60)
+        )
+        quality_multiplier = float(np.clip(1.0 + (quality_ratio - 1.0) * 0.32, 0.84, 1.18))
+
+        pitches1 = _finite_float(load1.get(team, 0.0), 0.0)
+        pitches3 = _finite_float(load3.get(team, 0.0), 0.0)
+        reliever_count3 = int(_finite_float(relievers3.get(team, 0.0), 0.0))
+        workload_pressure = 0.58 * min(pitches1 / 105.0, 1.6) + 0.42 * min(pitches3 / 290.0, 1.6)
+        workload_multiplier = float(np.clip(0.96 + workload_pressure * 0.10, 0.96, 1.12))
+        availability = float(np.clip(100.0 * (1.0 - min(workload_pressure / 1.35, 1.0)), 0.0, 100.0))
+        auto_multiplier = float(np.clip(quality_multiplier * workload_multiplier, 0.78, 1.30))
+
+        rows.append({
+            "BullpenTeam": team,
+            "BullpenRecentPA": int(pa),
+            "BullpenRecentHR": int(hr),
+            "BullpenRecentHRPA": hr_pa,
+            "BullpenRecentBarrelPA": brl_pa,
+            "BullpenRecentxSLGPA": xslg_pa,
+            "BullpenRecentWhiffPct": whiff_pct,
+            "BullpenPitchesLast1": pitches1,
+            "BullpenPitchesLast3": pitches3,
+            "BullpenRelieversLast3": reliever_count3,
+            "BullpenAvailabilityScore": availability,
+            "BullpenQualityMultiplier": quality_multiplier,
+            "BullpenWorkloadMultiplier": workload_multiplier,
+            "AutoBullpenMultiplier": auto_multiplier,
+            "BullpenIntelligenceStatus": "Prior 21 days",
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def bullpen_intelligence_for_team(table: pd.DataFrame, team: object) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "BullpenTeam": str(team or ""),
+        "BullpenRecentPA": 0,
+        "BullpenRecentHR": 0,
+        "BullpenRecentHRPA": np.nan,
+        "BullpenRecentBarrelPA": np.nan,
+        "BullpenRecentxSLGPA": np.nan,
+        "BullpenRecentWhiffPct": np.nan,
+        "BullpenPitchesLast1": 0.0,
+        "BullpenPitchesLast3": 0.0,
+        "BullpenRelieversLast3": 0,
+        "BullpenAvailabilityScore": 50.0,
+        "BullpenQualityMultiplier": 1.0,
+        "BullpenWorkloadMultiplier": 1.0,
+        "AutoBullpenMultiplier": 1.0,
+        "BullpenIntelligenceStatus": "Neutral fallback",
+    }
+    if table is None or table.empty:
+        return defaults
+    match = table[safe_text_series(table.get("BullpenTeam"), "").eq(str(team or ""))]
+    if match.empty:
+        return defaults
+    values = match.iloc[0].to_dict()
+    defaults.update(values)
+    return defaults
+
+
+def intelligent_weather_context(matchup: dict) -> dict[str, object]:
+    """Return automatic weather fields for live slates and neutral history fallbacks."""
+    defaults: dict[str, object] = {
+        "TemperatureF": 70.0,
+        "HumidityPct": 50.0,
+        "WindMPH": 0.0,
+        "WindGustMPH": 0.0,
+        "PressureHPA": 1013.25,
+        "WindDirection": "Cross/Calm",
+        "PrecipProbability": np.nan,
+        "RoofStatus": "Unknown",
+        "WeatherSource": "Neutral fallback",
+        "WeatherConfidence": 25.0,
+        "WeatherMultiplier": 1.0,
+    }
+    slate_date = pd.to_datetime(matchup.get("slate_date"), errors="coerce")
+    if pd.notna(slate_date) and slate_date.date() < date.today() - timedelta(days=5):
+        defaults["WeatherSource"] = "Historical neutral fallback"
+        defaults["WeatherConfidence"] = 35.0
+        return defaults
+
+    result = automatic_game_weather(matchup)
+    metadata = result.get("metadata") or load_stadium_weather_metadata(str(matchup.get("venue", "")))
+    roof_type = str(metadata.get("roof_type", "open")).lower()
+    fixed_roof = roof_type == "fixed"
+    defaults["RoofStatus"] = "Closed (fixed roof)" if fixed_roof else ("Retractable / unknown" if roof_type == "retractable" else "Open air")
+    if not result.get("ok"):
+        defaults["WeatherSource"] = str(result.get("error") or "Weather unavailable")[:160]
+        defaults["WeatherConfidence"] = 70.0 if fixed_roof else 25.0
+        return defaults
+
+    temperature = _finite_float(result.get("temperature_f"), 70.0)
+    humidity = _finite_float(result.get("humidity_pct"), 50.0)
+    wind = _finite_float(result.get("wind_mph"), 0.0)
+    pressure = _finite_float(result.get("pressure_hpa"), 1013.25)
+    wind_direction = str(result.get("wind_direction") or "Cross/Calm")
+    multiplier = weather_carry_multiplier(
+        temperature,
+        humidity,
+        wind,
+        wind_direction,
+        pressure,
+        1.0,
+        enclosed=fixed_roof,
+    )
+    defaults.update({
+        "TemperatureF": temperature,
+        "HumidityPct": humidity,
+        "WindMPH": wind,
+        "WindGustMPH": _finite_float(result.get("wind_gust_mph"), 0.0),
+        "PressureHPA": pressure,
+        "WindDirection": wind_direction,
+        "PrecipProbability": _finite_float(result.get("precip_probability"), np.nan),
+        "WeatherSource": str(result.get("source") or "Open-Meteo"),
+        "WeatherConfidence": 92.0 if not fixed_roof else 100.0,
+        "WeatherMultiplier": multiplier,
+    })
+    return defaults
+
+
+def lineup_intelligence_context(
+    lineup_seed: pd.DataFrame | None,
+    lineup_status: str,
+    game_datetime_utc: object,
+    slate_date: object,
+    probable_pitcher_id: object,
+    park_source: str,
+    weather_context: dict[str, object],
+) -> dict[str, object]:
+    clean = _clean_lineup_seed(lineup_seed)
+    lineup_count = int(clean["LineupSpot"].nunique()) if not clean.empty and "LineupSpot" in clean.columns else 0
+    confirmed = int("confirm" in str(lineup_status).lower() and lineup_count >= 9)
+    minutes = _minutes_to_first_pitch(game_datetime_utc, slate_date)
+    if confirmed:
+        late_scratch_risk = 10.0 if np.isfinite(minutes) and minutes <= 120 else 18.0
+    elif lineup_count >= 7:
+        late_scratch_risk = 48.0
+    else:
+        late_scratch_risk = 72.0
+    probable_confirmed = int(pd.notna(pd.to_numeric(pd.Series([probable_pitcher_id]), errors="coerce").iloc[0]))
+    park_confidence = 100.0 if "neutral" not in str(park_source).lower() else 35.0
+    return {
+        "LineupCount": lineup_count,
+        "LineupCompleteness": float(lineup_count / 9.0),
+        "LineupConfirmedFlag": confirmed,
+        "LineupSourceType": str(lineup_status or "Unknown"),
+        "MinutesToFirstPitch": minutes,
+        "LateScratchRiskScore": late_scratch_risk,
+        "ProbablePitcherConfirmedFlag": probable_confirmed,
+        "ProbablePitcherStatus": "Confirmed/identified" if probable_confirmed else "TBD/override",
+        "ParkSource": str(park_source or "Neutral fallback"),
+        "ParkConfidence": park_confidence,
+        "WeatherSource": str(weather_context.get("WeatherSource", "Neutral fallback")),
+        "WeatherConfidence": _finite_float(weather_context.get("WeatherConfidence"), 25.0),
+        "IntelligenceFeatureVersion": INTELLIGENCE_FEATURE_VERSION,
+    }
+
+
 def build_hr_board(
     df: pd.DataFrame,
     pitcher_id: int,
@@ -1764,7 +2159,9 @@ def build_hr_board(
     bat_tracking_auto: pd.DataFrame | None,
     active_roster: pd.DataFrame | None,
     include_low_sample: bool,
+    intelligence_context: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    intelligence_context = dict(intelligence_context or {})
     profile, pitcher_hand = selected_pitcher_profile(df, pitcher_id)
     if not pitcher_hand:
         return pd.DataFrame(), profile
@@ -1930,6 +2327,7 @@ def build_hr_board(
         * 0.30
     )
     starter_rate = 0.88 * hitter_base + 0.12 * recent_component
+    starter_rate *= float(np.clip(_finite_float(intelligence_context.get("StarterContextMultiplier"), 1.0), 0.82, 1.22))
     bat_multiplier = (1.0 + (board["BatTrackingScore"] - 50.0) / 500.0).clip(0.90, 1.10)
     starter_rate *= bat_multiplier
 
@@ -1943,7 +2341,30 @@ def build_hr_board(
     game_per_pa = game_per_pa * board["ParkFactor"] / 100.0
     game_per_pa *= float(weather_multiplier)
     board["Model_HR_Per_PA"] = game_per_pa.clip(0.001, 0.18)
-    board["Projected_PA"] = projected_pa(board["LineupSpot"], team_runs, is_away)
+
+    lineup_mask = pd.to_numeric(board.get("LineupSpot"), errors="coerce").between(1, 9, inclusive="both")
+    lineup_rows = board.loc[lineup_mask].copy() if lineup_mask.any() else board.copy()
+    individual_power_ratio = (
+        0.40 * (board["Adj_HR_PA"] / max(league_hr_rate, 0.0001)).clip(0.35, 2.50)
+        + 0.35 * (board["Adj_Brl_PA"] / max(league_barrel_pa, 0.0001)).clip(0.35, 2.50)
+        + 0.25 * (board["Adj_xISO_PA"] / max(league_xiso_pa, 0.0001)).clip(0.40, 2.20)
+    )
+    lineup_ratio = float(np.clip(individual_power_ratio.loc[lineup_rows.index].mean(), 0.65, 1.45)) if not lineup_rows.empty else 1.0
+    top_four_mask = pd.to_numeric(lineup_rows.get("LineupSpot"), errors="coerce").between(1, 4, inclusive="both")
+    bottom_mask = pd.to_numeric(lineup_rows.get("LineupSpot"), errors="coerce").between(5, 9, inclusive="both")
+    top_four_ratio = float(np.clip(individual_power_ratio.loc[lineup_rows.index[top_four_mask]].mean(), 0.55, 1.65)) if top_four_mask.any() else lineup_ratio
+    bottom_ratio = float(np.clip(individual_power_ratio.loc[lineup_rows.index[bottom_mask]].mean(), 0.55, 1.65)) if bottom_mask.any() else lineup_ratio
+    auto_team_runs = float(np.clip(4.50 + (lineup_ratio - 1.0) * 1.35, 3.35, 5.85))
+    use_auto_team_runs = bool(intelligence_context.get("UseAutoTeamRuns", False))
+    team_runs_used = auto_team_runs if use_auto_team_runs else float(team_runs)
+
+    board["LineupPowerIndex"] = lineup_ratio * 100.0
+    board["LineupTop4PowerIndex"] = top_four_ratio * 100.0
+    board["LineupBottom5PowerIndex"] = bottom_ratio * 100.0
+    board["AutoTeamRuns"] = auto_team_runs
+    board["TeamImpliedRuns"] = team_runs_used
+    board["Projected_PA"] = projected_pa(board["LineupSpot"], team_runs_used, is_away)
+    board["LineupSpotPowerInteraction"] = individual_power_ratio * board["Projected_PA"]
     board["Model_1plus_HR"] = 1 - (1 - board["Model_HR_Per_PA"]) ** board["Projected_PA"]
 
     board["PitchMatchScore"] = percentile(board["PitchMatchRatio"])
@@ -1976,6 +2397,22 @@ def build_hr_board(
     board["Confidence_Level"] = pd.cut(
         board["Confidence"], bins=[-np.inf, 45, 70, np.inf], labels=["Low", "Medium", "High"]
     ).astype(str)
+
+    for feature_name, feature_value in intelligence_context.items():
+        if feature_name not in board.columns:
+            board[feature_name] = feature_value
+
+    lineup_quality = 100.0 * pd.to_numeric(board.get("LineupCompleteness", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    starter_sample_quality = 100.0 * (1.0 - np.exp(-pd.to_numeric(board.get("StarterSamplePitches", 0.0), errors="coerce").fillna(0.0) / 550.0))
+    weather_quality = pd.to_numeric(board.get("WeatherConfidence", 25.0), errors="coerce").fillna(25.0).clip(0.0, 100.0)
+    park_quality = pd.to_numeric(board.get("ParkConfidence", 35.0), errors="coerce").fillna(35.0).clip(0.0, 100.0)
+    board["DataQualityScore"] = (
+        0.35 * board["Confidence"]
+        + 0.25 * lineup_quality
+        + 0.20 * starter_sample_quality
+        + 0.10 * weather_quality
+        + 0.10 * park_quality
+    ).clip(0.0, 100.0)
 
     board = board.sort_values(["Model_1plus_HR", "HRScore"], ascending=False).reset_index(drop=True)
     board.insert(0, "Rank", np.arange(1, len(board) + 1))
@@ -3354,6 +3791,23 @@ def build_hr_projection_snapshot(
         "MarketImpliedProbability", "ModelMarketEdge", "Actual_Event", "Actual_HR", "Actual_PA", "ResultStatus", "Notes",
         "HRScore", "LA_Power_Score", "LA_Optimization_Score", "Adj_Brl_PA", "Barrel_Range_BIP", "PitchMatchScore",
         "ZoneFitScore", "PitcherSideAttackScore", "BvPScore", "RecentFormScore",
+        "IntelligenceFeatureVersion", "DataQualityScore", "LineupCount", "LineupCompleteness",
+        "LineupConfirmedFlag", "LineupSourceType", "MinutesToFirstPitch", "LateScratchRiskScore",
+        "ProbablePitcherConfirmedFlag", "ProbablePitcherStatus", "StarterRecentStarts",
+        "StarterRecentPitches", "StarterRecentBattersFaced", "StarterDaysRest",
+        "StarterRecentHRPA", "StarterRecentBarrelPA", "StarterRecentxSLGPA",
+        "StarterRecentWhiffPct", "StarterExpectedInningsAuto", "StarterRecentFormMultiplier",
+        "StarterFatigueMultiplier", "StarterContextMultiplier", "StarterSamplePitches",
+        "StarterSamplePA", "BullpenRecentPA", "BullpenRecentHR", "BullpenRecentHRPA",
+        "BullpenRecentBarrelPA", "BullpenRecentxSLGPA", "BullpenRecentWhiffPct",
+        "BullpenPitchesLast1", "BullpenPitchesLast3", "BullpenRelieversLast3",
+        "BullpenAvailabilityScore", "BullpenQualityMultiplier", "BullpenWorkloadMultiplier",
+        "AutoBullpenMultiplier", "LineupPowerIndex", "LineupTop4PowerIndex",
+        "LineupBottom5PowerIndex", "LineupSpotPowerInteraction", "AutoTeamRuns",
+        "TeamImpliedRuns", "TemperatureF", "HumidityPct", "WindMPH", "WindGustMPH",
+        "PressureHPA", "WindDirection", "PrecipProbability", "RoofStatus",
+        "WeatherSource", "WeatherConfidence", "ParkSource", "ParkConfidence",
+        "StarterInningsUsed", "BullpenMultiplierUsed",
     ]
     existing = [column for column in preferred if column in snapshot.columns]
     extras = [
@@ -3498,7 +3952,9 @@ def build_entire_slate_hr_snapshot(
     if error:
         return pd.DataFrame(), [f"Schedule error: {error}"]
     snapshots: list[pd.DataFrame] = []
+    bullpen_table = build_bullpen_intelligence_table(df, loaded_end)
     for game in games:
+        weather_context = intelligent_weather_context(game)
         for offense_side in ["away", "home"]:
             away_offense = offense_side == "away"
             batting_code = str(game["away_abbr"] if away_offense else game["home_abbr"])
@@ -3521,6 +3977,18 @@ def build_entire_slate_hr_snapshot(
                 lineup_seed = infer_recent_lineup(df, batting_team)
                 lineup_status = "Recent lineup fallback"
             auto_park = fetch_savant_park_factors(game.get("venue", ""), int(pd.Timestamp(slate_date_text).year), "HR")
+            starter_context = starter_intelligence_features(df, int(pitcher_row["pitcher"]), loaded_end)
+            bullpen_context = bullpen_intelligence_for_team(bullpen_table, str(pitcher_row["Pitcher_Team"]))
+            lineup_context = lineup_intelligence_context(
+                lineup_seed, lineup_status, game.get("game_datetime_utc"), slate_date_text,
+                pitcher_id, str(auto_park.get("source", "Neutral fallback")), weather_context,
+            )
+            intelligence_context = {
+                **starter_context, **bullpen_context, **weather_context, **lineup_context,
+                "UseAutoTeamRuns": True,
+                "StarterInningsUsed": _finite_float(starter_context.get("StarterExpectedInningsAuto"), 5.5),
+                "BullpenMultiplierUsed": _finite_float(bullpen_context.get("AutoBullpenMultiplier"), 1.0),
+            }
             board, _ = build_hr_board_safe(
                 df=df,
                 context=f"whole-slate {batting_code}",
@@ -3532,15 +4000,16 @@ def build_entire_slate_hr_snapshot(
                 park_hr_factor_rhb=float(auto_park.get("R", 100.0)),
                 team_runs=4.5,
                 is_away=away_offense,
-                starter_innings=5.5,
-                bullpen_multiplier=1.0,
-                weather_multiplier=1.0,
+                starter_innings=_finite_float(starter_context.get("StarterExpectedInningsAuto"), 5.5),
+                bullpen_multiplier=_finite_float(bullpen_context.get("AutoBullpenMultiplier"), 1.0),
+                weather_multiplier=_finite_float(weather_context.get("WeatherMultiplier"), 1.0),
                 lineup_override=lineup_seed,
                 lineup_edits=None,
                 bat_tracking_upload=None,
                 bat_tracking_auto=bat_tracking_auto,
                 active_roster=roster,
                 include_low_sample=include_low_sample,
+                intelligence_context=intelligence_context,
             )
             if board.empty:
                 messages.append(f"Skipped {batting_code}: no hitters remained after filtering.")
@@ -3552,6 +4021,7 @@ def build_entire_slate_hr_snapshot(
                 "batting_team": batting_team,
                 "home_away": "Away" if away_offense else "Home",
                 "venue": game.get("venue"),
+                "venue_id": game.get("venue_id"),
                 "game_pk": game.get("game_pk"),
                 "game_datetime_utc": game.get("game_datetime_utc"),
                 "slate_date": slate_date_text,
@@ -3560,7 +4030,9 @@ def build_entire_slate_hr_snapshot(
                 board, matchup_for_snapshot, lookback_days, loaded_start, loaded_end, lineup_status,
                 extra_context={
                     "AwayTeam": game.get("away_abbr"), "HomeTeam": game.get("home_abbr"),
-                    "ParkSource": auto_park.get("source", "Neutral fallback"), "WeatherMultiplier": 1.0,
+                    **intelligence_context,
+                    "ParkSource": auto_park.get("source", "Neutral fallback"),
+                    "WeatherMultiplier": _finite_float(weather_context.get("WeatherMultiplier"), 1.0),
                     "SnapshotScope": "Entire slate",
                 },
             )
@@ -3790,6 +4262,80 @@ def generate_three_man_hr_pairings(
     return result.drop(columns=["PlayerKeys", "_Adjusted"], errors="ignore")
 
 
+
+def probability_to_american(probability: object) -> float:
+    p = _finite_float(probability, np.nan)
+    if not np.isfinite(p) or p <= 0 or p >= 1:
+        return np.nan
+    return float(100.0 * (1.0 - p) / p) if p < 0.5 else float(-100.0 * p / (1.0 - p))
+
+
+def apply_hr_market_odds_upload(board: pd.DataFrame, upload) -> tuple[pd.DataFrame, str]:
+    """Attach timestamped HR yes/no prices without leaking them into the baseball-only model."""
+    result = board.copy() if board is not None else pd.DataFrame()
+    if result.empty or upload is None:
+        return result, ""
+    try:
+        odds = pd.read_csv(upload)
+    except Exception as exc:
+        return result, f"Odds CSV could not be read: {type(exc).__name__}: {exc}"
+    if odds.empty:
+        return result, "The odds CSV was empty."
+
+    aliases = {
+        "player_id": "PlayerID", "mlbam": "PlayerID", "id": "PlayerID",
+        "player": "Player", "name": "Player",
+        "yes_odds": "Over_Odds", "hr_yes_odds": "Over_Odds", "over": "Over_Odds",
+        "no_odds": "Under_Odds", "hr_no_odds": "Under_Odds", "under": "Under_Odds",
+        "book": "Line_Source", "sportsbook": "Line_Source", "source": "Line_Source",
+        "timestamp": "OddsTimestampUTC", "captured_at": "OddsTimestampUTC",
+    }
+    odds = odds.rename(columns={column: aliases.get(str(column).strip().lower(), column) for column in odds.columns})
+    if "PlayerID" not in odds.columns and "Player" not in odds.columns:
+        return result, "Odds CSV needs PlayerID or Player."
+    if "Over_Odds" not in odds.columns:
+        return result, "Odds CSV needs Over_Odds (HR yes price)."
+
+    odds["_player_id"] = pd.to_numeric(odds.get("PlayerID"), errors="coerce") if "PlayerID" in odds.columns else np.nan
+    odds["_player_name"] = safe_text_series(odds.get("Player", pd.Series("", index=odds.index)), "").map(normalize_name)
+    odds = odds.sort_index().drop_duplicates(["_player_id", "_player_name"], keep="last")
+
+    by_id: dict[int, dict[str, object]] = {}
+    by_name: dict[str, dict[str, object]] = {}
+    for _, odds_row_series in odds.iterrows():
+        record = odds_row_series.to_dict()
+        if pd.notna(record.get("_player_id")):
+            by_id[int(record["_player_id"])] = record
+        if str(record.get("_player_name") or ""):
+            by_name[str(record["_player_name"])] = record
+
+    matched = 0
+    for index, row in result.iterrows():
+        player_id = pd.to_numeric(pd.Series([row.get("PlayerID", row.get("player_id"))]), errors="coerce").iloc[0]
+        key_name = normalize_name(row.get("Player", ""))
+        odds_row = by_id.get(int(player_id)) if pd.notna(player_id) else None
+        if odds_row is None:
+            odds_row = by_name.get(key_name)
+        if odds_row is None:
+            continue
+        matched += 1
+        for column in ["Over_Odds", "Under_Odds", "Line_Source", "OddsTimestampUTC"]:
+            if column in odds_row and pd.notna(odds_row[column]):
+                result.at[index, column] = odds_row[column]
+
+    result["Over_Odds"] = pd.to_numeric(result.get("Over_Odds"), errors="coerce")
+    result["Under_Odds"] = pd.to_numeric(result.get("Under_Odds"), errors="coerce")
+    yes = result["Over_Odds"].map(american_to_implied)
+    no = result["Under_Odds"].map(american_to_implied)
+    no_vig = yes / (yes + no)
+    result["MarketImpliedProbability"] = yes
+    result["MarketProbability"] = no_vig.where(no.notna(), yes)
+    model_probability = pd.to_numeric(result.get("ModelProbability"), errors="coerce")
+    result["ModelMarketEdge"] = model_probability - result["MarketProbability"]
+    result["ModelFairOdds"] = model_probability.map(probability_to_american)
+    return result, f"Matched odds for {matched:,} of {len(result):,} slate rows."
+
+
 def render_hr_top10_parlay_tab(
     df: pd.DataFrame,
     pitcher_summary: pd.DataFrame,
@@ -3880,6 +4426,18 @@ def render_hr_top10_parlay_tab(
         st.info("Press Build / refresh whole-slate Top 10 + parlay pool to rebuild the slate board.")
         return
 
+    odds_upload = st.file_uploader(
+        "Optional timestamped HR odds CSV",
+        type=["csv"],
+        key=f"{widget_prefix}_top10_market_odds",
+        help="Columns: PlayerID or Player, Over_Odds, optional Under_Odds, Line_Source, OddsTimestampUTC.",
+    )
+    if odds_upload is not None:
+        slate_board, odds_message = apply_hr_market_odds_upload(slate_board, odds_upload)
+        st.session_state[board_key] = slate_board
+        if odds_message:
+            st.caption(odds_message)
+
     slate_board = apply_slate_hr_probability_calibration(slate_board, calibration)
     slate_board = hrml_apply_model_to_frame(
         slate_board,
@@ -3910,6 +4468,9 @@ def render_hr_top10_parlay_tab(
         "SlateRank", "Player", "Team", "Opponent", "StartingPitcher", "LineupSpot",
         "Projected_PA", "ExpectedCount", "ModelProbability", "HeuristicProbability", "Calibrated_ML_HR_Probability", "ActiveModel", "ModelScore", "Confidence",
         "SlateGrade", "TargetTier", "LineupStatus", "Venue",
+        "LineupConfirmedFlag", "DataQualityScore", "StarterDaysRest", "StarterRecentFormMultiplier",
+        "AutoBullpenMultiplier", "BullpenAvailabilityScore", "WeatherMultiplier",
+        "Over_Odds", "Under_Odds", "MarketProbability", "ModelMarketEdge", "ModelFairOdds", "Line_Source",
     ]
     top10 = ranked_slate[[column for column in top_columns if column in ranked_slate.columns]].head(10).copy()
     top10 = top10.rename(
@@ -3927,6 +4488,17 @@ def render_hr_top10_parlay_tab(
             "SlateGrade": "Slate Grade",
             "TargetTier": "Tier",
             "LineupStatus": "Lineup",
+            "LineupConfirmedFlag": "Confirmed",
+            "DataQualityScore": "Data Quality",
+            "StarterDaysRest": "SP Rest",
+            "StarterRecentFormMultiplier": "SP Form ×",
+            "AutoBullpenMultiplier": "Bullpen ×",
+            "BullpenAvailabilityScore": "Bullpen Avail",
+            "WeatherMultiplier": "Weather ×",
+            "MarketProbability": "Market Prob",
+            "ModelMarketEdge": "Model Edge",
+            "ModelFairOdds": "Model Fair",
+            "Line_Source": "Book",
         }
     )
     display_style = top10.style
@@ -3945,6 +4517,9 @@ def render_hr_top10_parlay_tab(
                 "HR Score": "{:.0f}",
                 "Confidence": "{:.0f}",
                 "Slate Grade": "{:.1f}",
+                "Data Quality": "{:.0f}", "SP Rest": "{:.0f}", "SP Form ×": "{:.3f}",
+                "Bullpen ×": "{:.3f}", "Bullpen Avail": "{:.0f}", "Weather ×": "{:.3f}",
+                "Market Prob": "{:.1%}", "Model Edge": "{:+.1%}", "Model Fair": "{:.0f}",
             },
             na_rep="—",
         ),
@@ -4707,7 +5282,7 @@ def render_edge_header() -> None:
 
 
 # ===== INTEGRATED TRAINER CORE =====
-TRAINER_VERSION = "hr_trainer_v1"
+TRAINER_VERSION = "hr_trainer_v2_intelligent_features"
 TARGET_COLUMN = "Actual_Event"
 DEFAULT_MODEL_FILENAME = "hr_model_bundle.joblib"
 DEFAULT_METADATA_FILENAME = "hr_model_metadata.json"
@@ -4735,12 +5310,29 @@ NUMERIC_BASEBALL_FEATURES = [
     "LA_Power_Score", "LA_Optimization_Score", "Barrel_Range_BIP",
     "TemperatureF", "HumidityPct", "WindMPH", "PressureHPA", "TeamImpliedRuns",
     "StarterInnings", "BullpenMultiplier",
+    "StarterRecentStarts", "StarterRecentPitches", "StarterRecentBattersFaced",
+    "StarterDaysRest", "StarterRecentHRPA", "StarterRecentBarrelPA",
+    "StarterRecentxSLGPA", "StarterRecentWhiffPct", "StarterExpectedInningsAuto",
+    "StarterRecentFormMultiplier", "StarterFatigueMultiplier", "StarterContextMultiplier",
+    "StarterSamplePitches", "StarterSamplePA", "BullpenRecentPA", "BullpenRecentHR",
+    "BullpenRecentHRPA", "BullpenRecentBarrelPA", "BullpenRecentxSLGPA",
+    "BullpenRecentWhiffPct", "BullpenPitchesLast1", "BullpenPitchesLast3",
+    "BullpenRelieversLast3", "BullpenAvailabilityScore", "BullpenQualityMultiplier",
+    "BullpenWorkloadMultiplier", "AutoBullpenMultiplier", "LineupCount",
+    "LineupCompleteness", "LineupConfirmedFlag", "MinutesToFirstPitch",
+    "LateScratchRiskScore", "ProbablePitcherConfirmedFlag", "ParkConfidence",
+    "WeatherConfidence", "WindGustMPH", "PrecipProbability", "DataQualityScore",
+    "LineupPowerIndex", "LineupTop4PowerIndex", "LineupBottom5PowerIndex",
+    "LineupSpotPowerInteraction", "AutoTeamRuns", "StarterInningsUsed",
+    "BullpenMultiplierUsed",
 ]
 
 CATEGORICAL_BASEBALL_FEATURES = [
     "HomeAway", "EffectiveStand", "SampleStatus", "Confidence_Level", "Position",
     "PitcherSideRead", "AttackConfidence", "BatTrackingAvailable", "RoofStatus",
-    "WindDirection",
+    "WindDirection", "LineupSourceType", "ProbablePitcherStatus",
+    "StarterIntelligenceStatus", "BullpenIntelligenceStatus", "WeatherSource",
+    "ParkSource", "IntelligenceFeatureVersion",
 ]
 
 # These are intentionally excluded from the baseball-only model but may be used
@@ -5729,24 +6321,40 @@ try:
 
     park_year = pd.Timestamp(matchup.get("slate_date") or loaded_end).year
     auto_park = fetch_savant_park_factors(matchup.get("venue", ""), park_year, "HR")
+    starter_intelligence = starter_intelligence_features(df, selected_pitcher, loaded_end)
+    bullpen_table_live = build_bullpen_intelligence_table(df, loaded_end)
+    bullpen_intelligence = bullpen_intelligence_for_team(bullpen_table_live, matchup.get("pitcher_team"))
 
     with st.expander("Game, park and weather adjustments", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         with c1:
+            use_intelligent_pitching = st.checkbox(
+                "Use intelligent pitching defaults",
+                value=True,
+                key="clean_hr_intelligent_pitching",
+                help="Uses starter rest/form and bullpen quality/workload derived only from data before the slate date.",
+            )
+            auto_starter_innings = float(np.clip(_finite_float(starter_intelligence.get("StarterExpectedInningsAuto"), 5.5), 2.0, 8.0))
+            auto_bullpen_multiplier = float(np.clip(_finite_float(bullpen_intelligence.get("AutoBullpenMultiplier"), 1.0), 0.65, 1.45))
             team_runs = st.number_input(
                 "Team implied runs", 1.0, 9.0, 4.5, 0.1, key="clean_hr_runs"
             )
             starter_innings = st.number_input(
-                "Expected starter innings", 2.0, 8.0, 5.5, 0.5, key="clean_hr_ip"
+                "Expected starter innings", 2.0, 8.0, auto_starter_innings if use_intelligent_pitching else 5.5, 0.1, key="clean_hr_ip"
             )
             bullpen_multiplier = st.number_input(
                 "Bullpen HR multiplier",
                 0.65,
                 1.45,
-                1.00,
+                auto_bullpen_multiplier if use_intelligent_pitching else 1.00,
                 0.01,
                 key="clean_hr_bullpen",
-                help="Above 1.00 means a more home-run-prone bullpen.",
+                help="Above 1.00 means a more home-run-prone or fatigued bullpen.",
+            )
+            st.caption(
+                f"SP auto: {auto_starter_innings:.1f} IP · rest {starter_intelligence.get('StarterDaysRest', np.nan):.0f} days · "
+                f"form ×{_finite_float(starter_intelligence.get('StarterRecentFormMultiplier'), 1.0):.3f}. "
+                f"Bullpen auto ×{auto_bullpen_multiplier:.3f} · availability {_finite_float(bullpen_intelligence.get('BullpenAvailabilityScore'), 50.0):.0f}/100."
             )
         with c2:
             manual_park_override = st.checkbox(
@@ -6060,6 +6668,24 @@ try:
             key=f"clean_hr_lineup_{selected_pitcher}_{selected_team}_{_lineup_fingerprint(lineup_seed)}",
         )
 
+    selected_weather_context = {
+        "TemperatureF": temperature_f, "HumidityPct": humidity_pct, "WindMPH": wind_mph,
+        "WindGustMPH": _finite_float(weather_result.get("wind_gust_mph"), 0.0) if isinstance(weather_result, dict) else 0.0,
+        "PressureHPA": pressure_hpa, "WindDirection": wind_direction,
+        "PrecipProbability": precip_probability, "RoofStatus": roof_status,
+        "WeatherSource": weather_source, "WeatherConfidence": 92.0 if use_auto_weather and weather_result.get("ok") else (100.0 if roof_closed else 35.0),
+        "WeatherMultiplier": weather_multiplier,
+    }
+    selected_lineup_context = lineup_intelligence_context(
+        lineup_seed, lineup_source_label, matchup.get("game_datetime_utc"), matchup.get("slate_date"),
+        matchup.get("pitcher_id"), park_source, selected_weather_context,
+    )
+    selected_intelligence_context = {
+        **starter_intelligence, **bullpen_intelligence, **selected_weather_context, **selected_lineup_context,
+        "UseAutoTeamRuns": False, "StarterInningsUsed": starter_innings,
+        "BullpenMultiplierUsed": bullpen_multiplier,
+    }
+
     rankings, pitch_mix = build_hr_board_safe(
         df=df,
         context=f"selected matchup {selected_team}",
@@ -6080,6 +6706,7 @@ try:
         bat_tracking_auto=bat_tracking_auto,
         active_roster=active_roster,
         include_low_sample=include_low_sample,
+        intelligence_context=selected_intelligence_context,
     )
 
     if rankings.empty:
@@ -6108,6 +6735,7 @@ try:
             "TeamImpliedRuns": team_runs,
             "StarterInnings": starter_innings,
             "BullpenMultiplier": bullpen_multiplier,
+            **selected_intelligence_context,
         },
         heuristic_column="Model_1plus_HR",
         update_model_probability=False,
@@ -6140,6 +6768,8 @@ try:
             "HRScore", "Confidence_Level", "Adj_Brl_PA", "Barrel_Range_BIP",
             "LA_Power_Score", "Adj_xISO_PA", "EffectiveStand", "PitcherSideRead", "PitcherSideAttackScore", "SampleStatus",
             "PitchMatchScore", "ZoneFitScore", "PitcherPowerScore", "ParkFactor",
+            "DataQualityScore", "StarterDaysRest", "StarterRecentFormMultiplier",
+            "AutoBullpenMultiplier", "BullpenAvailabilityScore", "WeatherMultiplier",
         ]
         quick = rankings[[column for column in quick_columns if column in rankings.columns]].copy()
         quick = quick.rename(columns={
@@ -6153,6 +6783,9 @@ try:
             "PitcherSideAttackScore": "Side Attack", "SampleStatus": "Sample",
             "PitchMatchScore": "Pitch Match", "ZoneFitScore": "Zone Fit",
             "PitcherPowerScore": "Pitcher Power", "ParkFactor": "Park Factor",
+            "DataQualityScore": "Data Quality", "StarterDaysRest": "SP Rest",
+            "StarterRecentFormMultiplier": "SP Form ×", "AutoBullpenMultiplier": "Bullpen ×",
+            "BullpenAvailabilityScore": "Bullpen Avail", "WeatherMultiplier": "Weather ×",
         })
         score_cols = ["HR Score", "LA Power", "Side Attack", "Pitch Match", "Zone Fit", "Pitcher Power"]
         score_cols = [column for column in score_cols if column in quick.columns]
@@ -6163,7 +6796,8 @@ try:
             "HR Score": "{:.1f}", "Adj Brl/PA": "{:.2%}", "Barrel Range/BIP": "{:.1%}",
             "LA Power": "{:.1f}", "Adj xISO/PA": "{:.3f}",
             "Side Attack": "{:.1f}", "Pitch Match": "{:.1f}", "Zone Fit": "{:.1f}", "Pitcher Power": "{:.1f}",
-            "Park Factor": "{:.0f}",
+            "Park Factor": "{:.0f}", "Data Quality": "{:.0f}", "SP Rest": "{:.0f}",
+            "SP Form ×": "{:.3f}", "Bullpen ×": "{:.3f}", "Bullpen Avail": "{:.0f}", "Weather ×": "{:.3f}",
         })
         st.dataframe(styler, use_container_width=True, hide_index=True, height=520)
 
